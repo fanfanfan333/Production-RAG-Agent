@@ -180,32 +180,44 @@ RAG 智能助手是一套面向企业内部使用的**检索增强生成（RAG�
 
 ## 七、快速开始
 
-### 1. 克隆
+### 1. 安装 Ollama 并拉取模型
+
+项目使用 Ollama 做本地推理（对话生成、意图路由、证据评估），无需任何云端 API Key。
+
+安装：https://ollama.com
+
+```bash
+ollama pull qwen3:8b
+```
+
+### 2. 克隆
 
 ```bash
 git clone https://github.com/fanfanfan333/Production-RAG-Agent.git
 cd Production-RAG-Agent
 ```
 
-### 2. 准备环境变量
+### 3. 准备环境变量
 
 ```bash
 cp .env.example .env
 cp backend/.env.example backend/.env
 ```
 
-按需填写：`POSTGRES_PASSWORD`、`QDRANT_URL`、`OLLAMA_BASE_URL` 等。
+默认配置即可跑通本地 Docker 环境。上生产前务必修改 `JWT_SECRET` 与 `POSTGRES_PASSWORD`。
 
-### 3. 启动依赖与后端
+### 4. 启动依赖与后端
 
 ```bash
 cd backend
 docker compose up --build
 ```
 
-后端将运行在 `http://localhost:8000`，Swagger 文档：`http://localhost:8000/docs`。
+首次启动会自动下载 BGE 向量模型（约 1.3 GB）与 cross-encoder 精排模型（约 278 MB），请确保网络可用并耐心等待。
 
-### 4. 启动前端
+后端运行在 `http://localhost:8000`，Swagger 文档：`http://localhost:8000/docs`。
+
+### 5. 启动前端
 
 ```bash
 cd ..
@@ -213,11 +225,55 @@ npm install
 npm run dev
 ```
 
-打开 `http://localhost:3000`，注册账号 → 上传文档 → 提问。
+打开 `http://localhost:3000`，注册账号（第一个注册者自动成为管理员）→ 上传文档 → 提问。
 
 ---
 
-## 八、项目结构
+## 八、获取与分发
+
+### 直接下载
+
+| 方式 | 地址 / 命令 |
+|:---|:---|
+| Git 克隆 | `git clone https://github.com/fanfanfan333/Production-RAG-Agent.git` |
+| ZIP 打包 | `https://github.com/fanfanfan333/Production-RAG-Agent/archive/refs/heads/main.zip` |
+| 指定版本 | 在 Releases 页面发布 tag 后，可拿到 `.../archive/refs/tags/v1.0.0.zip` |
+
+仓库已设为 **Public**，任何人无需授权即可克隆或下载。
+
+### 发布一个稳定版本
+
+在 GitHub 仓库页右侧 **Releases → Create a new release**：
+
+1. Tag version 填 `v1.0.0`，Target 选 `main`
+2. Release title 填 `v1.0.0`
+3. 勾选 **Set as the latest release**
+4. 点 Publish release
+
+发布后会自动生成 `Source code (zip)` / `Source code (tar.gz)` 两个固定下载链接，适合给不会用 Git 的人。
+
+### 让别人"能正常访问"
+
+如果对方只是想**看界面**而不是本地部署，需要你提供一台可访问的服务：
+
+- 后端：`uvicorn app.main:app --host 0.0.0.0 --port 8000`
+- 前端：`npm run build && npm start`（或部署到 Vercel）
+- 同时把 `backend/.env` 里的 `CORS_ORIGINS` 改成前端真实域名，并把 `GATEWAY_ENFORCE_ORIGIN` 设为 `true`
+
+### 部署前检查清单
+
+| 项 | 说明 |
+|:---|:---|
+| `JWT_SECRET` | 用 `openssl rand -hex 32` 重新生成，绝不能用默认值 |
+| `POSTGRES_PASSWORD` | 改成强密码 |
+| `CORS_ORIGINS` | 列出精确的前端来源，不要用 `["*"]` |
+| `GATEWAY_ENFORCE_ORIGIN` | 设为 `true` |
+| `ENVIRONMENT` | 设为 `production`，`DEBUG=false` |
+| Ollama / Qdrant / PostgreSQL | 不要直接暴露到公网，放到内网或用反向代理 |
+
+---
+
+## 九、项目结构
 
 ```
 Production-RAG-Agent/
@@ -258,6 +314,6 @@ Production-RAG-Agent/
 
 ---
 
-## 九、许可
+## 十、许可
 
 本项目以 MIT 协议开源。
