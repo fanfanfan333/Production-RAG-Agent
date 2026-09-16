@@ -1,6 +1,6 @@
 <div align="center">
 
-# 0——1企业级RAG 智能助手
+# 0—1企业级LangGraphRAG 智能助手
 
 ### 企业私有知识库问答平台
 
