@@ -229,51 +229,7 @@ npm run dev
 
 ---
 
-## 八、获取与分发
-
-### 直接下载
-
-| 方式 | 地址 / 命令 |
-|:---|:---|
-| Git 克隆 | `git clone https://github.com/fanfanfan333/Production-RAG-Agent.git` |
-| ZIP 打包 | `https://github.com/fanfanfan333/Production-RAG-Agent/archive/refs/heads/main.zip` |
-| 指定版本 | 在 Releases 页面发布 tag 后，可拿到 `.../archive/refs/tags/v1.0.0.zip` |
-
-仓库已设为 **Public**，任何人无需授权即可克隆或下载。
-
-### 发布一个稳定版本
-
-在 GitHub 仓库页右侧 **Releases → Create a new release**：
-
-1. Tag version 填 `v1.0.0`，Target 选 `main`
-2. Release title 填 `v1.0.0`
-3. 勾选 **Set as the latest release**
-4. 点 Publish release
-
-发布后会自动生成 `Source code (zip)` / `Source code (tar.gz)` 两个固定下载链接，适合给不会用 Git 的人。
-
-### 让别人"能正常访问"
-
-如果对方只是想**看界面**而不是本地部署，需要你提供一台可访问的服务：
-
-- 后端：`uvicorn app.main:app --host 0.0.0.0 --port 8000`
-- 前端：`npm run build && npm start`（或部署到 Vercel）
-- 同时把 `backend/.env` 里的 `CORS_ORIGINS` 改成前端真实域名，并把 `GATEWAY_ENFORCE_ORIGIN` 设为 `true`
-
-### 部署前检查清单
-
-| 项 | 说明 |
-|:---|:---|
-| `JWT_SECRET` | 用 `openssl rand -hex 32` 重新生成，绝不能用默认值 |
-| `POSTGRES_PASSWORD` | 改成强密码 |
-| `CORS_ORIGINS` | 列出精确的前端来源，不要用 `["*"]` |
-| `GATEWAY_ENFORCE_ORIGIN` | 设为 `true` |
-| `ENVIRONMENT` | 设为 `production`，`DEBUG=false` |
-| Ollama / Qdrant / PostgreSQL | 不要直接暴露到公网，放到内网或用反向代理 |
-
----
-
-## 九、项目结构
+## 八、项目结构
 
 ```
 Production-RAG-Agent/
