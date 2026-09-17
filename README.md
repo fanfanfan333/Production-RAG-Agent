@@ -1,6 +1,6 @@
 <div align="center">
 
-# RAG 智能助手
+# 企业LangGraphRAG 智能助手
 
 ### 企业私有知识库问答平台
 
@@ -76,7 +76,7 @@ RAG 智能助手是一套面向企业内部使用的检索增强生成平台，�
 
 <div align="center">
 
-### 仪表盘 —— 全局态势一屏掌握
+### 首页 —— 查看全局状态
 
 <img src="screenshots/dashboard.png" width="80%" alt="仪表盘"/>
 
@@ -787,7 +787,8 @@ cp .env.example .env
 
 其余配置项均有合理默认值，本地开发可直接使用。完整说明见 `backend/.env.example` 注释与本文第八节。
 
-> Linux 宿主机注意：Docker Engine 默认不提供 `host.docker.internal`。可在 compose 的 backend 服务中追加>   
+> Linux 宿主机注意：Docker Engine 默认不提供 `host.docker.internal`。可在 compose 的 backend 服务中追加
+>   
 > `extra_hosts: ["host.docker.internal:host-gateway"]`，或直接在 `.env` 中填写宿主机内网 IP。
 
 ### 7.5 启动后端
@@ -815,47 +816,7 @@ docker compose logs -f backend      # 观察启动日志，首次会下载模型
 - Keycloak 首次启动约需 30–60 秒（`healthcheck` 通过后才算就绪）；控制台 `http://localhost:8080` 可用 `admin` / `admin` 登录
 - **企业统一身份登录**：打开 `http://localhost:3000/login` 点击「企业统一身份登录」，用内置演示账号（如 `zhangsan` / `Passw0rd!`）登录即可。想只用本地账号时，把 `backend/.env` 的 `KEYCLOAK_ENABLED` 设为 `false` 并 `docker compose stop keycloak`
 
-### 7.6 开发模式：后端热重载
-
-**为什么需要它**：默认配置下源码是在**构建时**被 `COPY app/ ./app/` 打进镜像的，容器里跑的是镜像内的代码快照。所以：
-
-| 操作                                | 是否加载新代码        |
-| :-------------------------------- | :------------- |
-| `docker compose restart backend`  | ❌ 只是重启旧进程      |
-| `docker compose up -d backend`    | ❌ 镜像没变，容器被复用   |
-| `docker compose build backend`    | ✅ 重新 COPY 源码   |
-| `docker compose -f ...dev.yml up` | ✅ 挂载源码 + 自动重载  |
-
-也就是说，"本地改好了但容器里行为没变"（改了意图路由 / output_guard / stream_filter 却依然走旧逻辑）的根因就在这里。
-
-`backend/docker-compose.dev.yml` 通过「挂载源码 + `uvicorn --reload`」解决该问题，改完 `.py` 存盘即自动重载：
-
-```bash
-cd backend
-docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d backend
-docker compose -f docker-compose.yml -f docker-compose.dev.yml logs -f backend
-# 看到 "Will watch for changes in these directories: ['/app/app']" 即已生效
-```
-
-根目录也提供了等价快捷方式：`npm run dev:api` · `npm run dev:api:logs` · `npm run dev:api:stop`。
-
-生效后，改动任意 `.py` 文件，日志会输出：
-
-```
-WARNING:  WatchFiles detected changes in 'app/main.py'. Reloading...
-INFO:     Started server process [56]
-INFO:     Application startup complete.
-```
-
-注意事项：
-
-- 该覆盖文件只动了 `command` / `volumes` / `environment` 三个字段；不写 `-f docker-compose.dev.yml` 时行为与原先完全一致，生产模式 `docker compose up -d` 不受影响
-- 必须开启 `WATCHFILES_FORCE_POLLING`：Docker Desktop 的 bind mount 不会把宿主机 inotify 事件透传进容器，不加这个变量会出现"改了没反应"
-- 只监听 `.py` 文件；改动 `requirements.txt` / `Dockerfile` 仍需 `docker compose up -d --build backend`
-- 重载时 paddle 会打印一条 `FatalError: Termination signal ...` 的 SIGTERM 日志，是旧进程被终止的正常现象，不影响新进程启动
-- 想回到"跑镜像内代码"的状态：去掉 `-f docker-compose.dev.yml` 再执行 `docker compose up -d backend` 即可
-
-### 7.7 启动前端
+### 7.6 启动前端
 
 ```bash
 # 回到项目根目录
@@ -868,7 +829,7 @@ npm run dev
 
 打开 `http://localhost:3000`，注册账号——第一个注册的用户自动获得管理员角色——然后上传文档、开始提问。
 
-### 7.8 验证安装
+### 7.7 验证安装
 
 ```bash
 curl http://localhost:8000/health
@@ -881,94 +842,12 @@ curl http://localhost:8000/health
 
 若 `ollama` 显示为 `not_connected`，请回到 7.4 检查 `OLLAMA_BASE_URL`。
 
-### 7.9 生产模式启动前端
+### 7.8 生产模式启动前端
 
 ```bash
 npm run build
 npm start          # 默认监听 3000 端口
 ```
-
-### 7.10 不使用 Docker 运行后端
-
-仅在需要调试后端代码时推荐。数据库与向量库仍可用容器快速拉起：
-
-```bash
-cd backend
-docker compose up -d postgres qdrant
-
-python3.12 -m venv .venv
-
-# Windows (PowerShell)
-.venv\Scripts\Activate.ps1
-# Linux / macOS
-source .venv/bin/activate
-
-pip install -r requirements.txt
-
-# 在 .env 中指向本机服务
-# POSTGRES_HOST=localhost
-# QDRANT_HOST=localhost
-
-alembic upgrade head        # 存量库演进；全新库可跳过，启动时会自动建表
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
-```
-
-### 7.11 常用命令
-
-| 目的      | 命令                                                  |
-| :------ | :-------------------------------------------------- |
-| 启动全部服务  | `cd backend && docker compose up -d`                |
-| 重新构建并启动 | `cd backend && docker compose up -d --build`        |
-| 开发热重载启动  | `cd backend && docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d backend` |
-| 开发热重载日志  | `cd backend && docker compose -f docker-compose.yml -f docker-compose.dev.yml logs -f backend` |
-| 停止热重载后端  | `cd backend && docker compose -f docker-compose.yml -f docker-compose.dev.yml stop backend`（等价于 `npm run dev:api:stop`） |
-| 查看后端日志  | `cd backend && docker compose logs -f backend`      |
-| 停止服务    | `cd backend && docker compose down`                 |
-| 清空数据重来  | `cd backend && docker compose down -v`（会删除数据库与向量数据） |
-| 进入后端容器  | `docker exec -it rag_backend bash`                  |
-| 前端开发    | `npm run dev`                                       |
-| 前端构建    | `npm run build`                                     |
-| 前端类型检查  | `npx tsc --noEmit`                                  |
-| 运行后端单测  | `cd backend && python tests/test_output_guard.py`    |
-|            | `cd backend && python tests/test_stream_filter.py`   |
-|            | `cd backend && python tests/test_intent_rules.py`    |
-|            | `cd backend && python tests/test_retrieval_optimization.py` |
-|            | `cd backend && python tests/test_evidence_gate.py`（证据门控） |
-|            | `cd backend && python tests/test_citation_verifier.py`（五项引用校验） |
-|            | `cd backend && python tests/test_position_tracking.py`（行号溯源） |
-|            | `cd backend && python tests/test_master_graph_topology.py`（图谱拓扑） |
-|            | `cd backend && python tests/test_master_graph_e2e.py`（图谱级端到端，FakeLLM） |
-
-后端单测为零第三方依赖的纯函数测试，不需要数据库、Ollama 或向量库，直接 `python` 运行即可。
-
-### 7.12 故障排查
-
-| 现象                                     | 原因与处理                                                              |
-| :------------------------------------- | :----------------------------------------------------------------- |
-| `/health` 中 `ollama` 为 `not_connected` | 容器内 `localhost` 指容器自身；改用 `host.docker.internal:11434`（Linux 见 7.4） |
-| 8000 端口被占用                             | 修改 compose 中的端口映射，或先停止占用进程                                         |
-| BGE 模型下载缓慢或失败                          | 确认 `HF_ENDPOINT` 已生效；或手动下载后挂载到 `hf_cache` volume                   |
-| 上传后一直停留在 embedding                     | 属正常：入库是**异步**的，`POST /upload` 受理即返回。首次需下载模型，可在文档页看 `current_stage`；`docker compose logs -f backend` 跟进度。容器重启会把处理中的文档标成 FAILED，重传同一文件即幂等续传          |
-| 提示向量维度不匹配                              | 修改 `EMBEDDING_DIMENSION` 后必须重建 collection 并重新上传文档                  |
-| 前端报网络错误                                | 确认后端已启动，且根目录 `.env` 的 `BACKEND_URL` 指向正确地址                         |
-| 改了后端代码但容器里没生效                           | 源码是构建时 COPY 进镜像的，参考 7.6 用 `docker-compose.dev.yml` 启动热重载，或 `docker compose build backend` 重新构建 |
-| OCR 首次运行较慢                             | PaddleOCR 首次会下载检测与识别模型，属正常现象                                       |
-| `docker compose build` 长时间无输出（CPU 归零、网络计数静止） | 容器内 **IPv6 不可达**，而镜像源同时返回 AAAA 记录；glibc 默认优先 IPv6，pip/apt 便卡在一个连不通的地址上（宿主机 curl 同一 URL 却只需 1–2 秒）。镜像已在 apt/pip 之前写入 `/etc/gai.conf` 把 IPv4 提为最高优先级；若宿主/守护进程层仍异常，请给 Docker 配 IPv4 DNS 或禁用容器 IPv6 |
-| 登录报"服务端未启用 Keycloak 认证"                | 后端容器是在 `.env` 补上 `KEYCLOAK_ENABLED` **之前**创建的：`env_file` 只在容器创建时读取。`docker compose up -d --force-recreate backend` 让新环境变量生效（参考 7.6） |
-| 登录报"Keycloak 公钥解析失败（缺少 cryptography）"  | 镜像是加 `cryptography==44.0.0` 之前构建的。`docker compose up -d --build backend` 重新构建即可（RS256 验签依赖它） |
-| 登录报"无法获取 Keycloak 公钥"                  | Keycloak 未就绪或 `KEYCLOAK_URL` 不可达：`docker compose ps` 确认 `rag_keycloak` 为 healthy，容器网络内地址应为 `http://keycloak:8080` |
-| 上传/图片保存报 `Permission denied: '/app/uploads'` | 命名卷是在旧镜像（`/app/uploads` 属主为 root）上创建的，非 root 的 `appuser` 无法写入。修复：`docker exec -u 0 rag_backend chown -R appuser:appgroup /app/uploads`；或 `docker compose down -v` 用新镜像重建卷（新镜像已把该目录 chown 给 appuser） |
-| 文档列表里看不到自己上传的文档                       | 确认 `access_level` 与所在租户：新上传默认落**个人知识库**（仅本人可见）；跨公司（`tenant_id` 不同）一律不可见，且不泄漏存在性（表现为 404） |
-| 删除文档报"文档不存在或无权访问"                     | 说明该文档不在你的租户内（跨公司），或你既不是归属人、也没有部门负责人/知识库管理员权限。列表里能看到的文档若为他人所有，删除按钮会被禁用并给出中文原因 |
-| 答案说"没有找到相关信息"却仍挂着"N 个引用来源"           | 模型**主动拒答**时实时流上报了 `refused=false`。根因是 `stream_master` 的局部变量 `final_answer` 只在 `refuse` / `output_guard` 节点被赋值，走 LLM 正常生成的路径时它始终是空串，`is_refusal("")` 恒为 `False`。落库走 `state["answer"]`，所以**历史回放是对的、只有实时流错**（典型现象：重开历史就正常）。修复后 token 与确定性产物都会累积进 `final_answer`，回归测试见 `tests/test_master_graph_e2e.py::test_model_self_refusal_reports_answer_status` |
-| 主界面「查看申请」角标恒为 0                      | 部门负责人调用 `/share-requests/summary` 曾 500（`== dept or ""` 运算符优先级把空字符串塞进 `where()`）。前端 `.catch` 吞掉了错误所以只表现为角标为 0。已加括号并补未归属部门早返回 |
-| `docker compose build backend` 卡住十几分钟不结束   | 依赖**未锁版本**，pip 在 `langchain-core` / `docling` 的几十个版本之间反复回溯。已把 langchain 家族与 docling 图片处理块全部锁死（见 `requirements.txt` 注释），现在解析是线性的 |
-| `pip` 报 `ResolutionImpossible`（docling 相关）   | 两处版本冲突：`docling-slim[standard]` 要求 `openpyxl>=3.1.5`（原锁 3.1.2）、`docling-core` 要求 `pydantic-settings>=2.14.0`（原锁 2.6.1）。均已上调，只用到稳定公开 API，无行为影响 |
-| 中文 OCR 质量明显下降 / `import paddleocr` 报 `No module named 'albumentations'` | `albumentations` 缺失会让 PaddleOCR **整个 import 崩溃**，OCR 静默降级到 Tesseract（中文识别质量差很多）。已在 `requirements.txt` 锁 `albumentations==2.0.8` 并重建镜像 |
-| AI 回答过程中鼠标滚不动 / 往上翻被拽回底部                  | 吸底 effect 依赖 `[messages]`，而流式回答时 `messages` **每个 token 都变**，于是每 token 都调一次 `scrollIntoView({behavior:"smooth"})` 把视口强行拉到底。已改为：仅在用户贴底时跟随（`pinnedRef` + 80px 阈值）、直接设 `scrollTop` 而非 `scrollIntoView`（后者会连带滚动祖先容器）、流式期间用即时滚动（smooth 会被高频 token 打断）。用户滚上去时显示"回到最新"按钮 |
-
----
-
 
 ## 八、环境配置参考
 
@@ -1024,16 +903,7 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 
 发布稳定版本：在仓库 Releases 页面新建 tag（例如 `v1.0.0`），勾选 Set as the latest release 后发布，GitHub 会自动生成 Source code (zip / tar.gz) 下载链接。
 
-### 9.2 远程访问
-
-若需让他人通过浏览器访问，需提供一台可访问的服务：
-
-- 后端：`uvicorn app.main:app --host 0.0.0.0 --port 8000`（生产建议置于反向代理之后终止 TLS）
-- 前端：`npm run build && npm start`
-- 将 `backend/.env` 的 `CORS_ORIGINS` 改为精确的前端域名，`GATEWAY_ENFORCE_ORIGIN` 设为 `true`
-- 多实例部署时，内存级限流需替换为 Redis 等分布式限流，边缘策略建议交由 Kong / APISIX / Envoy 承担
-
-### 9.3 部署前检查清单
+### 9.2 部署前检查清单
 
 | 检查项                          | 要求                                     |
 | :--------------------------- | :------------------------------------- |
