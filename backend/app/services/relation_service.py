@@ -46,11 +46,95 @@ class DocumentDigest:
     warnings: list[str] = field(default_factory=list)
 
 
+def _spread_pick(items: list, count: int) -> list:
+    """
+    在一份文档的 chunk 序列上**等距**取 count 个（含首尾）.
+
+    为什么不能只取开头：分块是按阅读顺序排的，``items[:8]`` 对一份 60 块的
+    文档等于"只读前 13%"。整库总结时这会直接表现为"这份文档只总结了开篇"。
+    等距采样让采样点覆盖全文（首尾必取），摘要才代表整份文档。
+
+    取不满 count 个（步长取整后重复）时不补齐 —— 少一个采样点比重复同一块好。
+    """
+    if count <= 0 or not items:
+        return []
+    if len(items) <= count:
+        return list(items)
+    if count == 1:
+        return [items[0]]
+    step = (len(items) - 1) / (count - 1)
+    return [items[i] for i in sorted({round(i * step) for i in range(count)})]
+
+
+async def list_accessible_documents(
+    *,
+    limit: int | None = None,
+    owner_id: str | None = None,
+    tenant_id: str | None = None,
+    user_department_id: str | None = None,
+    tenant_wide: bool = False,
+    platform_wide: bool = False,
+    document_ids: list[str] | None = None,
+) -> list[tuple]:
+    """
+    列出**当前用户有权访问**的已完成文档（(id, filename, page_count,
+    chunk_count, created_at)，按上传时间倒序）.
+
+    单独抽出来的理由：文档总结需要"用户点名了哪份文档"的完整候选清单，
+    但那一步只要 id + 文件名 —— 为此跑一遍 Qdrant 采样（collect_document_digests）
+    是纯浪费。抽成轻量函数后，候选解析与摘要采样各取所需、共用同一套 ACL。
+    """
+    from app.services.tenancy import document_acl_clause, normalize_tenant_id
+
+    query = (
+        select(
+            Document.id,
+            Document.filename,
+            Document.page_count,
+            Document.chunk_count,
+            Document.created_at,
+        )
+        .where(Document.status == DocumentStatus.COMPLETED)
+        .order_by(Document.created_at.desc())
+    )
+    if document_ids:
+        # 点名了文档 → 必须按 id 过滤后再限量，否则"被点名的老文档"会被
+        # 最近 N 份的上限挤掉（用户明明点了它，却总结不到它）。
+        query = query.where(Document.id.in_([uuid.UUID(str(d)) for d in document_ids]))
+        query = query.limit(max(len(document_ids), 1))
+    elif limit:
+        query = query.limit(limit)
+
+    if tenant_id and not platform_wide:
+        query = query.where(Document.tenant_id == normalize_tenant_id(tenant_id))
+    elif not platform_wide and owner_id:
+        # 无公司上下文的历史调用：退化为"仅本人"，不跨公司放量
+        query = query.where(Document.owner_id == uuid.UUID(owner_id))
+    if platform_wide or tenant_id or owner_id:
+        query = query.where(
+            document_acl_clause(
+                owner_id=uuid.UUID(owner_id) if owner_id else None,
+                department_id=user_department_id,
+                tenant_wide=tenant_wide,
+                platform_wide=platform_wide,
+            )
+        )
+
+    async with get_db_session() as session:
+        rows = (await session.execute(query)).all()
+    return list(rows)
+
+
 async def collect_document_digests(
     max_documents: int | None = None,
     chunks_per_doc: int | None = None,
     digest_chars: int | None = None,
     owner_id: str | None = None,
+    tenant_id: str | None = None,
+    user_department_id: str | None = None,
+    tenant_wide: bool = False,
+    platform_wide: bool = False,
+    document_ids: list[str] | None = None,
 ) -> list[DocumentDigest]:
     """
     Build a content digest for every accessible completed document.
@@ -59,8 +143,14 @@ async def collect_document_digests(
         max_documents:   Cap on documents analysed (most recent N win).
         chunks_per_doc:  Chunks sampled per document for its digest.
         digest_chars:    Max characters of digest text per document.
-        owner_id:        Restrict analysis to documents owned by this user
-                         (None = unrestricted / admin).
+        owner_id:        个人库归属人（恒为本人 id）；None = 不含任何个人库。
+        tenant_id:       第一层隔离 —— 摘要采样只覆盖本公司文档；
+                         None 仅当 platform_wide（平台管理员）时为真。
+        user_department_id: 第二层 Document ACL 的部门条件。
+        tenant_wide:     企业/知识库管理员 —— 本公司的部门库全通。
+        platform_wide:   平台管理员 —— 跨公司（个人库仍然只有自己的）。
+        document_ids:    只采样这些文档（用户点名总结某几份时用）；
+                         None = 全库（受 max_documents 与 ACL 约束）。
 
     Returns:
         List of DocumentDigest sorted by upload time (oldest first).
@@ -72,22 +162,15 @@ async def collect_document_digests(
     digest_chars = digest_chars or settings.RELATION_DIGEST_CHARS
 
     # ── 1. Completed documents from PostgreSQL (most recent N) ────────────────
-    async with get_db_session() as session:
-        query = (
-            select(
-                Document.id,
-                Document.filename,
-                Document.page_count,
-                Document.chunk_count,
-                Document.created_at,
-            )
-            .where(Document.status == DocumentStatus.COMPLETED)
-            .order_by(Document.created_at.desc())
-            .limit(max_documents)
-        )
-        if owner_id:
-            query = query.where(Document.owner_id == uuid.UUID(owner_id))
-        rows = (await session.execute(query)).all()
+    rows = await list_accessible_documents(
+        limit=max_documents,
+        owner_id=owner_id,
+        tenant_id=tenant_id,
+        user_department_id=user_department_id,
+        tenant_wide=tenant_wide,
+        platform_wide=platform_wide,
+        document_ids=document_ids,
+    )
 
     if not rows:
         logger.info("collect_document_digests: no completed documents found")
@@ -140,9 +223,9 @@ async def collect_document_digests(
         if not sample:
             warning.append("未采样到文本内容")
 
-        # Take a spread of chunks (beginning matters most) and clip each one
-        # so a single verbose chunk cannot eat the whole digest budget.
-        picked = sample[: max(chunks_per_doc, 4)]
+        # Take an even spread of chunks (first & last always included) and clip
+        # each one so a single verbose chunk cannot eat the whole digest budget.
+        picked = _spread_pick(sample, max(chunks_per_doc, 4))
         per_chunk = max(digest_chars // max(len(picked), 1), 120)
         parts = [text.strip()[:per_chunk] for _, text in picked if text.strip()]
         digest = "\n…\n".join(parts)[:digest_chars]

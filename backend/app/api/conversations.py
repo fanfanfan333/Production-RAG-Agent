@@ -23,6 +23,7 @@ from app.services.conversation_service import (
     get_conversation_messages,
     list_conversations,
 )
+from app.services.tenancy import effective_tenant_id, scope_for
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -38,9 +39,14 @@ async def list_conversations_endpoint(
     user: Annotated[User, Depends(require_permission("conversation.read"))],
     limit: int = Query(default=50, ge=1, le=200),
 ) -> dict:
+    # 会话是**个人**数据：连平台管理员也只列自己的（管理员的跨公司能力
+    # 作用于知识库文档，而不是别人的对话 —— 对话正文里可能引用了他的个人库）。
+    scope = scope_for(user)
     conversations = await list_conversations(
         limit=limit,
-        owner_id=None if user.is_admin else user.id,
+        owner_id=scope.owner_id,
+        # 第三层隔离：跨公司会话不出现在列表里
+        tenant_id=scope.tenant_id,
     )
     return {"conversations": conversations, "total": len(conversations)}
 
@@ -53,9 +59,11 @@ async def get_conversation_messages_endpoint(
     conversation_id: uuid.UUID,
     user: Annotated[User, Depends(require_permission("conversation.read"))],
 ) -> dict:
+    scope = scope_for(user)
     messages = await get_conversation_messages(
         conversation_id,
-        owner_id=None if user.is_admin else user.id,
+        owner_id=scope.owner_id,
+        tenant_id=scope.tenant_id,
     )
     if messages is None:
         raise HTTPException(
@@ -79,7 +87,8 @@ async def delete_conversation_endpoint(
 ) -> dict:
     deleted = await delete_conversation(
         conversation_id,
-        owner_id=None if user.is_admin else user.id,
+        owner_id=user.id,
+        tenant_id=scope_for(user).tenant_id,
     )
     if not deleted:
         raise HTTPException(

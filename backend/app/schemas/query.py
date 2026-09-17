@@ -32,14 +32,24 @@ class QueryRequest(BaseModel):
         le=20,
         description="Number of document chunks to retrieve from the vector store.",
     )
-    mode: Literal["rag", "doc_relations", "list_documents"] | None = Field(
+    mode: Literal[
+        "rag",
+        "knowledge_qa",
+        "document_summary",
+        "general_chat",
+        "doc_relations",
+        "list_documents",
+    ] | None = Field(
         None,
         description=(
-            "Pipeline selection. 'rag' = normal semantic retrieval QA; "
-            "'doc_relations' = cross-document relation analysis (answers "
-            "organized per document); 'list_documents' = deterministic "
-            "listing of the knowledge-base documents (no LLM). Omitted/null "
-            "= auto-detect from the query text."
+            "Pipeline selection. Omitted/null = the LLM Query Router decides "
+            "among the five intents. Explicit values bypass the router: "
+            "'knowledge_qa' (alias 'rag') = Hybrid RAG retrieval QA; "
+            "'document_summary' = per-document content summary; "
+            "'general_chat' = casual chat, no retrieval; "
+            "'doc_relations' = cross-document relation analysis; "
+            "'list_documents' = deterministic listing of knowledge-base "
+            "documents (no LLM)."
         ),
     )
     collection_id: uuid.UUID | None = Field(

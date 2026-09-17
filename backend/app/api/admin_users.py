@@ -19,6 +19,7 @@ from app.db.postgres import get_db_session
 from app.db.user_models import User
 from app.services.audit_service import record_audit
 from app.services.permissions import require_platform_admin
+from app.services.tenancy import normalize_tenant_id
 
 router = APIRouter(prefix="/admin", tags=["Administration"])
 
@@ -30,22 +31,30 @@ class UserAdminOut(BaseModel):
     username: str
     role: str
     is_active: bool
+    tenant_id: str = "default"
+    department_id: str | None = None
 
 
 class UpdateUserAccessRequest(BaseModel):
     role: RoleName | None = None
     is_active: bool | None = None
+    # 第一层/第二层隔离的管理入口：租户与部门只能由管理员分配，
+    # 自主注册一律落在 default 租户（防"自选 company_A"越权加入）。
+    tenant_id: str | None = None
+    department_id: str | None = None
 
 
 @router.get("/users", response_model=list[UserAdminOut], summary="List users and roles")
 async def list_users(
-    _: Annotated[User, Depends(require_platform_admin)],
+    _: Annotated[User, Depends(require_platform_admin())],
 ) -> list[UserAdminOut]:
     async with get_db_session() as session:
         users = list((await session.execute(select(User).order_by(User.created_at))).scalars())
     return [
         UserAdminOut(
-            id=str(user.id), username=user.username, role=user.role, is_active=user.is_active
+            id=str(user.id), username=user.username, role=user.role,
+            is_active=user.is_active, tenant_id=user.tenant_id,
+            department_id=user.department_id,
         )
         for user in users
     ]
@@ -55,10 +64,16 @@ async def list_users(
 async def update_user_access(
     user_id: uuid.UUID,
     body: UpdateUserAccessRequest,
-    admin: Annotated[User, Depends(require_platform_admin)],
+    admin: Annotated[User, Depends(require_platform_admin())],
 ) -> UserAdminOut:
-    if body.role is None and body.is_active is None:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="至少需要提供 role 或 is_active")
+    if (
+        body.role is None and body.is_active is None
+        and body.tenant_id is None and body.department_id is None
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="至少需要提供 role / is_active / tenant_id / department_id 之一",
+        )
 
     async with get_db_session() as session:
         user = await session.get(User, user_id)
@@ -87,10 +102,16 @@ async def update_user_access(
             user.role = body.role
         if body.is_active is not None:
             user.is_active = body.is_active
+        if body.tenant_id is not None:
+            user.tenant_id = normalize_tenant_id(body.tenant_id)
+        if body.department_id is not None:
+            user.department_id = body.department_id.strip() or None
         await session.flush()
         await session.refresh(user)
         out = UserAdminOut(
-            id=str(user.id), username=user.username, role=user.role, is_active=user.is_active
+            id=str(user.id), username=user.username, role=user.role,
+            is_active=user.is_active, tenant_id=user.tenant_id,
+            department_id=user.department_id,
         )
 
     await record_audit(
@@ -99,6 +120,6 @@ async def update_user_access(
         username=admin.username,
         resource_type="user",
         resource_id=str(user_id),
-        detail=f"role={out.role}; is_active={out.is_active}",
+        detail=f"role={out.role}; is_active={out.is_active}; tenant={out.tenant_id}; dept={out.department_id}",
     )
     return out

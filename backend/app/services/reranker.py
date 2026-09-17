@@ -24,6 +24,7 @@ LLM 的证据越干净，幻觉与答非所问越少。
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import math
 import threading
 from typing import TYPE_CHECKING
@@ -73,6 +74,49 @@ def _heuristic_scores(query: str, texts: list[str], vector_scores: list[float]) 
 
 
 # ── Reranker singleton ───────────────────────────────────────────────────────
+
+def dedup_candidates(chunks: "list[RetrievedChunk]") -> "list[RetrievedChunk]":
+    """
+    精排前去重：文本完全相同的候选只保留排名最高的一个.
+
+    多查询扩展 + small-to-big 场景下，同一个 chunk 经常从向量腿和 BM25 腿
+    各进一次候选池（或不同查询召回同一父块下的相同子块）。cross-encoder
+    对重复候选是纯粹的浪费推理，还会把 top_k 名额挤占成重复引用。
+    *chunks* 需已按粗排名次排序（保留下标最小的那个）。
+    """
+    seen: set[str] = set()
+    unique: "list[RetrievedChunk]" = []
+    for c in chunks:
+        # 只哈希文本前 1000 字：足以识别重复块，又避免对超长文本全量哈希
+        fingerprint = hashlib.md5(c.text[:1000].encode("utf-8", "ignore")).hexdigest()
+        if fingerprint in seen:
+            continue
+        seen.add(fingerprint)
+        unique.append(c)
+    if len(unique) != len(chunks):
+        logger.info("rerank dedup: %d candidates → %d unique", len(chunks), len(unique))
+    return unique
+
+
+def filter_by_min_score(
+    ranked: "list[RetrievedChunk]",
+    min_score: float,
+) -> "list[RetrievedChunk]":
+    """
+    Relevance Threshold（框架图精排 → Top 3~5 → 相关性阈值）：
+    丢弃精排置信度低于阈值的候选，不让"擦边"证据进入上下文诱导幻觉.
+
+    可能返回空列表 —— 全员低于阈值说明证据确实不行，交给上层 grader
+    走 retry/refuse 路径，比硬塞噪声证据给 LLM 更诚实。
+    """
+    kept = [c for c in ranked if c.score >= min_score]
+    if len(kept) != len(ranked):
+        logger.info(
+            "relevance threshold: %d → %d chunks (min_score=%.2f)",
+            len(ranked), len(kept), min_score,
+        )
+    return kept
+
 
 class ChunkReranker:
     """
@@ -163,6 +207,13 @@ class ChunkReranker:
         if not texts:
             return []
 
+        # bge-reranker 系列的窗口只有 512 token，超长部分本来就截断；
+        # 先按字符截到 RERANKER_MAX_TEXT_CHARS，省掉无效 tokenization
+        # 与推理开销（粗排候选是 1000~2000 字的块，父块回填后更长）。
+        limit = get_settings().RERANKER_MAX_TEXT_CHARS
+        if limit > 0:
+            texts = [t[:limit] for t in texts]
+
         if self._backend == "flagreranker":
             raw = self._model.compute_score(
                 [[query, t] for t in texts], normalize=False
@@ -188,6 +239,29 @@ class ChunkReranker:
         """Async wrapper: normalize=False + sigmoid keeps the [0,1] scale stable."""
         return await asyncio.to_thread(self._score_pairs_sync, query, texts, vector_scores)
 
+    async def score_pairs_multi(
+        self,
+        queries: list[str],
+        texts: list[str],
+        vector_scores: list[float],
+    ) -> list[float]:
+        """
+        多查询精排：对每路查询分别打分，每个候选取各路中的最高分.
+
+        动机：粗排用多查询扩展提升了召回，但精排只用主查询打分会漏掉
+        "变体措辞比主查询贴得更近"的候选（查询改写本来就是近似）。
+        取 max 是标准的多查询精排融合做法；代价是推理次数 × 查询数，
+        由 RERANKER_USE_QUERY_VARIANTS 开关控制（默认关）。
+        """
+        if len(queries) <= 1:
+            return await self.score_pairs(queries[0], texts, vector_scores)
+        score_lists = await asyncio.gather(*(
+            self.score_pairs(q, texts, vector_scores) for q in queries
+        ))
+        return [
+            max(per_candidate) for per_candidate in zip(*score_lists)
+        ]
+
     def backend_name(self) -> str:
         return self._backend or "heuristic"
 
@@ -202,9 +276,18 @@ async def rerank_chunks(
     query: str,
     chunks: "list[RetrievedChunk]",
     top_k: int,
+    queries: "list[str] | None" = None,
+    min_score: float | None = None,
 ) -> "list[RetrievedChunk]":
     """
     精排：对粗排候选逐对打分并重排序，返回 top_k.
+
+    流程（对应框架图 Candidate Top 20~50 → Reranker → Top 3~5 → Threshold）：
+      1. 去重      —— 相同文本候选只保留一个，省推理也不挤占 top_k 名额
+      2. 逐对打分  —— cross-encoder 打分；传入 *queries*（含检索变体）且
+                      RERANKER_USE_QUERY_VARIANTS 开启时按多查询取最大分
+      3. 阈值过滤  —— *min_score* 以下丢弃（None = 不过滤）
+      4. 截断      —— 取前 top_k
 
     - chunk.score 被替换为归一化精排分（[0,1]，可直接用于
       RERANK_MIN_SCORE 幻觉守卫和前端"相关度 %"展示）。
@@ -219,21 +302,46 @@ async def rerank_chunks(
 
     try:
         reranker = get_reranker()
-        vector_scores = [c.score for c in chunks]
-        scores = await reranker.score_pairs(query, [c.text for c in chunks], vector_scores)
 
-        ranked = list(zip(chunks, scores))
+        # 1) 去重（保序：粗排名次靠前的优先保留）
+        unique_chunks = dedup_candidates(chunks)
+
+        vector_scores = [c.score for c in unique_chunks]
+        score_queries: list[str] = [query]
+        if settings.RERANKER_USE_QUERY_VARIANTS and queries:
+            score_queries = [q for q in dict.fromkeys(queries) if q]
+            if query not in score_queries:
+                score_queries.insert(0, query)
+
+        # 2) 打分（单查询或多查询取 max）
+        if len(score_queries) > 1:
+            scores = await reranker.score_pairs_multi(
+                score_queries, [c.text for c in unique_chunks], vector_scores
+            )
+        else:
+            scores = await reranker.score_pairs(
+                query, [c.text for c in unique_chunks], vector_scores
+            )
+
+        ranked = list(zip(unique_chunks, scores))
         ranked.sort(key=lambda cs: cs[1], reverse=True)
 
-        reranked: list[RetrievedChunk] = []
-        for chunk, score in ranked[:top_k]:
+        reranked: "list[RetrievedChunk]" = []
+        for chunk, score in ranked:
             chunk.score = round(float(score), 4)
             reranked.append(chunk)
 
+        # 3) 相关性阈值（可能返回空 —— 证据不行就交给上层 retry/refuse）
+        if min_score is not None:
+            reranked = filter_by_min_score(reranked, min_score)
+
+        # 4) 截断到 top_k
+        reranked = reranked[:top_k]
+
         logger.info(
-            "rerank: %d candidates → top %d (backend=%s best=%.4f)",
+            "rerank: %d candidates → top %d (backend=%s queries=%d best=%.4f)",
             len(chunks), len(reranked), reranker.backend_name(),
-            ranked[0][1] if ranked else 0.0,
+            len(score_queries), ranked[0][1] if ranked else 0.0,
         )
         return reranked
     except Exception:

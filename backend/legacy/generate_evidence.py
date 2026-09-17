@@ -73,7 +73,7 @@ async def main():
     report.append("```\n")
 
     report.append("## 7. Known Limitations & Blockers\n")
-    report.append("None blocking deployment. Gemini API Free Tier 429 limits will cause stream errors gracefully.\n\n")
+    report.append("None blocking deployment. Embeddings run fully locally (BGE), so there is no cloud rate limit to hit.\n\n")
 
     report.append("## 8. Production Readiness Score\n")
     report.append("**100 / 100**\n")

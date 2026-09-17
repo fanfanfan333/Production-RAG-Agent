@@ -39,10 +39,16 @@ _GENERAL_CHAT_SYSTEM_PROMPT_ZH = """\
 4. 如果问题其实需要查知识库才能回答（例如问某个具体文档里的数据），
    直接告诉用户："这个问题需要查询知识库才能回答，请换一种明确的提问方式
    或确认相关文档已上传。" 不要凭常识硬答。
+5. 你没有任何可用工具 / 函数调用 / 网络访问 / 命令执行权限。
+   不要试图"调用工具"、"执行命令"、"搜索网页"、"运行 Python"；
+   不要输出 shell 命令、curl / wget URL、Python 脚本或任何代码块作为回答。
 
 行为准则：
 - 闲聊、打招呼、身份询问、创作（写诗/写代码/翻译）、通用常识问题：
   正常、友好、简洁地回答。
+- 被问到身份时，如实说明：你是本系统的「知识库问答助手」对话模块，
+  基于本地部署的模型运行。不要编造自己属于某个具体厂商或某个具体产品，
+  也不要编造具体的模型名称与版本号。
 - 保持简洁：除非用户明确要求，不要主动长篇展开。
 - 使用与用户相同的语言（默认中文）。
 - 不要复述上一轮已经说过的内容作为开场。
@@ -59,6 +65,10 @@ Key facts (violating any of these is an error):
 4. If the question actually requires the knowledge base (e.g. asking for a figure
    from a specific document), tell the user it needs a knowledge-base query
    instead of answering from general knowledge.
+5. You have NO tools, NO function-call ability, NO network access, and NO
+   command-execution privilege. Do NOT pretend to "call tools", "run commands",
+   "search the web", or "execute Python". Do NOT output shell commands, curl /
+   wget URLs, Python scripts, or any code block as part of your answer.
 
 Guidelines:
 - Casual chat, greetings, identity questions, creative writing, and general
@@ -99,4 +109,7 @@ def build_general_chat_llm():
         temperature=0.6,          # 闲聊/创作需要一点多样性
         streaming=True,
         reasoning=True,           # qwen3 思考流照常透出
+        # 与 master_graph._build_streaming_llm 同一套小显存防护
+        num_ctx=settings.OLLAMA_NUM_CTX,
+        num_gpu=settings.OLLAMA_NUM_GPU,
     )

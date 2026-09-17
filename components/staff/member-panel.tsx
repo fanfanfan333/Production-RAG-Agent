@@ -1,0 +1,678 @@
+"use client";
+
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
+import {
+  AlertCircle,
+  FileText,
+  Loader2,
+  MessagesSquare,
+  Search,
+  ShieldAlert,
+  Trash2,
+  UserCog,
+  Users,
+} from "lucide-react";
+import { toast } from "sonner";
+import {
+  deleteStaffMember,
+  getStaffCompanies,
+  getStaffMembers,
+  previewStaffMemberDeletion,
+  updateStaffMember,
+} from "@/lib/api/staff";
+import { useAuth } from "@/lib/context/auth-context";
+import type {
+  CompanyOption,
+  MemberDeletionImpact,
+  StaffMember,
+} from "@/lib/types";
+import { ROLE_LABELS, roleRank } from "@/lib/types";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { Select, SelectItem } from "@/components/ui/select";
+import { Skeleton } from "@/components/ui/skeleton";
+import { IdentityBadge } from "@/components/staff/identity-badge";
+import { cn } from "@/lib/utils";
+
+const IDENTITY_FILTERS = [
+  { key: "all", label: "全部" },
+  { key: "approved", label: "已通过" },
+  { key: "pending", label: "审核中" },
+  { key: "none", label: "未验证" },
+] as const;
+
+/**
+ * 成员管理（知识库管理员及以上）.
+ *
+ * 公司隔离由后端强制：非平台管理员传 ``company_id`` 也会被忽略，只返回本公司
+ * 成员。前端因此把公司筛选器只对平台管理员渲染出来 —— 不显示一个点了没反应的控件。
+ *
+ * 「更换职责」= 已入职成员调整岗位，不必再走一遍身份验证申请。约束与审核一致：
+ * 只能授予严格低于自己的角色，不能修改同级或更高等级的人，也不能把自己提权。
+ */
+export function MemberPanel() {
+  const { user } = useAuth();
+  const isPlatformAdmin = Boolean(user?.role === "admin" || user?.permissions?.includes("*"));
+
+  const [members, setMembers] = useState<StaffMember[]>([]);
+  const [companies, setCompanies] = useState<CompanyOption[]>([]);
+  const [companyId, setCompanyId] = useState("");
+  const [keyword, setKeyword] = useState("");
+  const [filter, setFilter] = useState<(typeof IDENTITY_FILTERS)[number]["key"]>("all");
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [editing, setEditing] = useState<StaffMember | null>(null);
+  const [deleting, setDeleting] = useState<StaffMember | null>(null);
+
+  const load = useCallback(async () => {
+    setError(null);
+    try {
+      const [list, companyList] = await Promise.all([
+        getStaffMembers({
+          companyId: isPlatformAdmin && companyId ? companyId : undefined,
+          keyword: keyword.trim() || undefined,
+        }),
+        getStaffCompanies().catch(() => [] as CompanyOption[]),
+      ]);
+      setMembers(list);
+      setCompanies(companyList);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "加载成员列表失败");
+    } finally {
+      setLoading(false);
+    }
+  }, [companyId, keyword, isPlatformAdmin]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  const visible = useMemo(
+    () =>
+      filter === "all"
+        ? members
+        : members.filter((m) => m.identityStatus === filter),
+    [members, filter]
+  );
+
+  /** 我可授予的角色（严格低于自己等级的）——与后端 can_grant_role 同规则。 */
+  const myRank = roleRank(user?.role);
+  const grantable = useMemo(
+    () => Object.keys(ROLE_LABELS).filter((r) => roleRank(r) < myRank && r !== "user" && r !== "editor" && r !== "manager"),
+    [myRank]
+  );
+
+  /**
+   * 为什么这个成员不能被删除（null = 可以删）。
+   *
+   * 与后端 ``_deletable_member`` 的五条判定同口径，只是提前在界面上说清楚，
+   * 让用户看到"按钮为什么是灰的"，而不是点了才收到 403。
+   * 注意：真正不可绕过的守门永远在后端，这里只是把原因显性化。
+   */
+  const deleteBlockedReason = useCallback(
+    (member: StaffMember): string | null => {
+      if (member.isAdmin) return "平台管理员账号不可删除";
+      if (user?.id && member.id === user.id) return "不能删除自己的账号";
+      if (roleRank(member.role) >= myRank)
+        return `只能删除等级低于自己的成员（对方：${member.roleLabel}）`;
+      return null;
+    },
+    [myRank, user?.id]
+  );
+
+  return (
+    <Card>
+      <CardHeader className="gap-4">
+        <div>
+          <CardTitle>成员管理</CardTitle>
+          <CardDescription>
+            查看本公司成员的公司、部门、职责与身份状态，可直接更换成员职责或删除成员；
+            删除会带走其个人知识库与历史对话，已发布到部门/公司知识库的文档保留
+          </CardDescription>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="relative min-w-[180px] flex-1">
+            <Search className="absolute top-1/2 left-3 size-3.5 -translate-y-1/2 text-muted-foreground" />
+            <Input
+              value={keyword}
+              onChange={(e) => setKeyword(e.target.value)}
+              placeholder="按账号或姓名搜索"
+              className="h-9 pl-8"
+            />
+          </div>
+
+          {isPlatformAdmin && companies.length > 0 && (
+            <Select
+              value={companyId}
+              onChange={(e) => setCompanyId(e.target.value)}
+              className="w-[190px]"
+            >
+              <SelectItem value="">全部公司（{companies.length}）</SelectItem>
+              {companies.map((c) => (
+                <SelectItem key={c.companyId} value={c.companyId}>
+                  {c.companyName}（{c.memberCount}）
+                </SelectItem>
+              ))}
+            </Select>
+          )}
+
+          <div className="flex items-center gap-1.5">
+            {IDENTITY_FILTERS.map((item) => (
+              <button
+                key={item.key}
+                type="button"
+                onClick={() => setFilter(item.key)}
+                className={cn(
+                  "rounded-md border px-2.5 py-1.5 text-xs font-medium transition-colors",
+                  filter === item.key
+                    ? "border-primary/50 bg-primary/5 text-foreground"
+                    : "border-border/60 text-muted-foreground hover:bg-muted/50 hover:text-foreground"
+                )}
+              >
+                {item.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      </CardHeader>
+
+      <CardContent className="px-0">
+        {error ? (
+          <div className="flex items-center gap-3 px-6 py-8 text-sm text-destructive">
+            <AlertCircle className="size-4 shrink-0" />
+            <span>{error}</span>
+          </div>
+        ) : loading ? (
+          <div className="space-y-3 px-6 py-2">
+            {Array.from({ length: 4 }).map((_, i) => (
+              <Skeleton key={i} className="h-14 w-full" />
+            ))}
+          </div>
+        ) : visible.length === 0 ? (
+          <p className="flex items-center justify-center gap-2 px-6 py-8 text-sm text-muted-foreground">
+            <Users className="size-4" />
+            没有匹配的成员
+          </p>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full min-w-[760px] text-[13px]">
+              <thead>
+                <tr className="border-b border-border/60 text-left text-[11px] uppercase tracking-wide text-muted-foreground">
+                  <th className="px-6 py-2.5 font-medium">姓名 / 账号</th>
+                  <th className="px-3 py-2.5 font-medium">公司</th>
+                  <th className="px-3 py-2.5 font-medium">部门</th>
+                  <th className="px-3 py-2.5 font-medium">职位</th>
+                  <th className="px-3 py-2.5 font-medium">身份验证</th>
+                  <th className="px-6 py-2.5 text-right font-medium">操作</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-border/60">
+                {visible.map((member) => (
+                  <tr key={member.id} className="transition-colors hover:bg-muted/30">
+                    <td className="px-6 py-3">
+                      <p className="font-medium">{member.name}</p>
+                      <p className="font-mono text-[11px] text-muted-foreground">
+                        {member.username}
+                      </p>
+                    </td>
+                    <td className="px-3 py-3 text-muted-foreground">
+                      {member.companyName}
+                    </td>
+                    <td className="px-3 py-3 text-muted-foreground">
+                      {member.departmentName || "—"}
+                    </td>
+                    <td className="px-3 py-3">
+                      <span className="text-foreground/90">
+                        {member.jobTitle || "—"}
+                      </span>
+                      <span className="ml-1.5 text-[11px] text-muted-foreground">
+                        {member.roleLabel}
+                      </span>
+                    </td>
+                    <td className="px-3 py-3">
+                      <IdentityBadge status={member.identityStatus} />
+                    </td>
+                    <td className="px-6 py-3 text-right">
+                      {member.isAdmin ? (
+                        <Badge variant="secondary">最高权限</Badge>
+                      ) : (
+                        <div className="flex items-center justify-end gap-0.5">
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="gap-1.5 text-muted-foreground hover:text-foreground"
+                            disabled={roleRank(member.role) >= myRank}
+                            title={
+                              roleRank(member.role) >= myRank
+                                ? `只能调整等级低于自己的成员（对方：${member.roleLabel}）`
+                                : "调整该成员的职责 / 部门 / 启用状态"
+                            }
+                            onClick={() => setEditing(member)}
+                          >
+                            <UserCog className="size-3.5" />
+                            更换职责
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            className="size-8 text-muted-foreground hover:text-destructive"
+                            disabled={deleteBlockedReason(member) !== null}
+                            title={
+                              deleteBlockedReason(member) ??
+                              `删除 ${member.name} 的账号（个人数据一并删除）`
+                            }
+                            onClick={() => setDeleting(member)}
+                          >
+                            <Trash2 className="size-3.5" />
+                          </Button>
+                        </div>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </CardContent>
+
+      <EditMemberDialog
+        member={editing}
+        grantable={grantable}
+        myRank={myRank}
+        onClose={() => setEditing(null)}
+        onDone={async () => {
+          setEditing(null);
+          await load();
+        }}
+      />
+
+      <DeleteMemberDialog
+        member={deleting}
+        onClose={() => setDeleting(null)}
+        onDone={async () => {
+          setDeleting(null);
+          await load();
+        }}
+      />
+    </Card>
+  );
+}
+
+/** 影响清单里的一行（左标签右数字，空值置灰但不隐藏 —— 让用户看清"确实为 0"）。 */
+function ImpactRow({
+  icon,
+  label,
+  count,
+  unit,
+  tone,
+}: {
+  icon: ReactNode;
+  label: string;
+  count: number;
+  unit: string;
+  tone: "danger" | "keep";
+}) {
+  return (
+    <li className="flex items-center gap-2">
+      <span
+        className={cn(
+          "shrink-0",
+          tone === "danger" ? "text-destructive" : "text-emerald-600 dark:text-emerald-400"
+        )}
+      >
+        {icon}
+      </span>
+      <span className="flex-1 text-foreground/90">{label}</span>
+      <span
+        className={cn(
+          "font-mono tabular-nums",
+          count === 0
+            ? "text-muted-foreground/60"
+            : tone === "danger"
+              ? "font-semibold text-destructive"
+              : "text-foreground/90"
+        )}
+      >
+        {count} {unit}
+      </span>
+    </li>
+  );
+}
+
+/**
+ * 删除成员确认弹窗.
+ *
+ * 打开时先向后端要一份**影响预检**：删掉之后哪些东西真的会消失、哪些会留下，
+ * 数字全部来自数据库。产品约定「个人文档消失、部门与公司文档保留」如果只写在
+ * 文案里，用户没法验证；放在这里，点确认之前就能看到有几个文件会被带走。
+ */
+function DeleteMemberDialog({
+  member,
+  onClose,
+  onDone,
+}: {
+  member: StaffMember | null;
+  onClose: () => void;
+  onDone: () => Promise<void> | void;
+}) {
+  const [impact, setImpact] = useState<MemberDeletionImpact | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+
+  const memberId = member?.id ?? null;
+
+  useEffect(() => {
+    if (!memberId) return;
+    let cancelled = false;
+    setImpact(null);
+    setError(null);
+    setLoading(true);
+    (async () => {
+      try {
+        const data = await previewStaffMemberDeletion(memberId);
+        if (!cancelled) setImpact(data);
+      } catch (err) {
+        if (!cancelled)
+          setError(err instanceof Error ? err.message : "无法获取删除影响，请稍后重试");
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [memberId]);
+
+  if (!member) return null;
+
+  const submit = async () => {
+    setError(null);
+    setSubmitting(true);
+    try {
+      const { message } = await deleteStaffMember(member.id);
+      toast.success(message);
+      await onDone();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "删除失败");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <Dialog open onOpenChange={(open) => !open && !submitting && onClose()}>
+      <DialogContent className="max-w-md">
+        <DialogHeader>
+          <DialogTitle className="flex items-center gap-2">
+            <Trash2 className="size-4 text-destructive" />
+            删除该成员的全部信息？
+          </DialogTitle>
+          <DialogDescription>
+            {member.name}（{member.username}） · {member.companyName}
+            {member.departmentName ? ` · ${member.departmentName}` : ""} ·{" "}
+            {member.roleLabel}
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className="space-y-4">
+          <p className="flex items-start gap-2 rounded-lg border border-destructive/25 bg-destructive/5 px-3 py-2 text-[12px] leading-relaxed text-destructive">
+            <ShieldAlert className="mt-0.5 size-3.5 shrink-0" />
+            <span>
+              账号与个人数据将被<strong>永久删除且不可恢复</strong>；删除后该成员无法再登录，
+              其个人知识库文档、历史对话都会消失。
+            </span>
+          </p>
+
+          {loading ? (
+            <p className="flex items-center gap-2 py-2 text-[12px] text-muted-foreground">
+              <Loader2 className="size-3.5 animate-spin" />
+              正在统计该成员的数据…
+            </p>
+          ) : impact ? (
+            <div className="space-y-3 text-[12px]">
+              <div className="rounded-lg border border-border/60 bg-muted/30 px-3 py-2.5">
+                <p className="mb-1.5 font-medium text-foreground/90">将被删除</p>
+                <ul className="space-y-1">
+                  <ImpactRow
+                    icon={<FileText className="size-3.5" />}
+                    label="个人知识库文档（含原文与向量索引）"
+                    count={impact.deleted.personalDocuments}
+                    unit="份"
+                    tone="danger"
+                  />
+                  <ImpactRow
+                    icon={<MessagesSquare className="size-3.5" />}
+                    label="历史对话"
+                    count={impact.deleted.conversations}
+                    unit="个"
+                    tone="danger"
+                  />
+                  <ImpactRow
+                    icon={<MessagesSquare className="size-3.5" />}
+                    label="对话消息"
+                    count={impact.deleted.messages}
+                    unit="条"
+                    tone="danger"
+                  />
+                  <ImpactRow
+                    icon={<FileText className="size-3.5" />}
+                    label="文档集合（个人分组）"
+                    count={impact.deleted.collections}
+                    unit="个"
+                    tone="danger"
+                  />
+                </ul>
+              </div>
+
+              <div className="rounded-lg border border-emerald-500/25 bg-emerald-500/5 px-3 py-2.5">
+                <p className="mb-1.5 font-medium text-foreground/90">将被保留</p>
+                <ul className="space-y-1">
+                  <ImpactRow
+                    icon={<FileText className="size-3.5" />}
+                    label="部门 / 公司知识库文档（仅解除归属，同事仍可检索）"
+                    count={impact.kept.sharedDocuments}
+                    unit="份"
+                    tone="keep"
+                  />
+                  <ImpactRow
+                    icon={<MessagesSquare className="size-3.5" />}
+                    label="身份验证与共享申请的审核留痕"
+                    count={impact.kept.staffRequests + impact.kept.shareRequests}
+                    unit="条"
+                    tone="keep"
+                  />
+                </ul>
+              </div>
+            </div>
+          ) : null}
+
+          {error && (
+            <p className="flex items-start gap-2 rounded-lg border border-destructive/20 bg-destructive/5 px-3 py-2 text-[12px] text-destructive">
+              <AlertCircle className="mt-0.5 size-3.5 shrink-0" />
+              {error}
+            </p>
+          )}
+
+          <div className="flex gap-2">
+            <Button
+              variant="outline"
+              className="flex-1"
+              onClick={onClose}
+              disabled={submitting}
+            >
+              取消
+            </Button>
+            <Button
+              variant="destructive"
+              className="flex-1 gap-2"
+              onClick={submit}
+              // 预检失败/未完成时不允许提交：宁可让用户重试，也不要在不知道
+              // 影响范围的情况下点下去
+              disabled={submitting || loading || (!impact && !error)}
+            >
+              {submitting && <Loader2 className="size-4 animate-spin" />}
+              确认删除
+            </Button>
+          </div>
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function EditMemberDialog({
+  member,
+  grantable,
+  myRank,
+  onClose,
+  onDone,
+}: {
+  member: StaffMember | null;
+  grantable: string[];
+  myRank: number;
+  onClose: () => void;
+  onDone: () => Promise<void> | void;
+}) {
+  const [role, setRole] = useState("");
+  const [department, setDepartment] = useState("");
+  const [jobTitle, setJobTitle] = useState("");
+  const [active, setActive] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+
+  useEffect(() => {
+    if (!member) return;
+    setRole(member.role);
+    setDepartment(member.departmentName ?? "");
+    setJobTitle(member.jobTitle ?? "");
+    setActive(member.isActive);
+    setError(null);
+  }, [member]);
+
+  if (!member) return null;
+
+  const roleOptions = Array.from(new Set([member.role, ...grantable])).filter(
+    (value) => roleRank(value) < myRank || value === member.role
+  );
+
+  const submit = async () => {
+    setError(null);
+    setSubmitting(true);
+    try {
+      await updateStaffMember(member.id, {
+        role: role !== member.role ? role : undefined,
+        departmentName: department.trim() || undefined,
+        jobTitle: jobTitle.trim() || undefined,
+        isActive: active !== member.isActive ? active : undefined,
+      });
+      toast.success("职责已更新");
+      await onDone();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "更新失败");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <Dialog open onOpenChange={(open) => !open && onClose()}>
+      <DialogContent className="max-w-md">
+        <DialogHeader>
+          <DialogTitle>更换职责</DialogTitle>
+          <DialogDescription>
+            {member.name}（{member.username}） · {member.companyName}
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className="space-y-4">
+          <div className="space-y-1.5">
+            <label className="text-[12px] font-medium text-muted-foreground">
+              职责角色
+            </label>
+            <Select
+              value={role}
+              onChange={(e) => setRole(e.target.value)}
+              disabled={submitting}
+            >
+              {roleOptions.map((value) => (
+                <SelectItem key={value} value={value}>
+                  {ROLE_LABELS[value] ?? value}
+                </SelectItem>
+              ))}
+            </Select>
+            <p className="text-[11px] text-muted-foreground">
+              只能授予低于你自己等级的职责；企业管理员全局唯一，不可授予
+            </p>
+          </div>
+
+          <div className="space-y-1.5">
+            <label className="text-[12px] font-medium text-muted-foreground">
+              部门
+            </label>
+            <Input
+              value={department}
+              onChange={(e) => setDepartment(e.target.value)}
+              placeholder="留空表示移出部门"
+              maxLength={128}
+              disabled={submitting}
+            />
+          </div>
+
+          <div className="space-y-1.5">
+            <label className="text-[12px] font-medium text-muted-foreground">
+              部门职责
+            </label>
+            <Input
+              value={jobTitle}
+              onChange={(e) => setJobTitle(e.target.value)}
+              placeholder="如：嵌入式软件工程师"
+              maxLength={128}
+              disabled={submitting}
+            />
+          </div>
+
+          <label className="flex items-center gap-2 text-[13px]">
+            <input
+              type="checkbox"
+              checked={active}
+              onChange={(e) => setActive(e.target.checked)}
+              className="size-3.5 accent-primary"
+              disabled={submitting}
+            />
+            账号启用（取消勾选即停用该成员）
+          </label>
+
+          {error && (
+            <p className="flex items-start gap-2 rounded-lg border border-destructive/20 bg-destructive/5 px-3 py-2 text-[12px] text-destructive">
+              <AlertCircle className="mt-0.5 size-3.5 shrink-0" />
+              {error}
+            </p>
+          )}
+
+          <Button className="w-full gap-2" onClick={submit} disabled={submitting}>
+            {submitting && <Loader2 className="size-4 animate-spin" />}
+            保存修改
+          </Button>
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}

@@ -4,3 +4,11 @@ export { uploadDocuments } from "@/lib/api/upload";
 export { streamQuery } from "@/lib/api/query";
 export { getCollections, createCollection, deleteCollection } from "@/lib/api/collections";
 export { getHealth } from "@/lib/api/health";
+export {
+  listBadCases,
+  updateBadCase,
+  getBadCaseStats,
+  type BadCaseItem,
+  type BadCaseStatus,
+  type BadCaseStatsResponse,
+} from "@/lib/api/badcases";

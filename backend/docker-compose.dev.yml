@@ -1,0 +1,85 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# 开发用覆盖配置 —— 源码热重载（hot reload）
+#
+# 背景（重要，别再踩）
+# ─────────────────────────────────────────────────────────────────────────────
+# Dockerfile 用 `COPY app/ ./app/` 在**构建时**把源码打进镜像，
+# docker-compose.yml 的 backend 只挂了 hf_cache，**不挂源码**。
+# 因此在不带本文件时：
+#     docker compose restart backend   ← 不会加载任何新代码（只是重启旧进程）
+#     docker compose up -d backend     ← 不会加载任何新代码（镜像没变，容器复用）
+#     docker compose build backend     ← 只有这个才会（重新 COPY 源码）
+# 症状就是"本地改好了但容器里行为没变"：改了意图路由 / output_guard /
+# stream_filter，容器里跑的仍是旧代码。
+#
+# 本文件通过「挂载源码 + uvicorn --reload」消除该问题：改完 .py 存盘即自动
+# 重载，无需 build / restart。
+#
+# 用法（必须显式 -f 叠加，默认生产配置完全不受影响）
+# ─────────────────────────────────────────────────────────────────────────────
+#   cd backend
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d backend
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml logs -f backend
+#
+#   回到生产模式（不带本文件即可，容器会被重建回镜像内代码）：
+#   docker compose up -d backend
+#
+#   根目录也提供了等价的快捷脚本：npm run dev:api / dev:api:logs
+#
+# ⚠️ 一个必须知道的副作用：改源码 = 重启 = 掐断进行中的请求
+# ─────────────────────────────────────────────────────────────────────────────
+# --reload 会在检测到 /app 下任何文件变化时重启 worker（SIGTERM）。进程重启会
+# 直接掐断**正在进行的上传**：解析/嵌入到一半的文档会被留在 PARSING/EMBEDDING，
+# 只能等下次启动被 recover_stuck_documents 标成 FAILED，再重传同一文件走幂等
+# 续传。大文档（十几 MB、上百张图）入库要 5–10 分钟，这期间**不要**保存任何
+# backend/app 下的源码；往 /app 里 docker cp 脚本同样会触发（监听范围是整个
+# /app）。需要边传边改代码时，用生产模式（不带本文件）而不是热重载模式。
+#
+# ─────────────────────────────────────────────────────────────────────────────
+services:
+  backend:
+    # 覆盖 Dockerfile 的 CMD：单进程 + 文件监听（--reload 与 --workers 互斥）
+    command:
+      - uvicorn
+      - app.main:app
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "8000"
+      - --reload
+      - --reload-dir
+      - /app/app
+      # 编辑器批量保存时合并成一次重启，避免抖动
+      - --reload-delay
+      - "0.5"
+
+    volumes:
+      # compose 多文件合并时 volumes 按 target 合并，这里保留缓存卷。
+      # target 必须与 docker-compose.yml 完全一致（/app/.cache）：
+      # 写成 /app/.cache/huggingface 会变成"同一卷挂两次"，在 /app/.cache 里
+      # 又叠一层 huggingface/，而 HF_HOME=/app/.cache 时权重其实落在
+      # /app/.cache/hub —— 子卷挂载把 hub 挤到容器可写层，重建即丢。
+      - hf_cache:/app/.cache
+      # 源码热挂载 —— 改完存盘即生效（核心）
+      - ./app:/app/app
+      # 迁移脚本同样免 build（uvicorn 的监听范围包含 /app 根目录）
+      - ./alembic:/app/alembic
+      - ./alembic.ini:/app/alembic.ini
+
+    environment:
+      # ── 关键：Docker Desktop（Windows / macOS）的 bind mount 不会把宿主机的
+      # inotify 事件透传进容器，只靠 --reload 会"改了没反应"。
+      # 强制 watchfiles 走轮询模式，牺牲一点 CPU 换取 100% 能触发。
+      # 本机 /app 下仅约 300 个文件（含 5.4G 模型缓存也只有 55 个文件），
+      # 轮询开销可以忽略。
+      WATCHFILES_FORCE_POLLING: "true"
+      # 轮询间隔（毫秒）。调大更省 CPU，调小更灵敏。
+      WATCHFILES_POLL_DELAY_MS: "500"
+
+      # qwen3:8b 冷启动（首次加载 / 权重换入）经常超过 8s，超时会降级成
+      # knowledge_qa，导致非确定性的闲聊（如"帮我写首诗"）被塞进 RAG。
+      # 开发环境放宽到 20s。
+      ROUTER_TIMEOUT_SECONDS: "20"
+
+      # 需要更详细日志时打开（config.py: LOG_LEVEL）
+      # LOG_LEVEL: "DEBUG"

@@ -1,10 +1,16 @@
 import fitz
 import json
+import os
+import tempfile
 import urllib.request
 import time
 from urllib.error import HTTPError
 
 BASE_URL = "http://localhost:8000"
+
+# 临时 PDF 落盘位置：用系统临时目录而不是硬编码 /tmp —— 后者在 Windows 上
+# 不存在，会让本脚本在能连上后端的情况下仍然第一步就失败。
+_TMP = tempfile.gettempdir()
 
 def create_resume_pdf():
     doc = fitz.open()
@@ -24,7 +30,7 @@ Phone: 555-0100
 B.S. Computer Science.
 """
     page.insert_text((50, 50), text, fontsize=12)
-    path = "/tmp/test_resume.pdf"
+    path = os.path.join(_TMP, "test_resume.pdf")
     doc.save(path)
     doc.close()
     return path
@@ -42,7 +48,7 @@ def create_research_paper_pdf():
         else:
             text = f"Page {i+1} content. " * 100
         page.insert_text((50, 50), text, fontsize=11)
-    path = "/tmp/test_research_paper.pdf"
+    path = os.path.join(_TMP, "test_research_paper.pdf")
     doc.save(path)
     doc.close()
     return path
@@ -56,7 +62,7 @@ def create_tech_book_pdf():
         else:
             text = f"This is detailed content for page {i+1}. " * 150
         page.insert_text((50, 50), text, fontsize=11)
-    path = "/tmp/test_tech_book.pdf"
+    path = os.path.join(_TMP, "test_tech_book.pdf")
     doc.save(path)
     doc.close()
     return path
@@ -127,14 +133,14 @@ if __name__ == "__main__":
     paper = create_research_paper_pdf()
     book = create_tech_book_pdf()
     
-    print("Uploading PDFs (this will trigger adaptive chunking and Gemini embeddings)...")
+    print("Uploading PDFs (this will trigger adaptive chunking and local BGE embeddings)...")
     id1 = upload_file(resume, "resume.pdf")
     
-    print("Sleeping 30s to avoid Gemini rate limits...")
+    print("Sleeping 30s to let the local embedding queue drain...")
     time.sleep(30)
     id2 = upload_file(paper, "research_paper.pdf")
     
-    print("Sleeping 30s to avoid Gemini rate limits...")
+    print("Sleeping 30s to let the local embedding queue drain...")
     time.sleep(30)
     id3 = upload_file(book, "tech_book.pdf")
     

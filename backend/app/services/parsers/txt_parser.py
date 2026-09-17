@@ -4,7 +4,7 @@ from app.utils.logging import get_logger
 logger = get_logger(__name__)
 
 class TxtParser(DocumentParser):
-    def parse(self, content: bytes, filename: str) -> ExtractionResult:
+    def parse(self, content: bytes, filename: str, *, document_id: str | None = None, tenant_id: str | None = None) -> ExtractionResult:
         try:
             full_text = content.decode("utf-8", errors="replace").strip()
         except Exception as exc:

@@ -6,7 +6,7 @@ from app.utils.logging import get_logger
 logger = get_logger(__name__)
 
 class CsvParser(DocumentParser):
-    def parse(self, content: bytes, filename: str) -> ExtractionResult:
+    def parse(self, content: bytes, filename: str, *, document_id: str | None = None, tenant_id: str | None = None) -> ExtractionResult:
         try:
             # Read CSV and convert to string representation
             df = pd.read_csv(io.BytesIO(content))
@@ -33,5 +33,6 @@ class CsvParser(DocumentParser):
             parser_used="pandas",
             ocr_used=False,
             ocr_engine=None,
-            extraction_method="native"
+            extraction_method="native",
+            is_tabular=True,
         )

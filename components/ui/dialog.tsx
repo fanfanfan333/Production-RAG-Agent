@@ -47,8 +47,16 @@ function DialogOverlay({
 function DialogContent({
   className,
   children,
+  hideClose = false,
   ...props
-}: React.ComponentProps<typeof DialogPrimitive.Content>) {
+}: React.ComponentProps<typeof DialogPrimitive.Content> & {
+  /**
+   * 隐藏右上角关闭按钮。"身份验证"这类**必须完成或明确取消**的弹窗用它
+   * 收掉暗戳戳的关闭路径 —— 否则用户点 X 就绕过了整个流程，弹窗会在
+   * 下一次渲染时再弹一次，观感像卡死。
+   */
+  hideClose?: boolean;
+}) {
   return (
     <DialogPortal>
       <DialogOverlay />
@@ -60,10 +68,12 @@ function DialogContent({
         {...props}
       >
         {children}
-        <DialogPrimitive.Close className="absolute top-4 right-4 rounded-sm opacity-70 transition-opacity hover:opacity-100">
-          <X className="size-4" />
-          <span className="sr-only">Close</span>
-        </DialogPrimitive.Close>
+        {!hideClose && (
+          <DialogPrimitive.Close className="absolute top-4 right-4 rounded-sm opacity-70 transition-opacity hover:opacity-100">
+            <X className="size-4" />
+            <span className="sr-only">Close</span>
+          </DialogPrimitive.Close>
+        )}
       </DialogPrimitive.Content>
     </DialogPortal>
   );

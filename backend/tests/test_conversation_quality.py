@@ -10,11 +10,17 @@ Requires:
   - Backend running at http://localhost:8000.
 """
 import json
+import os
+import tempfile
 import urllib.request
 import urllib.error
 import sys
 
 BASE_URL = "http://localhost:8000"
+
+# 临时 PDF 落盘位置：用系统临时目录而不是硬编码 /tmp —— 后者在 Windows 上
+# 不存在，会让本脚本在能连上后端的情况下仍然第一步就失败。
+_TMP = tempfile.gettempdir()
 
 
 def query(question: str, conversation_id: str | None = None, top_k: int = 5) -> dict:
@@ -99,7 +105,7 @@ Currently based in New York, NY."""
     doc = fitz.open()
     page = doc.new_page()
     page.insert_text((50, 50), resume_text, fontsize=11)
-    path = "/tmp/john_smith_resume.pdf"
+    path = os.path.join(_TMP, "john_smith_resume.pdf")
     doc.save(path)
     doc.close()
 

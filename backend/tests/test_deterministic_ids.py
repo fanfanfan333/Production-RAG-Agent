@@ -1,10 +1,16 @@
 import fitz
 import json
+import os
+import tempfile
 import urllib.request
 import time
 from qdrant_client import QdrantClient
 
 BASE_URL = "http://localhost:8000"
+
+# 临时 PDF 落盘位置：用系统临时目录而不是硬编码 /tmp —— 后者在 Windows 上
+# 不存在，会让本脚本在能连上后端的情况下仍然第一步就失败。
+_TMP = tempfile.gettempdir()
 
 def create_pdf(path):
     doc = fitz.open()
@@ -41,7 +47,7 @@ def get_vector_count():
     return client.count(collection_name="documents").count
 
 if __name__ == "__main__":
-    pdf_path = "/tmp/deterministic_test.pdf"
+    pdf_path = os.path.join(_TMP, "deterministic_test.pdf")
     create_pdf(pdf_path)
     
     print("Initial Vector Count:", get_vector_count())

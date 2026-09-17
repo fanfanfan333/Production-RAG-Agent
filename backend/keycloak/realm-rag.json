@@ -1,0 +1,250 @@
+{
+  "realm": "rag",
+  "enabled": true,
+  "displayName": "企业知识库统一身份",
+  "sslRequired": "none",
+  "registrationAllowed": false,
+  "loginWithEmailAllowed": true,
+  "duplicateEmailsAllowed": false,
+  "resetPasswordAllowed": false,
+  "editUsernameAllowed": false,
+  "accessTokenLifespan": 1800,
+  "ssoSessionIdleTimeout": 28800,
+  "ssoSessionMaxLifespan": 43200,
+  "roles": {
+    "realm": [
+      {
+        "name": "employee",
+        "description": "普通员工：上传文档、个人知识库；发布到部门/公司库需申请"
+      },
+      {
+        "name": "dept_manager",
+        "description": "部门负责人：可直接发布到部门库，审核部门范围内的共享申请"
+      },
+      {
+        "name": "kb_admin",
+        "description": "知识库管理员：可直接发布到公司库，审核公司范围共享申请"
+      },
+      {
+        "name": "company_admin",
+        "description": "企业管理员：本公司全部知识库与成员管理权限"
+      },
+      {
+        "name": "admin",
+        "description": "平台管理员：跨公司（租户）超管"
+      }
+    ]
+  },
+  "clients": [
+    {
+      "clientId": "rag-web",
+      "name": "RAG 智能助手 Web",
+      "enabled": true,
+      "publicClient": true,
+      "protocol": "openid-connect",
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": true,
+      "serviceAccountsEnabled": false,
+      "redirectUris": [
+        "http://localhost:3000/*",
+        "http://127.0.0.1:3000/*"
+      ],
+      "webOrigins": [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000"
+      ],
+      "attributes": {
+        "pkce.code.challenge.method": "S256",
+        "post.logout.redirect.uris": "http://localhost:3000/*"
+      },
+      "protocolMappers": [
+        {
+          "name": "tenant_id",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "consentRequired": false,
+          "config": {
+            "user.attribute": "tenant_id",
+            "claim.name": "tenant_id",
+            "jsonType.label": "String",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        },
+        {
+          "name": "department",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "consentRequired": false,
+          "config": {
+            "user.attribute": "department",
+            "claim.name": "department",
+            "jsonType.label": "String",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        },
+        {
+          "name": "roles-flat",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-realm-role-mapper",
+          "consentRequired": false,
+          "config": {
+            "multivalued": "true",
+            "claim.name": "roles",
+            "jsonType.label": "String",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        },
+        {
+          "name": "display-name",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-full-name-mapper",
+          "consentRequired": false,
+          "config": {
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        }
+      ]
+    }
+  ],
+  "users": [
+    {
+      "username": "zhangsan",
+      "enabled": true,
+      "emailVerified": true,
+      "firstName": "张三",
+      "email": "zhangsan@company-a.example",
+      "attributes": {
+        "tenant_id": [
+          "company_a"
+        ],
+        "department": [
+          "technology"
+        ]
+      },
+      "credentials": [
+        {
+          "type": "password",
+          "value": "Passw0rd!",
+          "temporary": false
+        }
+      ],
+      "realmRoles": [
+        "employee"
+      ],
+      "lastName": "张三"
+    },
+    {
+      "username": "lisi",
+      "enabled": true,
+      "emailVerified": true,
+      "firstName": "李四",
+      "email": "lisi@company-a.example",
+      "attributes": {
+        "tenant_id": [
+          "company_a"
+        ],
+        "department": [
+          "technology"
+        ]
+      },
+      "credentials": [
+        {
+          "type": "password",
+          "value": "Passw0rd!",
+          "temporary": false
+        }
+      ],
+      "realmRoles": [
+        "dept_manager"
+      ],
+      "lastName": "李四"
+    },
+    {
+      "username": "wangwu",
+      "enabled": true,
+      "emailVerified": true,
+      "firstName": "王五",
+      "email": "wangwu@company-a.example",
+      "attributes": {
+        "tenant_id": [
+          "company_a"
+        ],
+        "department": [
+          "knowledge-center"
+        ]
+      },
+      "credentials": [
+        {
+          "type": "password",
+          "value": "Passw0rd!",
+          "temporary": false
+        }
+      ],
+      "realmRoles": [
+        "kb_admin"
+      ],
+      "lastName": "王五"
+    },
+    {
+      "username": "zhaoliu",
+      "enabled": true,
+      "emailVerified": true,
+      "firstName": "赵六",
+      "email": "zhaoliu@company-a.example",
+      "attributes": {
+        "tenant_id": [
+          "company_a"
+        ],
+        "department": [
+          "management"
+        ]
+      },
+      "credentials": [
+        {
+          "type": "password",
+          "value": "Passw0rd!",
+          "temporary": false
+        }
+      ],
+      "realmRoles": [
+        "company_admin"
+      ],
+      "lastName": "赵六"
+    },
+    {
+      "username": "sunqi",
+      "enabled": true,
+      "emailVerified": true,
+      "firstName": "孙七",
+      "email": "sunqi@company-b.example",
+      "attributes": {
+        "tenant_id": [
+          "company_b"
+        ],
+        "department": [
+          "technology"
+        ]
+      },
+      "credentials": [
+        {
+          "type": "password",
+          "value": "Passw0rd!",
+          "temporary": false
+        }
+      ],
+      "realmRoles": [
+        "employee"
+      ],
+      "lastName": "孙七"
+    }
+  ]
+}

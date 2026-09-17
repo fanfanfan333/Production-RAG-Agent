@@ -1,5 +1,5 @@
 """
-Local BGE embedding provider (replaces the Gemini-based provider).
+Local BGE embedding provider (the project's only, fully offline provider).
 
 Implements the exact interface that embedding_service.embed_batch_with_retry
 expects from get_embedding_provider():

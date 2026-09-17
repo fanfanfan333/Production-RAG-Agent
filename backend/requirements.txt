@@ -1,22 +1,48 @@
 # ── Core ─────────────────────────────────────────────────────────────────────
 fastapi==0.115.5
 uvicorn[standard]==0.32.1
-pydantic==2.10.3
-pydantic-settings==2.6.1
+# pydantic>=2.11 修复 Docling 的 pipeline_options.model_dump_json() 循环引用 bug
+pydantic>=2.11
+# 2.6.1 → 2.14.0：docling-core 要求 pydantic-settings>=2.14.0，否则依赖解析
+# ResolutionImpossible。本项目只用到 BaseSettings + SettingsConfigDict 这两个
+# 2.x 全版本稳定的 API，升级无影响。
+pydantic-settings==2.14.0
 
 # ── Auth (multi-user JWT, 企业落地第一阶段) ────────────────────────────────────
 PyJWT==2.10.1
 bcrypt==4.2.1
+# Keycloak OIDC: RS256（RSASSA-PKCS1-v1_5 + SHA-256）验签需要 cryptography。
+# 没有它 PyJWT 的 jwt.algorithms.has_crypto 为 False，RSAAlgorithm 根本不存在，
+# 于是任何非对称签名令牌都会被判无效 —— 这是 Keycloak 接入的硬依赖。
+cryptography==44.0.0
+# JWKS 拉取与缓存（Keycloak 的 /realms/{realm}/protocol/openid-connect/certs）
+httpx==0.28.1
 
 # ── Ollama (chat generation) ───────────────────────────────────────────────
-langchain-ollama
+# 锁版本：不锁会连带把 langchain-core 拉到 1.x（见文件末尾 LangGraph 段的说明）
+langchain-ollama==0.3.10
 
 # ── BGE (local embedding) ─────────────────────────────────────────────────
 # CPU-only torch — avoids pulling several GB of unused NVIDIA/CUDA packages,
 # since this container has no GPU (bge_provider.py runs with use_fp16=False).
---extra-index-url https://download.pytorch.org/whl/cpu
-torch
-FlagEmbedding
+#
+# 注意两件事（2026-09-16 实修，别再踩）：
+#
+# 1) 这里**必须**写 `torch==2.14.0+cpu`，不能写 `torch==2.14.0`。
+#    阿里云 pytorch-wheels 镜像提供的是 `2.14.0+cpu` 这个带本地版本标识的
+#    wheel。按 PEP 440，`==2.14.0` **不匹配** `2.14.0+cpu`（本地版本标识只有
+#    在约束里显式带 `+` 时才参与匹配）。写 `2.14.0` 的后果实测是：第一层
+#    已按 wheel 直链装好 2.14.0+cpu，到了这一层 pip 仍判为不满足，转而去
+#    PyPI 下载 **554.6 MB 的 CUDA 版 torch**（镜像里根本用不上 GPU）。
+#
+# 2) 不要再写 `--extra-index-url`。
+#    原来是 download.pytorch.org（国外源，国内 ~196MB 极慢、解析期频繁回查）；
+#    改指 mirrors.aliyun.com/pytorch-wheels/cpu/ 也不行 —— 该镜像是目录索引式，
+#    不是标准 PEP 503 索引，pip 无法从它解析 `+cpu` 版本。
+#    正确做法：Dockerfile 用 wheel 完整 URL 直链安装（见 Dockerfile.local），
+#    本文件这行只作为「已满足」的声明，不会再触发任何下载。
+torch==2.14.0+cpu
+FlagEmbedding==1.4.2
 
 # ── Database ──────────────────────────────────────────────────────────────────
 sqlalchemy[asyncio]==2.0.36
@@ -29,11 +55,29 @@ paddleocr==2.9.0
 pytesseract==0.3.13
 Pillow==10.3.0
 opencv-python-headless==4.9.0.80
-python-docx==1.1.2
+python-docx==1.2.0
 python-pptx==1.0.2
-openpyxl==3.1.2
+# 3.1.2 → 3.1.5：docling-slim[standard] 要求 openpyxl>=3.1.5，否则依赖解析
+# 直接 ResolutionImpossible（构建失败）。3.1.x 内是补丁级升级，本项目只用到
+# load_workbook 这个稳定公开 API，不受影响。
+openpyxl==3.1.5
 pandas==2.2.2
 markdown==3.6
+
+# ── 多引擎图片处理（模型型方案）────────────────────────────────────────────────
+# 这几个包原先不锁版本，导致重新构建时 pip 在 docling 的 20+ 个版本之间反复回溯
+# （一次构建 >17 分钟仍未收敛）。更严重的是 albumentations 缺失会让
+# `import paddleocr` 直接抛 ModuleNotFoundError —— PaddleOCR 是中文 OCR 的主力，
+# 少了它只能退回 Tesseract，中文识别质量显著下降。因此这里全部锁死。
+# 版本取自实测可用的解析结果（torch 2.14.0 对应 torchvision 0.29.0）。
+# Docling：PDF/DOCX 基础解析（版面模型，首次使用自动下载）。
+#   注意 DOCLING_PDF_ENABLED 默认 false，主 PDF 路径不走它；
+#   引擎注册表通过 is_available() 探测，未安装时优雅降级，不影响启动。
+docling==2.126.0
+transformers==5.16.1
+timm==1.0.29
+torchvision==0.29.0+cpu
+albumentations==2.0.8
 
 # ── Qdrant ────────────────────────────────────────────────────────────────────
 qdrant-client==1.12.1
@@ -42,6 +86,16 @@ qdrant-client==1.12.1
 pymupdf==1.25.1
 
 # ── LangGraph / LangChain ──────────────────────────────────────────────────
-langgraph
-langchain-community
+# 必须锁死。这几个包原先不锁版本，导致 2026-09 之后重新构建时 pip 会解析到
+# langchain-core 1.x —— 与已测试的 0.3.x API 不兼容，且解析过程会在
+# langchain-core 的 30+ 个版本之间反复回溯（一次构建 >17 分钟仍未收敛）。
+# 下面这组版本是运行态实测通过（259 条后端测试全绿）的组合，不要随意放开。
+langchain-core==0.3.86
+langchain==0.3.30
+langchain-community==0.3.27
+langchain-text-splitters==0.3.11
+langgraph==1.0.1
+langgraph-checkpoint==3.0.1
+langgraph-prebuilt==1.0.1
+langgraph-sdk==0.2.15
 python-multipart==0.0.20

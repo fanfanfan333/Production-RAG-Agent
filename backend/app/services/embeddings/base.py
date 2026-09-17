@@ -3,7 +3,8 @@ from typing import Any
 
 class BaseEmbeddingProvider(ABC):
     """
-    Abstract base class for all embedding providers (Gemini, OpenAI, etc).
+    Abstract base class for all embedding providers (local BGE today, any
+    future provider must implement the same contract).
     """
 
     @abstractmethod

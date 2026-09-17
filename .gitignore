@@ -50,3 +50,32 @@ backend/alembic/versions/__pycache__/
 .vscode/
 .workbuddy/
 .workbuddy-ai/
+
+# ── 本地临时产物 / 一次性调试脚本（不入库）────────────────────────
+.e2e_tmp/
+.login.html
+probe_*.py
+probe_*.txt
+/NVIDIA Corporation/
+
+# ── 本机构建缓存 / 依赖镜像产物（不入库）────────────────────────
+.next-verify/
+backend/_wheels/
+backend/_fetch_wheels.sh
+.npmrc
+git_out.txt
+ls_out.txt
+copy_result.txt
+git_stage*.txt
+*_tmp_del.txt
+# git 修复过程的临时产物
+.git_broken/
+fix.txt
+push_result*.txt
+pull_info*.txt
+merge_info*.txt
+diag*.txt
+shallow.txt
+git_author.txt
+git_commit*.txt
+*_probe.txt

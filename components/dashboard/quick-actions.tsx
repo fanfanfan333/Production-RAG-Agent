@@ -1,11 +1,13 @@
 "use client";
 
+import { useEffect, useState } from "react";
 import Link from "next/link";
 import { motion } from "framer-motion";
 import {
   Upload,
   FileStack,
   FolderOpen,
+  Inbox,
   Settings2,
   ArrowUpRight,
 } from "lucide-react";
@@ -18,15 +20,41 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { quickActions } from "@/lib/types";
+import { getShareRequestSummary } from "@/lib/api/share";
 
 const iconMap = {
   upload: Upload,
   documents: FileStack,
+  requests: Inbox,
   collections: FolderOpen,
   settings: Settings2,
 };
 
 export function QuickActions() {
+  // 主界面「查看申请」角标：待我审核 + 我的申请有新结论，都提示出来，
+  // 让"申请是否通过 / 有没有待处理的申请"在主界面一眼可见。
+  const [pendingBadge, setPendingBadge] = useState(0);
+
+  useEffect(() => {
+    let cancelled = false;
+    const load = () => {
+      getShareRequestSummary()
+        .then((summary) => {
+          if (!cancelled) setPendingBadge(summary.totalBadge);
+        })
+        .catch(() => {
+          if (!cancelled) setPendingBadge(0);
+        });
+    };
+    load();
+    const handler = () => load();
+    window.addEventListener("share-requests-changed", handler);
+    return () => {
+      cancelled = true;
+      window.removeEventListener("share-requests-changed", handler);
+    };
+  }, []);
+
   return (
     <motion.div
       initial={{ opacity: 0, y: 16 }}
@@ -48,7 +76,14 @@ export function QuickActions() {
                   <Icon className="size-4" />
                 </div>
                 <div className="min-w-0 flex-1">
-                  <p className="text-sm font-medium">{action.label}</p>
+                  <p className="flex items-center gap-1.5 text-sm font-medium">
+                    {action.label}
+                    {action.id === "requests" && pendingBadge > 0 && (
+                      <span className="inline-flex min-w-4 items-center justify-center rounded-full bg-destructive px-1 text-[10px] font-medium text-destructive-foreground">
+                        {pendingBadge > 9 ? "9+" : pendingBadge}
+                      </span>
+                    )}
+                  </p>
                   <p className="mt-0.5 truncate text-xs text-muted-foreground">
                     {action.description}
                   </p>

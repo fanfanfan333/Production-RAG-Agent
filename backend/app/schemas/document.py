@@ -20,6 +20,9 @@ class DocumentResult(BaseModel):
     status: DocumentStatus
     page_count: int | None = Field(None, ge=0)
     chunk_count: int | None = Field(None, ge=0)
+    # 图片统计（部分1+2）：识别到的图片总数 / 建成独立检索对象的图片数
+    image_count: int | None = Field(None, ge=0)
+    image_object_count: int | None = Field(None, ge=0)
     file_size_bytes: int | None = Field(None, ge=0)
     error: str | None = None
     created_at: datetime | None = None
@@ -28,6 +31,9 @@ class DocumentResult(BaseModel):
     message: str | None = None
     existing_document_id: uuid.UUID | None = None
     uploaded_at: datetime | None = None
+
+    # ── 问题3 文档防护：入库时被 Injection Detection 屏蔽的段落数（0/None=干净）──
+    injection_masked: int | None = Field(None, ge=0)
 
     model_config = {
         "from_attributes": True,

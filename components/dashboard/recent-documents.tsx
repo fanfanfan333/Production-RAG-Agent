@@ -36,9 +36,8 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Skeleton } from "@/components/ui/skeleton";
-import { cn } from "@/lib/utils";
+import { cn, describeIngestStage, formatBytes, formatRelativeTime } from "@/lib/utils";
 import type { Document, DocumentStatus } from "@/lib/types";
-import { formatBytes, formatRelativeTime } from "@/lib/utils";
 
 const typeIcons: Record<string, typeof FileText> = {
   PDF: FileText,
@@ -248,6 +247,13 @@ export function RecentDocuments({
                         <span>{doc.type}</span>
                         <span>{formatBytes(doc.size)}</span>
                         <span>{doc.chunks} 个分块</span>
+                        {/* 异步入库：处理中的文档说清楚卡在哪一步 */}
+                        {doc.status === "processing" &&
+                          describeIngestStage(doc.currentStage, doc.progress) && (
+                            <span className="text-amber-600 dark:text-amber-400">
+                              {describeIngestStage(doc.currentStage, doc.progress)}
+                            </span>
+                          )}
                       </div>
                     </div>
                     <div className="hidden shrink-0 items-center gap-3 sm:flex">

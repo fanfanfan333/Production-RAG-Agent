@@ -47,7 +47,6 @@ Client-side usage example (JavaScript):
 """
 
 import json
-import re
 import uuid
 from typing import Annotated, AsyncGenerator
 
@@ -64,6 +63,7 @@ from app.services.conversation_service import get_or_create_conversation, load_h
 from app.services.prompt_security import inspect_user_query
 from app.services.master_graph import stream_master
 from app.services.rag_graph import stream_document_list
+from app.services.routers.intent_rules import deterministic_route
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -79,42 +79,28 @@ def _sse(payload: dict | str) -> str:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
-# Document-relation query auto-detection (问题1) ───────────────────────────────
-
-# The question must (a) ask about relations/connections and (b) refer to the
-# documents collectively — both conditions keep ordinary doc-QA untouched.
-_ASKS_RELATION_RE = re.compile(
-    r"关联|关系|联系|相关性|关联度|异同|共同点|相同点|相似之处|重叠|互补|主题分布"
-)
-_REFERENCES_COLLECTION_RE = re.compile(
-    r"(这些|这批|这几个|这几份|各个|所有|全部|哪些|库里|库中|库内|知识库|文档库|上传)[^。？?!\n]{0,12}(文档|文件|资料|报告)"
-    r"|文档库|知识库"
-    r"|(文档|文件|资料|报告)之间"
-)
-
-# "知识库里有哪些文档" style listing questions → deterministic DB listing
-# instead of similarity search (a listing question's chunks never rerank
-# above the guard threshold, which used to end in an empty answer).
-_ASKS_DOC_LIST_RE = re.compile(
-    r"(有哪些|有什么|都有哪些|都有什么|多少个?|哪些|列出|列一下|清单|列表|包含哪些)"
-    r"[^。？?!\n]{0,4}(文档|文件|资料|pdf)"
-    r"|(文档|文件|资料|pdf)(列表|清单)"
-    r"|上传了(哪些|什么)(文档|文件|资料)?"
-)
+# Deterministic pipeline auto-detection (问题1) ──────────────────────────────
+#
+# 规则本体在 app/services/routers/intent_rules.py，与 master graph 的
+# Query Router 共用同一份定义，避免两边正则漂移。
+#
+# 注意返回值语义（问题1 的关键）：判定不了时返回 **None**，而不是以前的
+# "rag"。返回 "rag" 会让调用方误以为"已确定走知识库问答"，进而绕过 LLM
+# 路由 —— 这正是闲聊分支永远触发不了的原因之一。
 
 
-def _detect_mode(query: str) -> str:
-    """Return the pipeline selected by the query text."""
-    # Doc-relation analysis first: a listing query never contains relation
-    # words, but a relation question may mention 知识库, and must not be
-    # captured by the listing patterns below.
-    if _ASKS_RELATION_RE.search(query) and _REFERENCES_COLLECTION_RE.search(query):
-        logger.info("Query auto-detected as doc_relations: %r", query[:80])
-        return "doc_relations"
-    if _ASKS_DOC_LIST_RE.search(query):
-        logger.info("Query auto-detected as list_documents: %r", query[:80])
-        return "list_documents"
-    return "rag"
+def _detect_mode(query: str) -> str | None:
+    """Return the deterministically selected pipeline, or None if undecided."""
+    detected = deterministic_route(query)
+    if detected in (
+        "doc_relations",
+        "list_documents",
+        "general_chat",
+        "document_agent",
+    ):
+        logger.info("Query auto-detected as %s: %r", detected, query[:80])
+        return detected
+    return None
 
 
 # 旧 mode 名 → master graph intent 名。
@@ -150,7 +136,8 @@ async def _generate_sse(
              b. After retrieval/digests → yield "sources" / "doc_digests"
              c. After the grader        → yield "grade"    (good / bad + retry)
              d. Per Ollama token        → yield "chunk"    (1:1 与模型输出)
-             e. After graph end         → yield "done"
+             e. After output_guard      → yield "output_guard" (问题3+4 合规审计信号)
+             f. After graph end         → yield "done"
         5. Yield "[DONE]" SSE terminator
 
     *mode* is the auto-detected/legacy pipeline label used for logging and for
@@ -161,11 +148,22 @@ async def _generate_sse(
     Retrieval is restricted to documents owned by *user* (admins see all)
     and, when *collection_id* is set, to one knowledge-base collection.
     """
-    # ── 1+2. Conversation setup (owner-scoped) ────────────────────────────────
-    owner = None if user.is_admin else user.id
+    # ── 1+2. Conversation setup (owner + tenant scoped) ───────────────────────
+    from app.services.tenancy import scope_for
+
+    # 可见范围一处组装：平台管理员 = 全平台（跨公司部门库/公司库，但看不到
+    # 别人的个人库）；其他人 = 本公司内 个人 + 本部门 + 公司库。
+    scope = scope_for(user)
+    # 个人库归属**恒为本人**（含平台管理员）：owner_id 不再是"None = admin 全览"，
+    # 因此这里必须是 user.id，否则管理员会连自己的个人库都检索不到。
+    owner = scope.owner_id
+    tenant = scope.tenant_id
+    department = scope.department_id
     try:
-        conv_id = await get_or_create_conversation(conversation_id, owner_id=owner)
-        history = await load_history(conv_id)
+        conv_id = await get_or_create_conversation(
+            conversation_id, owner_id=owner, tenant_id=tenant,
+        )
+        history = await load_history(conv_id, owner_id=owner, tenant_id=tenant)
     except Exception as exc:
         logger.exception("Conversation setup failed: %s", exc)
         yield _sse({"type": "error", "message": f"Conversation setup failed: {exc}"})
@@ -183,6 +181,11 @@ async def _generate_sse(
             conversation_id=str(conv_id),
             owner_id=str(owner) if owner else None,
             collection_id=str(collection_id) if collection_id else None,
+            tenant_id=tenant,
+            user_department_id=department,
+            user_id=str(user.id),
+            tenant_wide=scope.tenant_wide,
+            platform_wide=scope.platform_wide,
         )
     else:
         # 其余全部交给 master graph：
@@ -196,6 +199,16 @@ async def _generate_sse(
             owner_id=str(owner) if owner else None,
             collection_id=str(collection_id) if collection_id else None,
             forced_mode=forced_mode,
+            # 监控 / Bad Case 回流需要"是谁问的"，owner_id 在管理员视角下为 None，
+            # 因此单独传真实用户身份（与检索权限解耦）。
+            user_id=str(user.id),
+            username=user.username,
+            # 三层隔离：第一层公司前置过滤 + 第二层部门 ACL + 第三层会话归属。
+            # tenant_id=None 仅表示"跨公司"（平台管理员），仍受 ACL 约束。
+            tenant_id=tenant,
+            department_id=department,
+            tenant_wide=scope.tenant_wide,
+            platform_wide=scope.platform_wide,
         )
 
     try:
@@ -297,13 +310,19 @@ async def query_endpoint(
             detail="该请求包含疑似试图改变系统行为的指令，已被安全策略拦截。请仅提交与知识库内容相关的问题。",
         )
 
-    mode = body.mode or _detect_mode(effective_query)
+    detected = _detect_mode(effective_query)
+    # "auto" 表示交给 master graph 的 LLM 路由决定（不再是以前的 "rag"）。
+    mode = body.mode or detected or "auto"
 
     # 客户端显式指定 mode 时，跳过 master graph 的 LLM 路由。
     # 旧客户端习惯传 mode="rag"，这里归一化成 master graph 的 intent 名。
     forced_mode = None
     if body.mode:
         forced_mode = _LEGACY_MODE_ALIASES.get(body.mode, body.mode)
+    elif detected in ("doc_relations", "general_chat", "document_agent"):
+        # 确定性判定命中 → 跳过 LLM 路由，省一次调用，且不受路由超时影响。
+        # list_documents 不走这里，它有自己的 DB 直读快路径。
+        forced_mode = detected
 
     await record_audit(
         "query.ask" if inspection.risk == "clean" else "query.ask.suspicious",

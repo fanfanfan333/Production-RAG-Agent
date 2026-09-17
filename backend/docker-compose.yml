@@ -12,6 +12,7 @@ volumes:
   postgres_data:
   qdrant_data:
   hf_cache:
+  uploads_data:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Services
@@ -52,6 +53,48 @@ services:
     networks:
       - rag_net
 
+  # ── Keycloak（企业统一身份 OIDC）────────────────────────────────────────────
+  # 身份链路：前端 → Keycloak 登录 → JWT → FastAPI 验签 → 身份信息
+  #          (user_id / tenant_id=company_a / department / roles)
+  #          → Permission Layer → RAG Retrieval 前置过滤 → LLM
+  #
+  # realm 通过 keycloak/realm-rag.json 导入（--import-realm 只在 realm 不存在时
+  # 生效）：包含 company_a / company_b 两家公司、四个业务角色与示例账号。
+  #
+  # 不想启用统一身份（纯本地账号开发）时：把 backend 的 KEYCLOAK_ENABLED 设为
+  # false，然后 `docker compose stop keycloak` 即可，其余功能不受影响。
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    container_name: rag_keycloak
+    restart: unless-stopped
+    command:
+      - start-dev
+      - --import-realm
+      - --http-port=8080
+      - --health-enabled=true
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN_USER:-admin}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+      KC_HTTP_ENABLED: "true"
+      # 浏览器与后端各自用不同地址访问同一个 realm：
+      #   浏览器 → http://localhost:8080
+      #   后端   → http://keycloak:8080（容器网络内）
+      # token 的 iss 会是浏览器用的地址，后端验签时两种都接受（见 keycloak_auth）。
+      KC_HOSTNAME_STRICT: "false"
+      KC_PROXY_HEADERS: xforwarded
+    volumes:
+      - ./keycloak:/opt/keycloak/data/import:ro
+    ports:
+      - "127.0.0.1:8080:8080"
+    networks:
+      - rag_net
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/8080 && echo -e 'GET /realms/rag HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && head -1 <&3 | grep -q 200"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
   # ── FastAPI backend ─────────────────────────────────────────────────────────
   backend:
     build:
@@ -66,9 +109,26 @@ services:
       # Override host names so the app talks to Docker service names
       POSTGRES_HOST: postgres
       HF_ENDPOINT: https://hf-mirror.com
+      # ⚠️ 必须指向**卷根** /app/.cache，与下面 `hf_cache:/app/.cache` 的挂载点一致。
+      # huggingface_hub 把权重放在 $HF_HOME/hub/，所以这里若写成
+      # /app/.cache/huggingface，实际缓存目录会变成 /app/.cache/huggingface/hub
+      # —— 一个空且归 root 所有的新目录：appuser 既读不到已有的
+      # /app/.cache/hub 权重，又无权在 root 目录里落盘，于是整批嵌入失败，
+      # 报错只有一行 "N chunks failed to embed permanently"，极难反查。
+      # （2026-09-14 实修，Dockerfile 里的 ENV 同步纠正）
+      HF_HOME: /app/.cache
       QDRANT_HOST: qdrant
+      KEYCLOAK_URL: ${KEYCLOAK_URL:-http://keycloak:8080}
+      KEYCLOAK_PUBLIC_URL: ${KEYCLOAK_PUBLIC_URL:-http://localhost:8080}
     volumes:
-      - hf_cache:/app/.cache/huggingface
+      # 挂载整个 /app/.cache，让 HuggingFace / PaddleOCR / Docling 的模型权重
+      # 全部持久化，避免每次重建容器都重复下载（BGE 1.3GB + Table Transformer
+      # ~100MB + PaddleOCR ~60MB）。
+      - hf_cache:/app/.cache
+      # Extracted images, archived originals and generated Word docs must
+      # outlive the container — otherwise "返回原始图片" breaks on every
+      # restart/recreate.
+      - uploads_data:/app/uploads
     # Bind only to loopback. In production, terminate TLS and expose the API
     # through a dedicated reverse proxy/API gateway (Kong, APISIX, Envoy or Nginx).
     ports:

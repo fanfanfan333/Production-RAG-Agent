@@ -13,7 +13,7 @@ export interface paths {
         };
         /**
          * System health check
-         * @description Returns the connectivity status for Gemini, PostgreSQL, and Qdrant. Overall `status` is `ok` only when all services are reachable.
+         * @description Returns the connectivity status for Ollama, PostgreSQL, and Qdrant. Overall `status` is `ok` only when all services are reachable.
          */
         get: operations["health_check_health_get"];
         put?: never;
@@ -39,7 +39,7 @@ export interface paths {
          *     1. Validated (size limit and supported format)
          *     2. Text-extracted with the corresponding parser
          *     3. Recursively chunked
-         *     4. Embedded via Gemini text-embedding-004
+         *     4. Embedded locally with the BGE model
          *     5. Stored in Qdrant (vectors) and PostgreSQL (metadata)
          *
          *     A per-file status is returned regardless of individual failures.
@@ -202,8 +202,8 @@ export interface components {
             name: string;
             /**
              * Vector Size
-             * @description Dimensionality of vectors (default: 768 for text-embedding-004).
-             * @default 768
+             * @description Dimensionality of vectors (default: 1024 for bge-large-zh-v1.5).
+             * @default 1024
              */
             vector_size: number;
             /**
@@ -455,7 +455,7 @@ export interface components {
         /**
          * HealthResponse
          * @example {
-         *       "gemini": "connected",
+         *       "ollama": "connected",
          *       "postgres": "connected",
          *       "qdrant": "connected",
          *       "status": "ok"
@@ -468,10 +468,10 @@ export interface components {
              */
             status: "ok" | "degraded";
             /**
-             * Gemini
+             * Ollama
              * @enum {string}
              */
-            gemini: "connected" | "not_connected";
+            ollama: "connected" | "not_connected";
             /**
              * Postgres
              * @enum {string}

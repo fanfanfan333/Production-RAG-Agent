@@ -1,19 +1,9 @@
 import type { Metadata } from "next";
-import { Geist, Geist_Mono } from "next/font/google";
 import { AppProvider } from "@/lib/context/app-context";
 import { AuthProvider } from "@/lib/context/auth-context";
+import { IdentityGate } from "@/components/staff/identity-gate";
 import { Toaster } from "@/components/ui/sonner";
 import "./globals.css";
-
-const geistSans = Geist({
-  variable: "--font-geist-sans",
-  subsets: ["latin"],
-});
-
-const geistMono = Geist_Mono({
-  variable: "--font-geist-mono",
-  subsets: ["latin"],
-});
 
 export const metadata: Metadata = {
   title: "RAG 智能助手",
@@ -27,12 +17,12 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="zh-CN">
-      <body
-        className={`${geistSans.variable} ${geistMono.variable} font-sans antialiased`}
-      >
+      <body className="font-sans antialiased">
         <AuthProvider>
           <AppProvider>
             {children}
+            {/* 未通过企业身份验证时自动弹一次（根布局不随导航重挂载） */}
+            <IdentityGate />
             <Toaster richColors closeButton />
           </AppProvider>
         </AuthProvider>

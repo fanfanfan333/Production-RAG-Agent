@@ -1,0 +1,38 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# pip 约束文件 —— 只锁「会被传递依赖反复拉扯」的包，不改 requirements 的语义。
+#
+# 用法（见 Dockerfile.local）：
+#   pip install -c constraints.txt -r requirements.txt
+#
+# 解决什么问题
+# ─────────────────────────────────────────────────────────────────────────────
+# requirements.txt 里 opencv-python-headless==4.9.0.80 是锁死的，但 paddleocr
+# 会拉入**未锁版本**的 opencv-python / opencv-contrib-python。pip 解析时倾向
+# 选最新版（实测选到 5.0.0.93），而新版的 numpy 要求又和 docling 冲突，于是
+# 触发逐版本回溯：每个候选都要下载 70–80 MB，实测连续试了 6 个版本
+# （opencv-python 4.14→4.11，opencv-contrib 4.14→4.11）35 分钟仍未收敛。
+#
+# 约束文件是 pip 专门用来干这件事的机制：limit 那些「你没直接声明、但被传递
+# 依赖带进来」的包能取哪些版本。写在这里比改 requirements.txt 更合适 ——
+# requirements.txt 是项目文件（描述「要什么」），constraints 是构建环境适配
+# （描述「在这个网络/环境下只能取到哪个版本」）。
+#
+# 选 4.9.0.80 的理由
+# ─────────────────────────────────────────────────────────────────────────────
+# 与 requirements.txt 里已锁的 opencv-python-headless==4.9.0.80 保持同一版本，
+# 避免 opencv 家族三个包版本不一致导致的 ABI 问题。该版本在阿里云 PyPI 上
+# 提供 manylinux wheel（opencv-python 62.2 MB / contrib 68.3 MB），无需编译。
+#
+# numpy<2 同理：docling 2.126.0 与 paddle 系列的 numpy 上界都要求 1.x，
+# 不锁的话 pip 会先试 numpy 2.5.3 再回退，白白多下载 16.7 MB。
+# ─────────────────────────────────────────────────────────────────────────────
+opencv-python==4.9.0.80
+opencv-contrib-python==4.9.0.80
+opencv-python-headless==4.9.0.80
+numpy<2
+
+# scipy：由 docling / scikit-image 传递引入，未锁版本。
+# 2026-09-16 实测 pip 依次尝试 1.18.1 → 1.18.0 → 1.17.1，每个 35 MB，
+# 共多下 ~70 MB 才收敛到 1.17.1（1.18.x 与 docling 的约束不兼容）。
+# 直接锁到收敛值，省掉这两次无效下载与相应的网络失败风险。
+scipy==1.17.1

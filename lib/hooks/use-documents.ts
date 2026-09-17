@@ -3,10 +3,15 @@
 import { useCallback, useEffect, useState } from "react";
 import { getDocuments } from "@/lib/api/documents";
 import { useApp } from "@/lib/context/app-context";
-import type { DashboardStats, Document } from "@/lib/types";
+import type { AccessLevel, DashboardStats, Document } from "@/lib/types";
 
-export function useDocuments(options?: { pollProcessing?: boolean }) {
+export function useDocuments(options?: {
+  pollProcessing?: boolean;
+  /** 三层知识库筛选：undefined/"all" = 全部；否则只看某一层。 */
+  accessLevel?: AccessLevel | "all";
+}) {
   const { refreshKey, activeCollectionId } = useApp();
+  const accessLevel = options?.accessLevel ?? "all";
   const [documents, setDocuments] = useState<Document[]>([]);
   const [stats, setStats] = useState<DashboardStats>({
     totalDocuments: 0,
@@ -20,7 +25,7 @@ export function useDocuments(options?: { pollProcessing?: boolean }) {
   const refetch = useCallback(async () => {
     setError(null);
     try {
-      const data = await getDocuments(activeCollectionId);
+      const data = await getDocuments(activeCollectionId, accessLevel);
       setDocuments(data.documents);
       setStats(data.stats);
     } catch (err) {
@@ -28,7 +33,7 @@ export function useDocuments(options?: { pollProcessing?: boolean }) {
     } finally {
       setLoading(false);
     }
-  }, [activeCollectionId]);
+  }, [activeCollectionId, accessLevel]);
 
   useEffect(() => {
     setLoading(true);

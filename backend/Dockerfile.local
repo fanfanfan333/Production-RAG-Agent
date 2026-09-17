@@ -1,0 +1,163 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# 本地构建覆盖层（全部使用国内镜像源，不改动项目原 Dockerfile）
+#
+# 用法：
+#   docker build -f Dockerfile.local -t backend-backend:latest .
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# ★ 2026-09-16 第四次实修 —— 找到「构建必在 ~610 秒被掐死」的真正原因
+# ─────────────────────────────────────────────────────────────────────────────
+# 之前三轮构建全部在 610–613 秒处被进程回收杀掉（日志停在同一秒、进程消失、
+# dockerd 侧一直健康）。当时判断为「带宽上限」是**错的**：实测本机直连带宽
+# 完全够用，真正的瓶颈是本文件把 pip 源和 apt 源**全部指向了阿里云**，而
+# mirrors.aliyun.com 在本机（WiFi + Docker Desktop WSL2）是所有国内源里最慢的：
+#
+#   源            宿主直连 PyPI (KiB/s)   宿主直连 apt (KiB/s)
+#   腾讯云              8867                    7319
+#   北外 BFSU           8833                    7790
+#   华为云              8284                    7862
+#   清华 TUNA           6982                    6905
+#   中科大 USTC         1805                    1457
+#   阿里云               564 ← 最慢            534 ← 最慢
+#
+#   阿里云比其余源慢 15 倍。1.5 GB 依赖在 564 KiB/s 下要 45 分钟以上，于是
+#   每一次构建都必然撞上「会话进程生存上限」，看起来像卡死，其实是在极慢地爬。
+#
+# 同时实测确认：
+#   - download.pytorch.org（whl/cpu）直连与走代理**都返回 403**，这条路彻底不可用。
+#     上海交大镜像 mirror(s).sjtug.sjtu.edu.cn/pytorch-wheels/cpu/ 有 +cpu wheel，
+#     1419 KiB/s，是阿里云 pytorch-wheels（574 KiB/s）的 2.5 倍。
+#   - 「把悠兔代理放进 docker」不能提速，反而**更慢**：腾讯源 1544 → 377 KiB/s，
+#     阿里云 560 → 449 KiB/s。代理是本地 HTTP 代理（127.0.0.1:7892，非 TUN），
+#     容器要访问它得走 host.docker.internal，且所有国内源都会绕一圈，纯负收益。
+#     结论：不要在构建里配代理。
+#   - 容器内“清华全挂”（http 502 / https UNEXPECTED_EOF_WHILE_READING），
+#     容器内必须避开清华；腾讯云、阿里云、华为云在容器内均可正常访问。
+#   - 容器内 apt 失败的常见原因不是源本身，而是源里写的是 `http://`。国内镜像的
+#     80 端口普遍已不可用，必须显式改成 `https://`（见下面的 sed）。
+#
+# ── 本次采取的构建策略：离线构建 ─────────────────────────────────────────────
+# 把「下载 1.5 GB 依赖」这件最耗时、最怕被打断的事，从 build 里挪出去，放到一个
+# **由 dockerd 托管、与会话生命周期无关**的容器里预先做完：
+#
+#   宿主执行： backend/_fetch_wheels.sh   （在 python:3.12-slim 容器内运行）
+#              → 产出 backend/_wheels/*.whl（全部依赖闭包，含传递依赖）
+#
+# 本文件随后只做 `COPY _wheels /wheels` + 本地离线安装。收益：
+#   1) 构建期**零网络依赖**（pip 用 --no-index，只认 /wheels），不会再因为某条
+#      CDN 慢或断流而整体失败；
+#   2) 把最长的那一层从「下载 + 解包」压缩成「解包」，单层耗时回到 10 分钟以内；
+#   3) /wheels 只存在于 builder 阶段，不会进最终镜像（runtime 只 COPY /install）。
+#
+# 为什么仍然必须写 `torch==2.14.0+cpu`（PEP 440 本地版本标识）：
+#   `+cpu` 是 PEP 440 的 local version，`==2.14.0` **不匹配** `2.14.0+cpu`。
+#   若 requirements.txt 写成 `2.14.0`，pip 会跳过本地的 cpu wheel，转去拉
+#   554.6 MB 的 CUDA 版 torch（容器内无 GPU，纯属浪费流量）。
+#
+# 为什么用 wheel 完整直链 / --find-links 而不是让 pip 解析索引：
+#   阿里云 pytorch-wheels 这类镜像是**目录索引式**，不是标准 PEP 503 简单索引，
+#   pip 无法从索引里解析出 `+cpu` 版本。`pip download -d /wheels` 的 `-d` 是
+#   **输出目录**而非来源，所以安装层必须显式带 `--find-links /wheels` 才能命中
+#   本地 wheel，否则仍会回索引并报
+#       No matching distribution found for torch==2.14.0+cpu
+#
+# constraints.txt 的作用不变：锁住被传递依赖反复拉扯的 opencv 家族与 scipy/numpy，
+# 避免 pip 逐版本回溯（实测曾因此卡 35 分钟以上）。
+# ─────────────────────────────────────────────────────────────────────────────
+FROM python:3.12-slim AS builder
+
+# 索引统一指到实测最快的源。离线安装下这两个变量只作为兜底存在。
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_INDEX_URL=https://mirrors.cloud.tencent.com/pypi/simple/ \
+    PIP_DEFAULT_TIMEOUT=120 \
+    PIP_RETRIES=10
+
+WORKDIR /build
+
+RUN echo 'precedence ::ffff:0:0/96  100' >> /etc/gai.conf
+
+# apt：必须同时换掉 scheme（http → https）。只换域名会把请求发到 80 端口，
+# 而国内镜像的 80 端口现在普遍返回 502 —— 这正是之前「容器内清华 502」的原因。
+RUN sed -i 's|http://deb.debian.org|https://mirrors.cloud.tencent.com|g' /etc/apt/sources.list.d/debian.sources \
+ && apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    g++ \
+    libpq-dev \
+    tesseract-ocr \
+    libgl1 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+COPY constraints.txt .
+
+# ★ 关键：依赖 wheel 由 backend/_fetch_wheels.sh 在宿主侧容器里预先拉全。
+#   若这一步报 "COPY failed: no source files"，说明没先跑预取脚本。
+COPY _wheels /wheels
+
+# 离线安装：--no-index 表示完全不碰网络，--find-links /wheels 是唯一来源。
+RUN pip install --no-cache-dir --upgrade pip \
+ && pip install --no-cache-dir --prefix=/install \
+      --no-index \
+      --find-links /wheels \
+      -c constraints.txt \
+      -r requirements.txt
+
+# pip 在 --prefix 模式下生成的 console script，其 shebang 可能指向构建期的
+# /install/bin/python；而 runtime 阶段会把 /install 展开到 /usr/local，
+# 那个路径就不存在了，uvicorn 之类的入口脚本会以
+#     /install/bin/python: not found
+# 直接启动失败。这里统一改写为 runtime 里真实存在的解释器路径。
+# （模式不匹配时 sed 静默通过，不影响正常情况。）
+RUN sed -i -E '1s|^#!/install/bin/python[0-9.]*$|#!/usr/local/bin/python3|' /install/bin/* 2>/dev/null || true
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage 2 — runtime（与原 Dockerfile 的 runtime 段保持一致）
+# ─────────────────────────────────────────────────────────────────────────────
+FROM python:3.12-slim AS runtime
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app
+
+# 同样必须换 scheme；这里额外装 tesseract-ocr-chi-sim 作为中文 OCR 兜底。
+RUN echo 'precedence ::ffff:0:0/96  100' >> /etc/gai.conf \
+ && sed -i 's|http://deb.debian.org|https://mirrors.cloud.tencent.com|g' /etc/apt/sources.list.d/debian.sources \
+ && apt-get update && apt-get install -y --no-install-recommends \
+    tesseract-ocr \
+    tesseract-ocr-chi-sim \
+    libgl1 \
+    libgomp1 \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# HF_HOME 必须指向卷根 /app/.cache（不是 /app/.cache/huggingface），
+# 否则整个嵌入流程会静默失败，只留一句 “N chunks failed to embed permanently.”
+ENV HF_HOME=/app/.cache
+RUN mkdir -p /app/.cache
+
+# appuser 的 HOME 默认是 /nonexistent，模型权重首次下载会写不进去。
+ENV HOME=/app/.cache \
+    PADDLE_CACHE_DIR=/app/.cache/paddleocr
+RUN mkdir -p /app/.cache/paddleocr
+
+COPY --from=builder /install /usr/local
+
+COPY app/ ./app/
+COPY alembic/ ./alembic/
+COPY alembic.ini .
+
+RUN addgroup --system appgroup && adduser --system --ingroup appgroup appuser
+RUN chown -R appuser:appgroup /app/.cache
+ENV IMAGE_STORAGE_DIR=/app/uploads \
+    DOCUMENT_OUTPUT_DIR=/app/uploads/_generated
+RUN mkdir -p /app/uploads/_generated && chown -R appuser:appgroup /app/uploads
+
+USER appuser
+
+EXPOSE 8000
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]

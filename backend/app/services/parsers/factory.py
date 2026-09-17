@@ -2,6 +2,7 @@ import mimetypes
 from app.services.parsers.base import DocumentParser
 from app.services.parsers.pdf_parser import PDFParser
 from app.services.parsers.docx_parser import DocxParser
+from app.services.parsers.doc_parser import DocParser
 from app.services.parsers.pptx_parser import PptxParser
 from app.services.parsers.xlsx_parser import XlsxParser
 from app.services.parsers.csv_parser import CsvParser
@@ -16,6 +17,8 @@ logger = get_logger(__name__)
 _parsers = {
     "pdf": PDFParser(),
     "docx": DocxParser(),
+    # 旧版二进制 Word（OLE2）：LibreOffice 可用则转 docx，否则纯 Python 抽正文。
+    "doc": DocParser(),
     "pptx": PptxParser(),
     "xlsx": XlsxParser(),
     "csv": CsvParser(),
@@ -38,6 +41,10 @@ def get_parser_for_file(filename: str, mime_type: str = "") -> DocumentParser:
         return _parsers["pdf"]
     elif ext == "docx":
         return _parsers["docx"]
+    elif ext == "doc":
+        # 注意顺序：必须在 MIME 兜底（text/*）之前命中，否则 .doc 的
+        # 二进制内容会被 TXT 解析器当文本读成乱码。
+        return _parsers["doc"]
     elif ext == "pptx":
         return _parsers["pptx"]
     elif ext == "xlsx":
@@ -56,6 +63,8 @@ def get_parser_for_file(filename: str, mime_type: str = "") -> DocumentParser:
         return _parsers["pdf"]
     elif "wordprocessingml.document" in mime_type:
         return _parsers["docx"]
+    elif "msword" in mime_type:
+        return _parsers["doc"]
     elif "presentationml.presentation" in mime_type:
         return _parsers["pptx"]
     elif "spreadsheetml.sheet" in mime_type:

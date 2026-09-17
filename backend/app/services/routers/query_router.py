@@ -44,50 +44,18 @@ from app.utils.logging import get_logger
 logger = get_logger(__name__)
 
 
-# ── 合法意图 ─────────────────────────────────────────────────────────────────
+# ── 合法意图 & 确定性前置规则 ───────────────────────────────────────────────
+#
+# 规则本体在 app/services/routers/intent_rules.py —— 零第三方依赖，
+# 可脱离 LLM/配置环境单测（backend/tests/test_intent_rules.py）。
+# 这里只做再导出，保持历史导入名不变。
 
-VALID_INTENTS = (
-    "document_summary",
-    "knowledge_qa",
-    "general_chat",
-    "doc_relations",
-    "list_documents",
+from app.services.routers.intent_rules import (  # noqa: E402
+    DEFAULT_INTENT,
+    VALID_INTENTS,
+    deterministic_route as _deterministic_route,
+    looks_knowledge_seeking,
 )
-
-DEFAULT_INTENT = "knowledge_qa"
-
-
-# ── 确定性前置规则（沿用 api/query.py 已有的正则，保持行为一致）──────────────
-
-_ASKS_RELATION_RE = re.compile(
-    r"关联|关系|联系|相关性|关联度|异同|共同点|相同点|相似之处|重叠|互补|主题分布"
-)
-_REFERENCES_COLLECTION_RE = re.compile(
-    r"(这些|这批|这几个|这几份|各个|所有|全部|哪些|库里|库中|库内|知识库|文档库|上传)[^。？?!\n]{0,12}(文档|文件|资料|报告)"
-    r"|文档库|知识库"
-    r"|(文档|文件|资料|报告)之间"
-)
-_ASKS_DOC_LIST_RE = re.compile(
-    r"(有哪些|有什么|都有哪些|都有什么|多少个?|哪些|列出|列一下|清单|列表|包含哪些)"
-    r"[^。？?!\n]{0,4}(文档|文件|资料|pdf)"
-    r"|(文档|文件|资料|pdf)(列表|清单)"
-    r"|上传了(哪些|什么)(文档|文件|资料)?"
-)
-
-
-def _deterministic_route(query: str) -> str | None:
-    """
-    确定性前置判定。命中返回意图，未命中返回 None（交给 LLM）。
-
-    只拦截 100% 确定的情况：
-    - 列表问题 → list_documents（必须走 DB 直读，LLM 路由会引入随机性）
-    - 跨文档关联 → doc_relations（特征明显，且有专门 pipeline）
-    """
-    if _ASKS_RELATION_RE.search(query) and _REFERENCES_COLLECTION_RE.search(query):
-        return "doc_relations"
-    if _ASKS_DOC_LIST_RE.search(query):
-        return "list_documents"
-    return None
 
 
 # ── LLM 路由 ─────────────────────────────────────────────────────────────────
@@ -97,17 +65,37 @@ _ROUTER_SYSTEM_PROMPT = """\
 
 可选的分支（只输出其中一个标签）：
 - "document_summary"：用户想让总结/概括/概述某个或某些文档的内容。
-  例如："总结一下这份报告"、"这份文档主要讲了什么"、"概括一下第三章"。
-- "general_chat"：与知识库无关的闲聊、打招呼、问你是谁、让你写诗/写代码/翻译、
-  以及纯常识问题。例如："你好"、"你是谁"、"帮我写一首关于春天的诗"。
+  例如："总结一下这份报告"、"这份文档主要讲了什么"、"概括一下第三章"、
+  **"总结所有文档"、"把所有文档总结一下"、"总结一下知识库"**（整库总结）。
+- "document_agent"：用户想**生成一份文档/文件**作为交付物（Word 报告、纪要、
+  方案等），而不只是要一段回答。例如："根据知识库生成一份调研报告"、
+  "把要点整理成 Word 文档"、"帮我写一份项目方案"。
+- "general_chat"：与知识库无关的闲聊、打招呼、问你是谁、让你写诗，
+  以及**与用户上传资料无关的**独立创作/常识问题。
+  例如："你好"、"你是谁"、"帮我写一首关于春天的诗"、"用 Python 写个快速排序"、
+  "今天天气怎么样"。
+  ⚠️ 只因为它"听起来像通用知识"就选 general_chat 是错的：凡是在问
+  **某个系统/机制/流程/工具/术语是怎么工作的**（如"反幻觉机制是怎么工作的？"、
+  "检索流程有哪些步骤？"、"这个参数怎么配置？"），一律选 knowledge_qa ——
+  用户资料里很可能就有这段说明，走闲聊等于放弃检索、只能凭记忆编。
 - "knowledge_qa"：用户想从知识库里查具体事实、数据、条款、流程等。
   例如："合同里约定的付款期限是多久？"、"营收增长率是多少？"。
 
 判断规则：
-1. 只要问题涉及知识库里的具体信息，就选 knowledge_qa。
+1. 只要问题的答案**应该来自用户上传的资料**，就选 knowledge_qa。
 2. 明确要求"总结/概括/概述/主要讲什么/核心观点"文档内容时，选 document_summary。
-3. 只有完全不涉及知识库、纯闲聊或纯创作时，才选 general_chat。
-4. 拿不准时选 knowledge_qa（最安全）。
+   ⚠️ 提到"所有文档 / 全部文档 / 这些文档 / 整个知识库"的总结请求一律选
+   document_summary —— 它是**整库总结**，不是从某一两份文档里找事实。
+   判成 knowledge_qa 会让整库总结退化成"只总结了召回分最高的那一份文档"。
+3. 明确要求"生成/导出/整理成一份文档、报告、Word 文件"时，选 document_agent。
+4. 只有**完全不涉及用户资料**的纯闲聊、纯创作或纯常识时，才选 general_chat。
+5. 拿不准时选 knowledge_qa（最安全）。
+
+⚠️ 最容易判错的一类：**技术类"怎么做/怎么配置/参数怎么写/命令是什么/报错怎么解"**。
+这类问题看起来像"写代码"，但只要它问的是**某个工具、某个库、某段流程的用法**，
+而用户的资料里可能就有这段笔记/手册，就必须选 knowledge_qa —— 选了
+general_chat 会绕过检索，模型只能凭记忆编，答得看似合理却与用户资料不符。
+判别口径是"答案该不该来自资料"，**不是"这问题像不像技术问题"**。
 
 只输出一个 JSON 对象，不要任何解释：
 {"intent": "knowledge_qa"}"""
@@ -212,6 +200,18 @@ async def route_query(
                 )
                 return DEFAULT_INTENT, "fallback"
 
+        # ── 纠偏：把"该走检索的知识提问"从闲聊里捞回来 ──────────────────────
+        # 实测 BUG：'反幻觉机制是怎么工作的？' 被判成 general_chat → 整条检索链
+        # 被绕过 → 模型凭记忆作答、无引用可核验，界面却毫无异常。
+        # 纠偏代价非对称：误判成"该检索"最坏是如实拒答（可解释、可发现）；
+        # 误判成闲聊则是静默幻觉（不可见、不可核验）。因此这里从严纠偏。
+        if intent == "general_chat" and looks_knowledge_seeking(query):
+            logger.warning(
+                "query_router: LLM 判为 general_chat，但问句在寻求知识 → "
+                "纠偏为 knowledge_qa（query=%r）", query[:60],
+            )
+            intent = "knowledge_qa"
+
         if settings.ROUTER_USE_CACHE:
             if len(_route_cache) >= _ROUTE_CACHE_MAX:
                 _route_cache.clear()
@@ -236,6 +236,9 @@ def _normalize_intent(raw: str) -> str | None:
     if not raw:
         return None
     r = raw.lower()
+    # document_agent 的近义写法（先于 summary 判断：agent 要"交付物"）
+    if any(k in r for k in ("agent", "document_agent", "doc_agent", "生成文档", "导出", "生成报告")):
+        return "document_agent"
     # document_summary 的近义写法
     if any(k in r for k in ("summary", "summar", "doc_summary", "总结", "摘要", "概括")):
         return "document_summary"

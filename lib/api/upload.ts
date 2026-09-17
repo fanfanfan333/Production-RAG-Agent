@@ -5,7 +5,7 @@ import {
   clearStoredToken,
 } from "@/lib/api/client";
 import { normalizeDocument } from "@/lib/api/normalize";
-import type { Document } from "@/lib/types";
+import type { AccessLevel, Document } from "@/lib/types";
 
 export interface UploadProgress {
   fileName: string;
@@ -16,6 +16,8 @@ export async function uploadDocuments(
   files: File[],
   options?: {
     collectionId?: string | null;
+    /** 三层知识库：文档直接落在哪一层（不传则由后端按默认层级决定）。 */
+    accessLevel?: AccessLevel;
     onProgress?: (progress: UploadProgress) => void;
     signal?: AbortSignal;
   }
@@ -25,16 +27,21 @@ export async function uploadDocuments(
   if (options?.collectionId) {
     formData.append("collection_id", options.collectionId);
   }
+  // 目标层级由后端按权限矩阵复核：无权限的层级会被 403 拦下并提示改用申请。
+  if (options?.accessLevel) {
+    formData.append("access_level", options.accessLevel);
+  }
 
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
-    // 直连 FastAPI 后端（与 SSE 同理）：后端要同步完成 解析→分块→嵌入
-    // 整条流水线，大文件可能要几分钟；走 Next.js /api 代理会被开发
-    // 服务器的代理超时中途掐断，表现为莫名其妙的红色失败提示。
+    // 直连 FastAPI 后端（与 SSE 同理）。POST /upload 现在只做「受理」——校验、
+    // 判重、落一条 PENDING 行——就返回 202，解析/OCR/向量化在服务端后台跑
+    // （进度见 GET /documents 的 current_stage）。所以这个超时只需覆盖"把字节
+    // 推上去"：50 MB 上限下留 5 分钟已非常宽松，超时能更快给出可读的失败提示。
     const apiBase = getStreamApiBase();
     xhr.open("POST", `${apiBase}/upload`);
     xhr.responseType = "json";
-    xhr.timeout = 900000; // 15 minutes
+    xhr.timeout = 300000; // 5 minutes — 上传本身，不含服务端后台入库
 
     const token = getStoredToken();
     if (token) xhr.setRequestHeader("Authorization", `Bearer ${token}`);

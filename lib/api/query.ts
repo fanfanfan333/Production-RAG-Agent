@@ -4,8 +4,20 @@ import {
   getStoredToken,
   clearStoredToken,
 } from "@/lib/api/client";
-import { normalizeSources } from "@/lib/api/normalize";
-import type { QuerySource } from "@/lib/types";
+import {
+  normalizeCitationCheck,
+  normalizeEvidence,
+  normalizeOutputGuard,
+  normalizeSources,
+} from "@/lib/api/normalize";
+import type {
+  AnswerStatusInfo,
+  CitationCheckInfo,
+  EvidenceInfo,
+  GeneratedDocumentInfo,
+  MultimodalInfo,
+  QuerySource,
+} from "@/lib/types";
 
 export type QueryMode =
   | "rag"
@@ -13,7 +25,8 @@ export type QueryMode =
   | "list_documents"
   | "document_summary"
   | "general_chat"
-  | "knowledge_qa";
+  | "knowledge_qa"
+  | "document_agent";
 
 /** Query Router 的判定结果（架构图 Query Router 节点）。 */
 export interface RouteInfo {
@@ -26,6 +39,28 @@ export interface GradeInfo {
   good: boolean;
   retry: number;
   reason: string;
+}
+
+/**
+ * Output Guard（问题3+问题4）的审计信号.
+ *
+ * - `citations_removed`      —— 被剔除的越界 [Source N] 编号
+ * - `leaked_phrases`         —— 命中的系统提示词泄露模式数
+ * - `hallucination_phrases`  —— 闲聊分支命中的幻觉措辞模式数
+ * - `tool_attempt_phrases`   —— 命中的工具/网络调用意图模式数
+ */
+export interface OutputGuardInfo {
+  changed: boolean;
+  citations_removed: number[];
+  leaked_phrases: number;
+  hallucination_phrases: number;
+  tool_attempt_phrases: number;
+  /**
+   * 净化后的完整答案（changed=true 时后端回传）。
+   * token 已实时流出无法撤回，前端应用它替换已渲染的正文，
+   * 保证「用户看到的 == 后端落库的」。
+   */
+  sanitized_answer?: string;
 }
 
 export interface StreamQueryOptions {
@@ -44,6 +79,18 @@ export interface StreamQueryOptions {
   onRoute?: (info: RouteInfo) => void;
   /** 可选：Retrieval Grader 判定结果（用于展示"证据不足，正在重试"）。 */
   onGrade?: (info: GradeInfo) => void;
+  /** 可选：Output Guard 审计信号（问题3+4，提示"已合规校验/命中 X 条"）。 */
+  onOutputGuard?: (info: OutputGuardInfo) => void;
+  /** 可选：Evidence Gate 判定（证据是否足够；不足时后端已直接拒答）。 */
+  onEvidence?: (info: EvidenceInfo) => void;
+  /** 可选：Citation Verifier 五项校验结论（引用存在/位置/支持/数字/日期）。 */
+  onCitationCheck?: (info: CitationCheckInfo) => void;
+  /** 可选：multimodal_context 节点统计（图文分流 / Vision 使用情况）。 */
+  onMultimodal?: (info: MultimodalInfo) => void;
+  /** 可选：Document Agent 生成的 Word 文档（附下载地址）。 */
+  onDocument?: (info: GeneratedDocumentInfo) => void;
+  /** 可选：答复性质（拒答 / 正常）—— 用于修正"拒答却显示引用来源"。 */
+  onAnswerStatus?: (info: AnswerStatusInfo) => void;
 }
 
 /** Map a doc_digests SSE event entry to the shared QuerySource shape. */
@@ -59,7 +106,19 @@ function normalizeDigest(raw: Record<string, unknown>): QuerySource {
 
 type SseHandler = Pick<
   StreamQueryOptions,
-  "onToken" | "onThinking" | "onSources" | "onDone" | "onError" | "onRoute" | "onGrade"
+  | "onToken"
+  | "onThinking"
+  | "onSources"
+  | "onDone"
+  | "onError"
+  | "onRoute"
+  | "onGrade"
+  | "onOutputGuard"
+  | "onEvidence"
+  | "onCitationCheck"
+  | "onMultimodal"
+  | "onDocument"
+  | "onAnswerStatus"
 >;
 
 /** 把单个 SSE data 行分发到对应回调。 */
@@ -89,8 +148,28 @@ function dispatchSseData(data: string, handlers: SseHandler) {
       });
       return;
     }
+    // Output Guard 审计信号（问题3+问题4）
+    // 归一化实现与"历史回放"共用（见 lib/api/normalize.ts）：数组 → 条数
+    // 的换算以前只写在这里，重新打开历史会话时徽标就显示不出来了。
+    if (type === "output_guard") {
+      const guard = normalizeOutputGuard(parsed);
+      if (guard) handlers.onOutputGuard?.(guard);
+      return;
+    }
     if (type === "sources" || parsed.sources) {
       handlers.onSources(normalizeSources(parsed.sources ?? parsed.data));
+      return;
+    }
+    // Evidence Gate 判定（证据形态是否足以作答；不足时后端已直接拒答）
+    if (type === "evidence") {
+      const evidence = normalizeEvidence(parsed);
+      if (evidence) handlers.onEvidence?.(evidence);
+      return;
+    }
+    // Citation Verifier 五项校验结论
+    if (type === "citation_check") {
+      const check = normalizeCitationCheck(parsed);
+      if (check) handlers.onCitationCheck?.(check);
       return;
     }
     // Cross-document relation analysis (问题1): per-document digests
@@ -103,6 +182,15 @@ function dispatchSseData(data: string, handlers: SseHandler) {
     }
     if (type === "thinking_delta") {
       handlers.onThinking?.(String(parsed.content ?? ""));
+      return;
+    }
+    // 答复性质（拒答 / 正常）—— 修正"拒答却挂着引用来源"的矛盾展示
+    if (type === "answer_status") {
+      handlers.onAnswerStatus?.({
+        refused: Boolean(parsed.refused ?? false),
+        sourcesUsed: Boolean(parsed.sources_used ?? true),
+        note: parsed.note ? String(parsed.note) : undefined,
+      });
       return;
     }
     if (type === "error") {

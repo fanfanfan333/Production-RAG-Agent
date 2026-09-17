@@ -13,8 +13,9 @@ import {
   XCircle,
 } from "lucide-react";
 import { getApiBase } from "@/lib/api/client";
-import { changePassword } from "@/lib/api/auth";
+import { useAuth } from "@/lib/context/auth-context";
 import { useHealth } from "@/lib/hooks/use-health";
+import { BadCaseReview } from "@/components/settings/badcase-review";
 import {
   Card,
   CardContent,
@@ -77,14 +78,11 @@ const services = [
 
 export function SettingsPanel() {
   const { health, loading, error, refetch } = useHealth();
+  const { user } = useAuth();
+  // RAG 质量监控（统计口径）需要 `audit.read` 权限（admin / manager）。
+  // 前端角色只有 admin / user，这里按 admin 展示；真正的权限校验以后端 403 为准。
+  const isAdmin = user?.role === "admin";
   const [urlInput, setUrlInput] = useState("");
-
-  // 修改密码表单状态
-  const [oldPw, setOldPw] = useState("");
-  const [newPw, setNewPw] = useState("");
-  const [confirmPw, setConfirmPw] = useState("");
-  const [changingPw, setChangingPw] = useState(false);
-  const [pwError, setPwError] = useState<string | null>(null);
 
   useEffect(() => {
     setUrlInput(getApiBase());
@@ -95,39 +93,6 @@ export function SettingsPanel() {
     localStorage.setItem("rag_backend_url", urlInput.trim());
     toast.success("API 地址已更新");
     refetch();
-  };
-
-  const handleChangePassword = async () => {
-    setPwError(null);
-    if (!oldPw || !newPw || !confirmPw) {
-      setPwError("请填写所有密码输入框");
-      return;
-    }
-    if (newPw.length < 8) {
-      setPwError("新密码至少需要 8 个字符");
-      return;
-    }
-    if (newPw !== confirmPw) {
-      setPwError("两次输入的新密码不一致");
-      return;
-    }
-    if (newPw === oldPw) {
-      setPwError("新密码不能与当前密码相同");
-      return;
-    }
-
-    setChangingPw(true);
-    try {
-      await changePassword(oldPw, newPw);
-      toast.success("密码修改成功");
-      setOldPw("");
-      setNewPw("");
-      setConfirmPw("");
-    } catch (err) {
-      setPwError(err instanceof Error ? err.message : "修改失败，请稍后再试");
-    } finally {
-      setChangingPw(false);
-    }
   };
 
   return (
@@ -183,72 +148,22 @@ export function SettingsPanel() {
         })}
       </div>
 
+      {/*
+        修改密码已迁到「个人主页」（点击右上角头像）——它是"关于我"的操作，
+        放在系统设置的运行时参数里语义不搭，用户也很难找到。
+      */}
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
             <KeyRound className="size-4 text-primary" />
             账号安全
           </CardTitle>
-          <CardDescription>修改当前账号的登录密码</CardDescription>
+          <CardDescription>修改登录密码</CardDescription>
         </CardHeader>
-        <CardContent className="space-y-4">
-          <div className="grid gap-4 sm:grid-cols-3">
-            <div className="space-y-1.5">
-              <label className="text-xs font-medium text-muted-foreground">
-                当前密码
-              </label>
-              <Input
-                type="password"
-                autoComplete="current-password"
-                placeholder="输入当前密码"
-                value={oldPw}
-                onChange={(e) => setOldPw(e.target.value)}
-                disabled={changingPw}
-              />
-            </div>
-            <div className="space-y-1.5">
-              <label className="text-xs font-medium text-muted-foreground">
-                新密码
-              </label>
-              <Input
-                type="password"
-                autoComplete="new-password"
-                placeholder="至少 8 个字符"
-                value={newPw}
-                onChange={(e) => setNewPw(e.target.value)}
-                disabled={changingPw}
-              />
-            </div>
-            <div className="space-y-1.5">
-              <label className="text-xs font-medium text-muted-foreground">
-                确认新密码
-              </label>
-              <Input
-                type="password"
-                autoComplete="new-password"
-                placeholder="再次输入新密码"
-                value={confirmPw}
-                onChange={(e) => setConfirmPw(e.target.value)}
-                disabled={changingPw}
-                onKeyDown={(e) => e.key === "Enter" && handleChangePassword()}
-              />
-            </div>
-          </div>
-
-          {pwError && (
-            <p className="rounded-lg border border-destructive/20 bg-destructive/5 px-3 py-2 text-sm text-destructive">
-              {pwError}
-            </p>
-          )}
-
-          <Button onClick={handleChangePassword} disabled={changingPw}>
-            {changingPw ? (
-              <Loader2 className="size-4 animate-spin" />
-            ) : (
-              <KeyRound className="size-4" />
-            )}
-            修改密码
-          </Button>
+        <CardContent>
+          <p className="text-sm text-muted-foreground">
+            点击右上角头像打开个人主页，在「修改密码」中修改登录密码。
+          </p>
         </CardContent>
       </Card>
 
@@ -294,6 +209,18 @@ export function SettingsPanel() {
           )}
         </CardContent>
       </Card>
+
+      {isAdmin && (
+        <>
+          <div className="pt-2">
+            <h2 className="text-lg font-semibold tracking-tight">RAG 质量监控</h2>
+            <p className="mt-1 text-sm text-muted-foreground">
+              运行期质量指标：拒答率、引用通过率与输出净化命中率
+            </p>
+          </div>
+          <BadCaseReview />
+        </>
+      )}
     </div>
   );
 }

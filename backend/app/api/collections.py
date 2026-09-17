@@ -30,6 +30,7 @@ from app.services.collection_service import (
     get_collection,
     list_collections,
 )
+from app.utils.errors import clean_message
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -49,7 +50,7 @@ router = APIRouter(prefix="/collections", tags=["Collections"])
     ),
 )
 async def list_collections_endpoint(
-    user: Annotated[User, Depends(require_platform_admin)],
+    user: Annotated[User, Depends(require_platform_admin())],
 ) -> CollectionListResponse:
     return await list_collections()
 
@@ -69,7 +70,7 @@ async def list_collections_endpoint(
 )
 async def create_collection_endpoint(
     payload: CollectionCreate,
-    user: Annotated[User, Depends(require_platform_admin)],
+    user: Annotated[User, Depends(require_platform_admin())],
 ) -> CollectionInfo:
     try:
         return await create_collection(payload)
@@ -93,14 +94,14 @@ async def create_collection_endpoint(
 )
 async def get_collection_endpoint(
     name: Annotated[str, Path(description="Collection name.")],
-    user: Annotated[User, Depends(require_platform_admin)],
+    user: Annotated[User, Depends(require_platform_admin())],
 ) -> CollectionInfo:
     try:
         return await get_collection(name)
     except KeyError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=str(exc),
+            detail=clean_message(exc),
         ) from exc
 
 
@@ -121,14 +122,14 @@ async def get_collection_endpoint(
 )
 async def delete_collection_endpoint(
     name: Annotated[str, Path(description="Collection name to delete.")],
-    user: Annotated[User, Depends(require_platform_admin)],
+    user: Annotated[User, Depends(require_platform_admin())],
 ) -> CollectionDeleteResponse:
     try:
         return await delete_collection(name)
     except KeyError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=str(exc),
+            detail=clean_message(exc),
         ) from exc
     except ValueError as exc:
         # Primary collection protection or other business-rule violations

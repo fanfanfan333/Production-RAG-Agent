@@ -6,7 +6,7 @@ from app.utils.logging import get_logger
 logger = get_logger(__name__)
 
 class XlsxParser(DocumentParser):
-    def parse(self, content: bytes, filename: str) -> ExtractionResult:
+    def parse(self, content: bytes, filename: str, *, document_id: str | None = None, tenant_id: str | None = None) -> ExtractionResult:
         try:
             wb = openpyxl.load_workbook(io.BytesIO(content), data_only=True)
         except Exception as exc:
@@ -56,5 +56,6 @@ class XlsxParser(DocumentParser):
             parser_used="openpyxl",
             ocr_used=False,
             ocr_engine=None,
-            extraction_method="native"
+            extraction_method="native",
+            is_tabular=True,
         )

@@ -4,12 +4,11 @@ Embedding service orchestrator.
 Provides a robust, queue-ready retry wrapper around the configured embedding provider.
 Implements exponential backoff and jitter, and tracks metrics.
 
-NOTE: This used to special-case google.api_core exceptions (ResourceExhausted /
-GoogleAPIError with HTTP-style codes) because the original provider was Gemini's
-cloud API. Now that get_embedding_provider() returns a local BGE provider
-(bge_provider.BGEEmbeddingProvider), there is no HTTP layer and no 429s — the
-retry logic below only needs to handle generic transient errors (e.g. brief
-resource contention), not provider-specific rate-limit responses.
+NOTE: The embedding provider is fully local (bge_provider.BGEEmbeddingProvider),
+so there is no HTTP layer, no cloud quota and no 429 responses. The retry logic
+below therefore only needs to absorb generic transient errors (e.g. brief
+resource contention or a cold model load) rather than provider-specific
+rate-limit responses.
 """
 
 import asyncio

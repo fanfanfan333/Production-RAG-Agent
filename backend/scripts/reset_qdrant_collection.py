@@ -1,7 +1,7 @@
 """
-One-off migration script: delete the primary Qdrant collection (currently
-holding 3072-dim Gemini vectors) and recreate it empty with the new
-dimension defined by settings.EMBEDDING_DIMENSION (1024, BGE).
+One-off migration script: delete the primary Qdrant collection (old vectors
+with a mismatched dimension) and recreate it empty with the dimension
+defined by settings.EMBEDDING_DIMENSION (1024 for bge-large-zh-v1.5).
 
 This bypasses collection_service.delete_collection()'s guard on purpose —
 that guard protects the API from accidental deletion, but this script IS

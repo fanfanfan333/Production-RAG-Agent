@@ -1,22 +1,35 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { useRouter } from "next/navigation";
 import { motion } from "framer-motion";
 import {
   AlertCircle,
+  Building2,
   Clock,
   Eye,
   FileSpreadsheet,
   FileText,
   FileType,
+  FileX2,
+  Image as ImageIcon,
   Loader2,
+  Lock,
+  Share2,
+  Sparkles,
   Trash2,
+  Users,
 } from "lucide-react";
 import { toast } from "sonner";
 import { deleteDocument, getDocumentChunks } from "@/lib/api/documents";
 import { useApp } from "@/lib/context/app-context";
 import { useDocuments } from "@/lib/hooks/use-documents";
-import type { Document, DocumentChunksResponse, DocumentStatus } from "@/lib/types";
+import type {
+  AccessLevel,
+  Document,
+  DocumentChunksResponse,
+  DocumentStatus,
+} from "@/lib/types";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -34,7 +47,9 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Skeleton } from "@/components/ui/skeleton";
-import { formatBytes, formatRelativeTime } from "@/lib/utils";
+import { cn, describeIngestStage, formatBytes, formatRelativeTime } from "@/lib/utils";
+import { AccessTierBadge, tierScopeName } from "@/components/documents/access-badge";
+import { DocumentSharingDialog } from "@/components/documents/document-sharing-dialog";
 
 const typeIcons: Record<string, typeof FileText> = {
   PDF: FileText,
@@ -54,6 +69,18 @@ const statusConfig: Record<
   failed: { label: "失败", variant: "destructive" },
   already_exists: { label: "已存在", variant: "success" },
 };
+
+/** 三层知识库的视图切换：全部 / 个人 / 部门 / 公司。 */
+const TIER_TABS: {
+  key: AccessLevel | "all";
+  label: string;
+  icon: typeof Lock;
+}[] = [
+  { key: "all", label: "全部", icon: FileText },
+  { key: "private", label: "个人知识库", icon: Lock },
+  { key: "department", label: "部门知识库", icon: Users },
+  { key: "tenant", label: "公司知识库", icon: Building2 },
+];
 
 /** 文档内容查看器：按分块展示索引后的文本（含页码） */
 function DocumentViewer({ doc }: { doc: Document }) {
@@ -123,17 +150,35 @@ function DocumentViewer({ doc }: { doc: Document }) {
 
 export function DocumentsList() {
   const { refresh } = useApp();
+  const router = useRouter();
+  const [tier, setTier] = useState<AccessLevel | "all">("all");
   const { documents, loading, error, refetch } = useDocuments({
     pollProcessing: true,
+    accessLevel: tier,
   });
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [viewingDoc, setViewingDoc] = useState<Document | null>(null);
+  const [sharingDoc, setSharingDoc] = useState<Document | null>(null);
 
-  const handleDelete = async (id: string, name: string) => {
-    setDeletingId(id);
+  const counts = useMemo(() => {
+    const base: Record<AccessLevel | "all", number> = {
+      all: documents.length,
+      private: 0,
+      department: 0,
+      tenant: 0,
+    };
+    documents.forEach((doc) => {
+      const level = doc.accessLevel ?? "private";
+      base[level] += 1;
+    });
+    return base;
+  }, [documents]);
+
+  const handleDelete = async (doc: Document) => {
+    setDeletingId(doc.id);
     try {
-      await deleteDocument(id);
-      toast.success(`已删除「${name}」`);
+      await deleteDocument(doc.id);
+      toast.success(`已删除「${doc.name}」`);
       refresh();
       refetch();
     } catch (err) {
@@ -143,14 +188,57 @@ export function DocumentsList() {
     }
   };
 
+  /**
+   * 「总结此文档」：带着**确切文件名**跳到对话页自动发起总结。
+   *
+   * 用《》把文件名包起来，后端就能 100% 认得是点名了哪一份文档
+   * （见 document_summary_node.resolve_summary_targets），
+   * 不会退化成"总结全部文档"。
+   */
+  const handleSummarize = (doc: Document) => {
+    router.push(`/chat?q=${encodeURIComponent(`总结《${doc.name}》`)}`);
+  };
+
   return (
     <Card>
-      <CardHeader>
-        <CardTitle>全部文档</CardTitle>
-        <CardDescription>
-          查看已上传的全部文档，可打开查看内容或删除
-        </CardDescription>
+      <CardHeader className="gap-4">
+        <div>
+          <CardTitle>全部文档</CardTitle>
+          <CardDescription>
+            按「个人 / 部门 / 公司」三层知识库查看已上传的文档
+          </CardDescription>
+        </div>
+
+        {/* 三层知识库切换 */}
+        <div className="flex flex-wrap items-center gap-1.5">
+          {TIER_TABS.map((tab) => {
+            const Icon = tab.icon;
+            const active = tier === tab.key;
+            return (
+              <button
+                key={tab.key}
+                type="button"
+                onClick={() => setTier(tab.key)}
+                className={cn(
+                  "inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs font-medium transition-colors",
+                  active
+                    ? "border-primary/50 bg-primary/5 text-foreground"
+                    : "border-border/60 text-muted-foreground hover:bg-muted/50 hover:text-foreground"
+                )}
+              >
+                <Icon className="size-3.5" />
+                {tab.label}
+                {tab.key !== "all" && counts[tab.key] > 0 && (
+                  <span className="rounded bg-muted px-1 text-[10px] text-muted-foreground">
+                    {counts[tab.key]}
+                  </span>
+                )}
+              </button>
+            );
+          })}
+        </div>
       </CardHeader>
+
       <CardContent className="px-0">
         {error ? (
           <div className="flex items-center gap-3 px-6 py-8 text-sm text-destructive">
@@ -171,7 +259,9 @@ export function DocumentsList() {
           </div>
         ) : documents.length === 0 ? (
           <p className="px-6 py-8 text-center text-sm text-muted-foreground">
-            尚未上传任何文档。
+            {tier === "all"
+              ? "尚未上传任何文档。"
+              : `${tierScopeName(tier as AccessLevel)}中还没有文档。`}
           </p>
         ) : (
           <ul className="divide-y divide-border/60">
@@ -180,6 +270,12 @@ export function DocumentsList() {
               const status = statusConfig[doc.status];
               const canView =
                 doc.status === "indexed" || doc.status === "already_exists";
+              const level = doc.accessLevel ?? "private";
+              const canPublish =
+                doc.canPublishDepartment || doc.canPublishCompany;
+              // 个人库 + 无发布权限 → 提示"申请共享"（权限矩阵第一行）
+              const showRequestHint =
+                level === "private" && doc.needsShareRequest && !doc.pendingShareRequest;
 
               return (
                 <motion.li
@@ -192,19 +288,79 @@ export function DocumentsList() {
                   <div className="flex size-10 shrink-0 items-center justify-center rounded-lg bg-muted">
                     <Icon className="size-4 text-muted-foreground" />
                   </div>
+
                   <div className="min-w-0 flex-1">
-                    <p className="truncate text-sm font-medium">{doc.name}</p>
-                    <div className="mt-0.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
+                    <div className="flex items-center gap-2">
+                      <p className="truncate text-sm font-medium">{doc.name}</p>
+                      <AccessTierBadge level={level} label={doc.accessLabel} />
+                    </div>
+                    <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
                       <span>{doc.type}</span>
                       <span>{formatBytes(doc.size)}</span>
                       <span>{doc.chunks} 个分块</span>
+                      {/* 图片是独立检索对象（命中后回显原图），列表里要能看见 */}
+                      {(doc.imageObjectCount ?? 0) > 0 && (
+                        <span className="flex items-center gap-1">
+                          <ImageIcon className="size-3" />
+                          {doc.imageObjectCount} 张图可检索
+                        </span>
+                      )}
                       <span className="flex items-center gap-1">
                         <Clock className="size-3" />
                         {formatRelativeTime(doc.uploadedAt)}
                       </span>
+                      {!doc.isOwner && doc.ownerUsername && (
+                        <span className="flex items-center gap-1">
+                          <Users className="size-3" />
+                          由 {doc.ownerUsername} 上传
+                        </span>
+                      )}
+                      {doc.pendingShareRequest && (
+                        <span className="text-amber-600 dark:text-amber-400">
+                          共享申请审核中
+                        </span>
+                      )}
                     </div>
                   </div>
-                  <Badge variant={status.variant}>{status.label}</Badge>
+
+                  <div className="flex shrink-0 flex-col items-end gap-1">
+                    <Badge variant={status.variant}>{status.label}</Badge>
+                    {/* 异步入库：把"处理中"讲清楚在哪个阶段，别只转圈 */}
+                    {doc.status === "processing" &&
+                      describeIngestStage(doc.currentStage, doc.progress) && (
+                        <span className="text-[11px] text-muted-foreground">
+                          {describeIngestStage(doc.currentStage, doc.progress)}
+                        </span>
+                      )}
+                  </div>
+
+                  {/* 个人文档上的「申请共享」入口 */}
+                  {showRequestHint && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="shrink-0 gap-1.5"
+                      onClick={() => setSharingDoc(doc)}
+                    >
+                      <Share2 className="size-3.5" />
+                      申请共享
+                    </Button>
+                  )}
+
+                  {/* 有发布权限 / 已共享的文档：共享与层级管理 */}
+                  {!showRequestHint && (
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="shrink-0 text-muted-foreground hover:text-foreground"
+                      title={canPublish ? "发布与共享设置" : "共享设置"}
+                      aria-label={`共享设置 ${doc.name}`}
+                      onClick={() => setSharingDoc(doc)}
+                    >
+                      <Share2 className="size-4" />
+                    </Button>
+                  )}
+
                   {/* 查看文档内容 */}
                   <Button
                     variant="ghost"
@@ -217,13 +373,51 @@ export function DocumentsList() {
                   >
                     <Eye className="size-4" />
                   </Button>
+
+                  {/* 总结此文档：只总结这一份（不带上其他文档） */}
                   <Button
                     variant="ghost"
                     size="icon"
-                    className="shrink-0 text-muted-foreground hover:text-destructive"
-                    title="删除文档"
-                    disabled={deletingId === doc.id}
-                    onClick={() => handleDelete(doc.id, doc.name)}
+                    className="shrink-0 text-muted-foreground hover:text-primary"
+                    title={
+                      canView
+                        ? "只总结这一份文档"
+                        : "文档处理完成并完成索引后可总结"
+                    }
+                    aria-label={`总结 ${doc.name}`}
+                    disabled={!canView}
+                    onClick={() => handleSummarize(doc)}
+                  >
+                    <Sparkles className="size-4" />
+                  </Button>
+
+                  {/* 无删除权但看得见该文档 → 走「申请删除」由上级审核。
+                      与「申请共享」对称：自己没有的权限，通过申请向上要。 */}
+                  {doc.canRequestDelete && !doc.canDelete && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="shrink-0 gap-1.5"
+                      title="你没有删除权限，可提交申请由上级审核"
+                      onClick={() => setSharingDoc(doc)}
+                    >
+                      <FileX2 className="size-3.5" />
+                      申请删除
+                    </Button>
+                  )}
+
+                  {/* 删除：无权限时禁用并把原因写在 title 上（不再点下去才 404） */}
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className={cn(
+                      "shrink-0 text-muted-foreground",
+                      doc.canDelete && "hover:text-destructive"
+                    )}
+                    title={doc.canDelete ? "删除文档" : doc.deleteDeniedReason || "无权删除"}
+                    aria-label={`删除 ${doc.name}`}
+                    disabled={!doc.canDelete || deletingId === doc.id}
+                    onClick={() => handleDelete(doc)}
                   >
                     {deletingId === doc.id ? (
                       <Loader2 className="size-4 animate-spin" />
@@ -259,6 +453,19 @@ export function DocumentsList() {
           )}
         </DialogContent>
       </Dialog>
+
+      {/* 共享 / 发布 / 申请弹窗 */}
+      <DocumentSharingDialog
+        doc={sharingDoc}
+        open={!!sharingDoc}
+        onOpenChange={(open) => {
+          if (!open) setSharingDoc(null);
+        }}
+        onChanged={() => {
+          refresh();
+          refetch();
+        }}
+      />
     </Card>
   );
 }

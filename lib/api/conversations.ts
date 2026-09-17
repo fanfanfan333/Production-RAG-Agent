@@ -1,4 +1,5 @@
 import { apiFetch } from "@/lib/api/client";
+import { normalizeTurnMeta } from "@/lib/api/normalize";
 import type {
   ConversationMessage,
   ConversationSummary,
@@ -33,6 +34,11 @@ export async function getConversationMessages(
     role: item.role === "assistant" ? "assistant" : "user",
     content: String(item.content ?? ""),
     createdAt: item.created_at ? String(item.created_at) : undefined,
+    // 回答的"依据快照"（messages.meta）：引用来源 / 引用校验 / 证据门控 /
+    // 输出合规 / 生成的文档 / 路由意图。
+    // 以前这里只取 role+content，重新打开会话时引用来源就此永久丢失 ——
+    // 用户看到的正是"上一次提问的数据来源不见了"。
+    ...normalizeTurnMeta(item.meta),
   }));
 }
 

@@ -43,7 +43,7 @@ from app.config import get_settings
 from app.db.models import Document, DocumentStatus
 from app.db.postgres import get_db_session
 from app.services.conversation_service import save_turn
-from app.services.query_transform import rewrite_query_with_history
+from app.services.query_transform import rewrite_query
 from app.services.relation_service import (
     build_digest_context,
     collect_document_digests,
@@ -83,12 +83,19 @@ _SYSTEM_TEMPLATE = """\
 
 6. 保持简洁。除非用户明确要求，不要主动补充背景、上下文或相关信息。
 
-7. 每一条基于文档的结论都必须标注引用。
+7. 引用要准确、克制（引用力度）。
    上面的上下文块中包含编号的文档片段：[Source 1]、[Source 2]……
-   在使用文档内容的句子之后立即追加对应标记，例如：“……损失更低 [Source 2]。”
-   - 每个引用了文档内容的段落都必须至少包含一个 [Source N] 标记。
+   - 凡结论来自文档，就在该句末尾标注来源，例如：“……损失更低 [Source 2]。”
+   - 需要时可紧跟一句位置说明，例如：“[Source 2]（第 12-28 行）”，
+     行号以上下文块给出的 lines 为准，不要自己推算。
+   - 但不要给常识、过渡句、你自己的组织性措辞强加引用；
+     同一来源在同一段内只需标注一次，不要每句话都挂引用。
    - 只能使用上下文块中给出的编号，严禁编造编号。
    - 不要使用（文件名.pdf，第 N 页）这类引用格式，只使用 [Source N]。
+   - 不要在正文里复述上下文块的头部信息（文件名、页码、行号、相关度），
+     也不要写“出自《……》第 N 页”这类出处说明 —— 出处会由系统随引用
+     自动展示，正文只写结论本身。回答内容之外的所有枚举编号
+     （“1.”“2.”这类条目序号）只是排版，与文档内容无关。
 
 8. 逐句忠实于证据（幻觉零容忍）。
    - 回答中的每一个事实性陈述（数字、日期、名称、结论）都必须能
@@ -97,8 +104,18 @@ _SYSTEM_TEMPLATE = """\
      必须原样引用。
    - 不确定时必须明说“上下文中未提及”，禁止用常识或推测补全。
 
-9. 如果检索到的上下文无法回答问题，请明确说明。
-   不要猜测；此时应完全省略 [Source N] 标记。
+9. 允许拒答 —— 宁可说“没有依据”，也不要编。
+   - 若检索到的上下文完全无法回答问题，直接以这句话开头作答：
+     “抱歉，我在当前知识库中没有找到与这个问题足够相关的信息，因此无法给出有依据的回答。”
+     此时不要输出任何 [Source N] 标记。
+   - 若上下文只覆盖了问题的一部分，只回答有依据的部分，并明确指出
+     哪一部分在知识库中没有找到，不要用常识补齐。
+   - 拒答是正确行为，不会被视为失败；编造一个有引用的错误答案才是失败。
+
+10. 你没有任何可用工具 / 函数调用 / 网络访问 / 命令执行权限。
+    不要假装要"调用工具""执行命令""访问网页""运行 Python"等；不要输出
+    shell 命令、curl / wget URL、Python 脚本或任何代码块作为回答的一部分。
+    只用自然语言回答用户。
 
 ── 检索到的上下文 ───────────────────────────────────────────────────────────────
 {context}
@@ -151,6 +168,8 @@ class RAGState(TypedDict):
     collection_id: str | None      # KB collection filter (None = all)
     rewritten_query: str           # 指代消解后的自包含检索查询
     query_variants: list[str]      # 多查询扩展变体（多路召回）
+    query_extra: list[str]         # 子问题 + 变体，进向量腿与关键词腿
+    query_hyde: str | None         # 假设答案段落，只进向量腿
     chunks: list[RetrievedChunk]
     sources: list[dict]            # serialisable dicts ready for SSE
     answer: str
@@ -225,19 +244,38 @@ async def _rewrite_node(state: RAGState) -> dict:
     查询改写节点（召回优化 / 抗幻觉第一道防线）.
 
     把「历史 + 带指代的当前问题」压缩成自包含的独立问题，并生成
-    multi-query 检索变体。失败/超时自动回退原查询 —— 该节点是增益
-    而非依赖，绝不阻塞主链路。
+    multi-query 检索变体、子问题拆解与 HyDE 段落。失败/超时自动回退原查询
+    —— 该节点是增益而非依赖，绝不阻塞主链路。
+
+    三条产物走三条通道（与 master_graph._rewrite_node 保持一致）：
+    query_extra 进两条检索腿，query_hyde 只进向量腿（见 QUERY_HYDE_VECTOR_ONLY）。
     """
-    rewritten, variants = await rewrite_query_with_history(
+    result = await rewrite_query(
         query=state["query"],
         history_messages=state["history_messages"],
     )
-    if rewritten != state["query"] or variants:
+    rewritten = result.rewritten
+    variants = list(result.variants)
+
+    extra: list[str] = []
+    for item in list(result.subqueries) + variants:
+        if item and item != rewritten and item not in extra:
+            extra.append(item)
+    # 总量封顶：每多一路 = 多一次向量 ANN + 一次关键词腿查询，延迟近似线性上升
+    extra = extra[: max(1, int(get_settings().MULTI_QUERY_MAX_EXTRA))]
+
+    if rewritten != state["query"] or variants or extra or result.hyde:
         logger.info(
-            "rewrite_node: %r → %r (+%d variants)",
+            "rewrite_node: %r → %r (+%d variants, +%d subqueries, hyde=%d chars)",
             state["query"][:60], rewritten[:60], len(variants),
+            len(result.subqueries), len(result.hyde or ""),
         )
-    return {"rewritten_query": rewritten, "query_variants": variants}
+    return {
+        "rewritten_query": rewritten,
+        "query_variants": variants,
+        "query_extra": extra,
+        "query_hyde": result.hyde,
+    }
 
 
 async def _retrieve_node(state: RAGState) -> dict:
@@ -257,7 +295,10 @@ async def _retrieve_node(state: RAGState) -> dict:
         top_k=state["top_k"],
         owner_id=state.get("owner_id"),
         collection_id=state.get("collection_id"),
-        extra_queries=state.get("query_variants"),
+        extra_queries=state.get("query_extra") or state.get("query_variants"),
+        extra_vector_queries=(
+            [state["query_hyde"]] if state.get("query_hyde") else None
+        ),
     )
 
     sources = [
@@ -583,6 +624,9 @@ async def _stream_graph_events(
     """
     sources_emitted = False
     total_chars = 0
+    # 累积答案正文：流结束后判断这次是不是"拒答"，用于修正引用来源的展示
+    # （见下方 answer_status 事件 —— 拒答却挂着"1 个引用"是自相矛盾的）。
+    answer_parts: list[str] = []
 
     try:
         async for event in graph.astream_events(initial_state, version="v2"):
@@ -616,6 +660,7 @@ async def _stream_graph_events(
                 refusal = str(event["data"].get("output", {}).get("answer", ""))
                 if refusal:
                     total_chars += len(refusal)
+                    answer_parts.append(refusal)
                     yield {"type": "chunk", "content": refusal}
 
             # ── LLM token streaming (Ollama-native, per token) ────────────────
@@ -648,7 +693,30 @@ async def _stream_graph_events(
 
                 if token:
                     total_chars += len(token)
+                    answer_parts.append(token)
                     yield {"type": "chunk", "content": token}
+
+        # ── 答复性质（拒答 / 正常回答）─────────────────────────────────────────
+        # 为什么需要这个事件：sources 事件在**检索之后**就发出了，而"是否拒答"
+        # 要到证据门控 / 生成结束才确定。于是拒答时前端会出现
+        # 「答案说知识库里没有相关资料」＋「旁边挂着 1 个引用来源」的
+        # 自相矛盾画面（用户反馈的显示 BUG）。
+        # 这里在流结束前补一条确定性状态，前端据此把引用来源标注为"未采用"，
+        # 而不是把一次正确拒答渲染成自相矛盾的界面。
+        full_answer = "".join(answer_parts)
+        from app.services.nodes.evidence_gate import is_refusal
+
+        refused = is_refusal(full_answer)
+        yield {
+            "type": "answer_status",
+            "refused": refused,
+            "sources_used": not refused,
+            "note": (
+                "本次答复为拒答：检索到的片段不足以支撑结论，以下来源未被采用。"
+                if refused
+                else ""
+            ),
+        }
 
         # ── Graph complete ─────────────────────────────────────────────────────
         yield {
@@ -669,13 +737,19 @@ async def _stream_graph_events(
 async def _list_completed_documents(
     owner_id: str | None,
     collection_id: str | None,
+    tenant_id: str | None = None,
+    user_department_id: str | None = None,
+    tenant_wide: bool = False,
+    platform_wide: bool = False,
 ) -> list[dict]:
     """
     List every completed document visible to the caller, most recent first.
 
-    Same visibility rules as retrieval: owner-scoped (admins see all) and,
-    when *collection_id* is set, restricted to one KB collection.
+    Same visibility rules as retrieval: 第一层公司过滤 + 第二层 Document ACL；
+    平台管理员（platform_wide）跳过公司过滤但仍然看不到别人的个人库。
     """
+    from app.services.tenancy import document_acl_clause, normalize_tenant_id
+
     async with get_db_session() as session:
         stmt = (
             select(
@@ -687,8 +761,20 @@ async def _list_completed_documents(
             .where(Document.status == DocumentStatus.COMPLETED)
             .order_by(Document.created_at.desc())
         )
-        if owner_id:
+        if tenant_id and not platform_wide:
+            stmt = stmt.where(Document.tenant_id == normalize_tenant_id(tenant_id))
+        elif not platform_wide and owner_id:
+            # 无公司上下文的历史调用：退化为"仅本人"
             stmt = stmt.where(Document.owner_id == uuid.UUID(owner_id))
+        if platform_wide or tenant_id or owner_id:
+            stmt = stmt.where(
+                document_acl_clause(
+                    owner_id=uuid.UUID(owner_id) if owner_id else None,
+                    department_id=user_department_id,
+                    tenant_wide=tenant_wide,
+                    platform_wide=platform_wide,
+                )
+            )
         if collection_id:
             stmt = stmt.where(Document.collection_id == uuid.UUID(collection_id))
         rows = (await session.execute(stmt)).all()
@@ -709,6 +795,11 @@ async def stream_document_list(
     conversation_id: str,
     owner_id: str | None = None,
     collection_id: str | None = None,
+    tenant_id: str | None = None,
+    user_department_id: str | None = None,
+    user_id: str | None = None,
+    tenant_wide: bool = False,
+    platform_wide: bool = False,
 ) -> AsyncGenerator[dict, None]:
     """
     Answer "知识库里有哪些文档" questions deterministically — no LLM, no
@@ -719,7 +810,11 @@ async def stream_document_list(
     base is answered honestly with "还没有文档".
     """
     try:
-        docs = await _list_completed_documents(owner_id, collection_id)
+        docs = await _list_completed_documents(
+            owner_id, collection_id,
+            tenant_id=tenant_id, user_department_id=user_department_id,
+            tenant_wide=tenant_wide, platform_wide=platform_wide,
+        )
     except Exception as exc:
         logger.exception("stream_document_list: DB query failed: %s", exc)
         yield {"type": "error", "message": f"读取文档列表失败：{exc}"}
@@ -749,6 +844,8 @@ async def stream_document_list(
             conversation_id=uuid.UUID(conversation_id),
             user_message=query,
             assistant_message=answer,
+            user_id=uuid.UUID(user_id) if user_id else None,
+            tenant_id=tenant_id,
         )
     except Exception as exc:
         logger.warning(
@@ -807,6 +904,8 @@ async def stream_rag(
         "collection_id": collection_id,
         "rewritten_query": "",
         "query_variants": [],
+        "query_extra": [],
+        "query_hyde": None,
         "chunks": [],
         "sources": [],
         "answer": "",

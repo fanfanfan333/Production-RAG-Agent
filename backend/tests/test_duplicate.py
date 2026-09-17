@@ -1,5 +1,7 @@
 import fitz
 import json
+import os
+import tempfile
 import urllib.request
 import time
 from qdrant_client import QdrantClient
@@ -7,6 +9,10 @@ from sqlalchemy import create_engine, text
 
 BASE_URL = "http://localhost:8000"
 DB_URL = "postgresql://raguser:ragpass@localhost:5432/ragdb" # Assuming defaults in .env or exposed via localhost
+
+# 临时 PDF 落盘位置：用系统临时目录而不是硬编码 /tmp —— 后者在 Windows 上
+# 不存在，会让本脚本在能连上后端的情况下仍然第一步就失败。
+_TMP = tempfile.gettempdir()
 
 def create_pdf(path):
     import time
@@ -59,7 +65,7 @@ async def get_pg_doc_count():
         return result.scalar()
 
 async def main():
-    pdf_path = "/tmp/duplicate_test.pdf"
+    pdf_path = os.path.join(_TMP, "duplicate_test.pdf")
     create_pdf(pdf_path)
     
     initial_pg = await get_pg_doc_count()

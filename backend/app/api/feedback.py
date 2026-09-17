@@ -89,6 +89,24 @@ async def submit_feedback(
         detail=f"rating={body.rating}; q={body.question[:200]}",
     )
 
+    # ── Bad Case 回流：👎 自动进入审阅队列（持续监控闭环的人工端）───────────
+    # 用户点👎是最强的质量信号，但它稀疏（多数人不会点）。这里把它自动
+    # 沉淀到 bad_cases，与"引用校验失败 / 门控拒答 / 输出净化"三类自动信号
+    # 汇入同一队列，管理员只需看一个地方。
+    if body.rating == "down":
+        from app.services.monitoring_service import BadCaseSignal, capture_bad_case
+
+        await capture_bad_case(BadCaseSignal(
+            reason="feedback_down",
+            severity="high",
+            question=body.question,
+            answer=body.answer,
+            user_id=str(user.id),
+            username=user.username,
+            conversation_id=str(body.conversation_id) if body.conversation_id else None,
+            detail={"comment": body.comment, "rating": body.rating},
+        ))
+
     logger.info(
         "Feedback recorded: user=%s rating=%s conv=%s",
         user.username, body.rating, body.conversation_id,
@@ -108,7 +126,7 @@ async def submit_feedback(
     ),
 )
 async def list_feedback(
-    admin: Annotated[User, Depends(require_platform_admin)],
+    admin: Annotated[User, Depends(require_platform_admin())],
     limit: int = Query(default=100, ge=1, le=500),
 ) -> FeedbackListResponse:
     from sqlalchemy import select

@@ -17,6 +17,7 @@ import uuid
 from asyncio import Lock
 from collections import defaultdict, deque
 
+import jwt
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
@@ -34,14 +35,49 @@ async def get_current_user(
     credentials: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
 ) -> User:
     """Resolve the request's Bearer token to an active User row."""
-    if credentials is None or not credentials.credentials:
+    return await _resolve_user(credentials.credentials if credentials else None)
+
+
+def _token_kind(token: str) -> str:
+    """
+    按 JWT header 的 alg 判断令牌来自哪条通路。
+
+    HS* → 本服务自签（本地账号登录）
+    其余非对称算法（RS*/PS*/ES*）→ Keycloak 等 OIDC 提供方签发
+
+    用 header 而不是"先试本地再试 Keycloak"：前者一次判定，失败原因清晰
+    （"Keycloak 未启用" vs "签名错误"），也不会因为本地验签异常而误导排查。
+    """
+    try:
+        header = jwt.get_unverified_header(token)
+    except Exception:      # noqa: BLE001 — 解析失败按本地通路处理，让后续报标准错误
+        return "local"
+    alg = str(header.get("alg") or "").upper()
+    return "local" if alg.startswith("HS") else "keycloak"
+
+
+async def _resolve_user(token: str | None) -> User:
+    """
+    共享的 token → User 解析（两条身份通路）：
+
+      1. 本地令牌（HS256，/auth/login 签发）  → 直接按 sub 查用户
+      2. Keycloak 令牌（RS256）              → JWKS 验签 → 身份信息
+                                              → 落地/同步本地用户行
+
+    无论走哪条通路，返回的都是**本地 User 行**：检索链路上的 tenant_id /
+    department / role 只有一个来源，权限矩阵不需要知道身份来自哪里。
+    """
+    if not token:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="未登录或缺少访问令牌",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    payload = decode_token(credentials.credentials)
+    if _token_kind(token) == "keycloak":
+        return await _resolve_keycloak_user(token)
+
+    payload = decode_token(token)
     try:
         user_id = uuid.UUID(payload["sub"])
     except (KeyError, ValueError) as exc:
@@ -59,6 +95,56 @@ async def get_current_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
     return user
+
+
+async def _resolve_keycloak_user(token: str) -> User:
+    """Keycloak 通路：验签 → 解析身份 → 落地本地用户行。"""
+    from app.services.keycloak_auth import (
+        KeycloakError,
+        identity_from_claims,
+        resolve_or_provision_user,
+        verify_keycloak_token,
+    )
+
+    try:
+        claims = await verify_keycloak_token(token)
+        identity = identity_from_claims(claims)
+        user = await resolve_or_provision_user(identity)
+    except KeycloakError as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail=str(exc),
+            headers={"WWW-Authenticate": "Bearer"},
+        ) from exc
+
+    if not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="账号已被禁用，请联系管理员",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    logger.debug(
+        "Keycloak auth ok: user=%s tenant=%s role=%s",
+        user.username, user.tenant_id, user.role,
+    )
+    return user
+
+
+async def get_current_user_media(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
+) -> User:
+    """
+    Auth for resource URLs loaded directly by the browser.
+
+    ``<img src>`` and ``<a download>`` cannot attach an Authorization header, so
+    these endpoints additionally accept ``?token=<jwt>``. The token is the same
+    short-lived JWT used by the API; access is still owner-checked downstream.
+    """
+    token = credentials.credentials if credentials else None
+    if not token:
+        token = request.query_params.get("token")
+    return await _resolve_user(token)
 
 
 async def require_admin(user: User = Depends(get_current_user)) -> User:

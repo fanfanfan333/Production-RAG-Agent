@@ -157,3 +157,35 @@
 .thinking-dots > span:nth-child(3) {
   animation-delay: 0.4s;
 }
+
+/* ---- KaTeX 数学公式显示优化 ---- */
+/* 块级公式：居中 + 超宽时横向滚动，不撑破气泡 */
+.katex-display {
+  margin: 0.75rem 0;
+  padding: 0.25rem 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+/* 行内公式与中文基线对齐、留出呼吸感 */
+.katex {
+  font-size: 1.05em;
+  padding: 0 0.1em;
+}
+
+/* ---- 细粒度引用：正文上标 → 引用卡片 的跳转 ---- */
+/* 正文里的 [Source N] 被前端渲染成链接 `[¹](#source-N)`。链接文字本身已是
+   上标字符，因此这里只做"可点"的视觉提示（底色 + 悬停加深），不再叠加
+   vertical-align，避免二次抬升。 */
+.prose a[href^="#source-"] {
+  color: var(--primary);
+  text-decoration: none;
+  padding: 0 0.12em;
+  border-radius: 0.2rem;
+  font-weight: 600;
+  background: color-mix(in oklch, var(--primary) 12%, transparent);
+}
+
+.prose a[href^="#source-"]:hover {
+  text-decoration: none;
+  background: color-mix(in oklch, var(--primary) 28%, transparent);
+}

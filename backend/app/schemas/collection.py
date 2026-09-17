@@ -29,10 +29,10 @@ class CollectionCreate(BaseModel):
         description="Collection name (alphanumeric, underscores, hyphens only).",
     )
     vector_size: int = Field(
-        768,
+        1024,
         ge=1,
         le=65536,
-        description="Dimensionality of vectors (default: 768 for text-embedding-004).",
+        description="Dimensionality of vectors (default: 1024 for bge-large-zh-v1.5).",
     )
     distance: DistanceMetric = Field(
         DistanceMetric.COSINE,
@@ -47,7 +47,7 @@ class CollectionCreate(BaseModel):
         "json_schema_extra": {
             "example": {
                 "name": "my_collection",
-                "vector_size": 768,
+                "vector_size": 1024,
                 "distance": "Cosine",
                 "on_disk_payload": True,
             }

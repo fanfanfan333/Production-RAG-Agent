@@ -12,6 +12,5 @@ def get_embedding_provider() -> BaseEmbeddingProvider:
     settings = get_settings()
 
     # In the future, this could inspect an `EMBEDDING_PROVIDER` setting.
-    # BGE (local, offline) is currently the only implemented provider —
-    # replaces the previous GeminiEmbeddingProvider.
+    # BGE (local, offline) is currently the only implemented provider.
     return BGEEmbeddingProvider()

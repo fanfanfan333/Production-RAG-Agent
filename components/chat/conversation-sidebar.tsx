@@ -57,6 +57,31 @@ export function ConversationSidebar() {
     }
   }, [conversationVersion, refetch]);
 
+  /**
+   * 脏指针对账：localStorage 里的活动会话可能已经不存在了.
+   *
+   * 会话 id 持久化在 localStorage（跨标签页、跨刷新保留），换账号登录时会
+   * 继承上一个账号的 id —— 那个会话当然不属于当前用户，后端按"不存在"返回
+   * 404。侧栏是唯一拿得到**完整会话清单**的地方，所以由它来清理这个脏指针。
+   *
+   * 只在"首次加载完成后"判一次（reconciledRef）：
+   *   * 首帧 conversations 还是空数组，此时判定会把刚创建的会话误清；
+   *   * 后续新增会话走的是 refetch，列表尚未更新时同样会误判。
+   * 运行期真正的失效场景（会话被删 / 被清空）由对话区收到 404 时自行清理，
+   * 两条路径互补，不互相依赖。
+   */
+  const reconciledRef = useRef(false);
+  useEffect(() => {
+    if (reconciledRef.current || loading) return;
+    reconciledRef.current = true;
+    if (
+      activeConversationId &&
+      !conversations.some((c) => c.id === activeConversationId)
+    ) {
+      setActiveConversationId(null);
+    }
+  }, [conversations, loading, activeConversationId, setActiveConversationId]);
+
   // 确认按钮 3 秒后自动收回
   useEffect(() => {
     if (!confirmingId) return;

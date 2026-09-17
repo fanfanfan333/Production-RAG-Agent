@@ -1,11 +1,13 @@
 import json
 import urllib.request
 import os
+import tempfile
 import fitz
 
 BASE_URL = "http://localhost:8000"
 PDF_NAME = "Rounak_Kumar_Sah_Profile.pdf"
-PDF_PATH = f"/tmp/{PDF_NAME}"
+# 用系统临时目录而不是硬编码 /tmp —— 后者在 Windows 上不存在。
+PDF_PATH = os.path.join(tempfile.gettempdir(), PDF_NAME)
 
 def create_dummy_profile():
     doc = fitz.open()
