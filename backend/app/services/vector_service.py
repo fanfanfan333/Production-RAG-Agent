@@ -397,6 +397,44 @@ async def delete_by_document_id(document_id: str) -> None:
     logger.info("Deleted vectors for document_id=%s", document_id)
 
 
+async def delete_by_document_ids(document_ids: "list[str] | set[str] | tuple[str, ...]") -> int:
+    """
+    Batch variant of :func:`delete_by_document_id` — one round trip for many docs.
+
+    为什么必须有批量版本（不是"循环调用单条版"）：清理类调用（e2e 收尾、孤儿
+    向量回收）动辄涉及上百份文档，逐份一次 HTTP 往返在千份规模下是几百次 RTT，
+    而且**部分失败会留下"删了一半"的中间态**，比全有或全无更难排查。Qdrant 的
+    ``MatchAny`` 把整个 id 集合压进一次 delete。
+
+    返回的是 Qdrant 的 ``operation_id``（不是删除点数）—— 本函数只保证"请求已被
+    接受"；需要精确点数时由调用方用 ``count`` 前后对比，或直接以 PG 行数为准。
+
+    ``document_ids`` 为空时直接返回，不发请求 —— 空 ``MatchAny(any=[])`` 的语义
+    在各版本间并不一致，别把"什么都没指定"赌在服务端行为上。
+    """
+    settings = get_settings()
+    ids = [str(i) for i in document_ids if i]
+    if not ids:
+        return 0
+
+    client = get_qdrant_client()
+    await client.delete(
+        collection_name=settings.QDRANT_COLLECTION,
+        points_selector=qmodels.FilterSelector(
+            filter=qmodels.Filter(
+                must=[
+                    qmodels.FieldCondition(
+                        key="document_id",
+                        match=qmodels.MatchAny(any=ids),
+                    )
+                ]
+            )
+        ),
+    )
+    logger.info("Deleted vectors for %d document_id(s) in one request", len(ids))
+    return len(ids)
+
+
 async def update_document_access_payload(
     document_id: str,
     *,

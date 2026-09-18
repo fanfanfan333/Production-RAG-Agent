@@ -79,6 +79,84 @@ export async function updateDocumentVisibility(
   };
 }
 
+/** 「转为部门文档」可选的部门（后端按公司隔离圈定，已是该公司已有部门）。 */
+export interface DepartmentOption {
+  departmentId: string;
+  departmentName: string;
+  memberCount: number;
+}
+
+export interface TransferTargets {
+  /** 文档当前所属部门（公司库文档为 null —— 它不属于任何部门）。 */
+  departmentId: string | null;
+  departmentName: string | null;
+  currentLevel: AccessLevel;
+  canTransfer: boolean;
+  deniedReason: string;
+  options: DepartmentOption[];
+}
+
+/**
+ * 拉取「转为部门文档」的可选部门清单。
+ *
+ * 部门清单来自该公司的成员归属（后端去重），因此天然是本公司范围 —— 不需要
+ * 前端再过滤一次公司。无权限（非企业管理员 / 知识库管理员）时抛 403。
+ */
+export async function getTransferTargets(
+  documentId: string
+): Promise<TransferTargets> {
+  const raw = await apiFetch<Record<string, unknown>>(
+    `/documents/${documentId}/transfer-targets`
+  );
+  const options = (raw.options as Record<string, unknown>[] | undefined) ?? [];
+  return {
+    departmentId: (raw.department_id as string | null) ?? null,
+    departmentName: (raw.department_name as string | null) ?? null,
+    currentLevel: String(raw.current_level ?? "private") as AccessLevel,
+    canTransfer: Boolean(raw.can_transfer_department ?? false),
+    deniedReason: String(raw.transfer_denied_reason ?? ""),
+    options: options.map((o) => ({
+      departmentId: String(o.department_id ?? ""),
+      departmentName: String(o.department_name ?? ""),
+      memberCount: Number(o.member_count ?? 0),
+    })),
+  };
+}
+
+/**
+ * 把文档转为指定部门的部门文档（公司 HR / 知识库管理员的整理动作）。
+ *
+ * 这是一次**可见性收缩**：公司库文档转成部门文档后，其他部门的同事将无法再
+ * 检索到它。调用方在界面上必须先明示这一后果。
+ */
+export async function transferDocumentToDepartment(
+  documentId: string,
+  departmentId: string,
+  note?: string
+): Promise<{
+  accessLevel: string;
+  accessLabel: string;
+  departmentId: string | null;
+  departmentName: string;
+  message: string;
+}> {
+  const raw = await apiFetch<Record<string, unknown>>(
+    `/documents/${documentId}/transfer-department`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ department_id: departmentId, note }),
+    }
+  );
+  return {
+    accessLevel: String(raw.access_level ?? "department"),
+    accessLabel: String(raw.access_label ?? "部门"),
+    departmentId: (raw.department_id as string | null) ?? null,
+    departmentName: String(raw.department_name ?? ""),
+    message: String(raw.message ?? "已转为部门文档"),
+  };
+}
+
 export async function assignDocumentToCollection(
   documentId: string,
   collectionId: string | null

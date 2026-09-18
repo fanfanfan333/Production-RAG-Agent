@@ -462,5 +462,5 @@ def build_summary_llm(reasoning: bool | None = None):
         temperature=0.2,
         streaming=True,
         reasoning=reasoning,
-        num_ctx=settings.OLLAMA_NUM_CTX,
+        num_ctx=settings.chat_num_ctx,
     )

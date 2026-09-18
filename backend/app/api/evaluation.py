@@ -2,7 +2,7 @@
 检索质量评测 API（持续监控 Recall / MRR / NDCG / 引用准确率）.
 
     POST /eval/run      — 提交金标集跑一轮评测（真实走检索链路）
-    GET  /eval/history  — 最近若干轮评测摘要（看趋势、做回归对比）
+    GET  /eval/history  — 最近若干轮评测摘要（**落库**，跨重启保留；看趋势、做回归对比）
     GET  /eval/metrics  — 当前运行期质量指标（含引用准确率）
 
 与 /badcases/stats 的分工
@@ -46,9 +46,10 @@ from app.db.user_models import User
 from app.services.evaluation import (
     EvalCase,
     EvalSet,
+    eval_history_persisted,
     evaluate,
-    eval_history,
     item_from_chunk,
+    persist_eval_run,
 )
 from app.services.monitoring_service import metrics_snapshot
 from app.services.permissions import require_permission
@@ -101,6 +102,12 @@ class EvalRunResponse(BaseModel):
     ndcg: dict[int, float | None]
     hit_rate: dict[int, float | None]
     by_modality: dict[str, dict]
+    # 按"答案需要几条证据"分组（single_evidence / multi_evidence）。
+    # 多证据切片是"相对分带会不会砍掉次要证据"的唯一观测点 —— 旧集 11 例
+    # 全是单证据，这个维度无观测点，于是分带参数只能靠拍脑袋。
+    evidence_slices: dict[str, dict] = Field(default_factory=dict)
+    # 金标分数画像（分带安全上界的原料；阈值过滤开启时该值是上界而非真值）
+    gold_ratio: dict = Field(default_factory=dict)
     citation: dict | None
     generated_at: str
 
@@ -167,9 +174,19 @@ async def run_evaluation(
         return [item_from_chunk(c) for c in chunks]
 
     report = await evaluate(_retrieve, eval_set, k_values=ks)
+    # 落库：一次评测如果只活在进程内存里，重启即丢，等于没有基线。
+    # 写历史失败不影响本次返回（persist_eval_run 内部已吞掉异常并记日志）。
+    persisted = await persist_eval_run(
+        report,
+        run_by=user.username,
+        tenant_id=tenant_id,
+        collection_id=collection_id,
+        top_k=top_k,
+        description=payload.description,
+    )
     logger.info(
-        "eval_run: set=%s cases=%d by user=%s -> mrr=%s",
-        payload.name, len(payload.cases), user.username, report.mrr,
+        "eval_run: set=%s cases=%d by user=%s -> mrr=%s persisted=%s",
+        payload.name, len(payload.cases), user.username, report.mrr, persisted,
     )
     return EvalRunResponse(
         eval_set=report.eval_set,
@@ -182,6 +199,8 @@ async def run_evaluation(
         ndcg=report.ndcg,
         hit_rate=report.hit_rate,
         by_modality=report.by_modality,
+        evidence_slices=report.evidence_slices,
+        gold_ratio=report.gold_ratio,
         citation=report.citation,
         generated_at=report.generated_at,
     )
@@ -195,8 +214,14 @@ async def get_eval_history(
     limit: Annotated[int, Query(ge=1, le=20)] = 10,
     _user: User = Depends(require_permission("audit.read")),
 ) -> dict:
-    """最新在前。改了切分 / 换 Embedding 之后，用它对比前后变化。"""
-    return {"runs": eval_history(limit=limit), "total": len(eval_history(limit=20))}
+    """
+    最新在前。改了切分 / 换 Embedding 之后，用它对比前后变化。
+
+    数据源是 ``eval_runs`` 表（跨重启保留）；表不可用时自动回退到进程内
+    历史，绝不会因为"读历史失败"把面板显示成"从没评测过"。
+    """
+    runs = await eval_history_persisted(limit=limit)
+    return {"runs": runs, "total": len(await eval_history_persisted(limit=20))}
 
 
 @router.get(
@@ -214,7 +239,7 @@ async def get_eval_metrics(
     任一指标都会漏掉的退化形态。
     """
     snap = metrics_snapshot()
-    history = eval_history(limit=1)
+    history = await eval_history_persisted(limit=1)
     return {
         "runtime": snap,
         "latest_eval": history[0] if history else None,

@@ -45,6 +45,7 @@ try:
         company_display_name,
         delete_permission_for,
         document_acl_clause,
+        is_upward_transition,
         publish_requirement,
         scope_for,
     )
@@ -385,6 +386,326 @@ def test_acl_clause_never_opens_private():
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# 4. 申请共享能力：**按目标层级**判定
+# ═════════════════════════════════════════════════════════════════════════════
+
+def test_request_capability_is_per_level():
+    """
+    回归：部门负责人曾经**拿不到「申请共享」入口**。
+
+    旧实现把申请能力算成一个总布尔
+    ``needs_request = is_owner and not can_dept and not can_company``，
+    前端据此把弹窗拆成互斥的两支（"有任一发布权 → 只渲染直接发布"）。
+    部门负责人 can_dept=True，于是整个申请分支被隐藏：界面里只剩"发布到部门
+    知识库"，他要把文档提到公司库时**在界面上无路可走**（接口本身放行，所以
+    日志里没有任何报错，纯前端死角）。
+
+    现在逐层判定：某一层能直接发就不给申请入口，不能直接发就给。
+    两者对**不同**层级可同时为真 —— 部门负责人正是这种形态。
+    """
+    from app.services.knowledge_tier_service import publish_capability
+
+    owner_id = uuid.uuid4()
+    dept_head = _user(User.ROLE_DEPT_MANAGER, department_id="tech", uid=owner_id)
+    employee = _user(User.ROLE_EMPLOYEE, department_id="tech", uid=owner_id)
+    kb_admin = _user(User.ROLE_KB_ADMIN, uid=owner_id)
+
+    personal = _StubDoc(owner_id=owner_id, access_level=ACCESS_PRIVATE)
+    dept_doc = _StubDoc(owner_id=owner_id, access_level=ACCESS_DEPARTMENT,
+                        department_id="tech")
+    company_doc = _StubDoc(owner_id=owner_id, access_level=ACCESS_TENANT)
+
+    cap = publish_capability(dept_head, personal)
+    check("部门负责人：可直接发布到部门库", cap["can_publish_department"])
+    check("部门负责人：不能直接发布到公司库", not cap["can_publish_company"])
+    check("部门负责人：部门库无需申请（本来就能直接发）",
+          not cap["can_request_department"])
+    check("部门负责人：可以申请公司库 ← 本次修复的核心",
+          cap["can_request_company"])
+    check("部门负责人：有可申请的层级 → needs_share_request 为真",
+          cap["needs_share_request"])
+
+    cap = publish_capability(dept_head, dept_doc)
+    check("部门负责人：文档已在部门库 → 该层不再重复申请",
+          not cap["can_request_department"])
+    check("部门负责人：部门库文档仍可申请提到公司库", cap["can_request_company"])
+
+    cap = publish_capability(employee, personal)
+    check("普通员工：部门库要申请", cap["can_request_department"])
+    check("普通员工：公司库要申请", cap["can_request_company"])
+    check("普通员工：有可申请的层级", cap["needs_share_request"])
+
+    cap = publish_capability(kb_admin, personal)
+    check("知识库管理员：两级都能直接发布",
+          cap["can_publish_department"] and cap["can_publish_company"])
+    check("知识库管理员：没有任何需要申请的层级",
+          not (cap["can_request_department"] or cap["can_request_company"]))
+    check("知识库管理员：needs_share_request 为假", not cap["needs_share_request"])
+
+    cap = publish_capability(employee, company_doc)
+    check("文档已在公司库：不能再申请『部门库』（那是降级，不是共享）",
+          not cap["can_request_department"])
+    check("文档已在公司库：再无更高层级可申请", not cap["needs_share_request"])
+
+    peer = _user(User.ROLE_EMPLOYEE, department_id="tech")
+    cap = publish_capability(peer, personal)
+    check("非归属人：没有任何申请入口（只有归属人能提申请）",
+          not (cap["can_request_department"] or cap["can_request_company"]))
+
+    cap = publish_capability(kb_admin, company_doc)
+    check("公司库文档：知识库管理员没有任何需要申请的层级",
+          not (cap["can_request_department"] or cap["can_request_company"]))
+    check("发布能力**按文档层级收窄**：公司库文档不能再「发布」到部门库（那是降级）",
+          not cap["can_publish_department"])
+    check("同层级（公司→公司）不算降级，仍然允许",
+          cap["can_publish_company"])
+
+
+def test_direct_publish_cannot_downgrade():
+    """
+    回归：**直接发布**链路曾是一条不需要审批的降级通道。
+
+    旧实现 ``can_publish_department = has_permission(user, "document.publish.department")``
+    是纯角色判定，文档当前在哪一层完全不参与。后果：部门负责人面对一份**已经
+    发布到公司库**的文档，能力字段仍为 True，界面照常渲染"发布到部门知识库"
+    按钮，点下去 ``PATCH /documents/{id}/visibility`` 就把它真降成部门库 ——
+    其他部门同事静默失去访问权，而审计日志里只是一条正常的"层级变更"。
+
+    申请链路当时已用 is_upward_transition 堵住向下，但直接发布这条路更短、
+    更隐蔽（无人审批）。现在两处同一口径：``can_publish_*`` 也按层级收窄。
+
+    注意边界：**收回个人库不能被误伤** —— 那是归属人的正当操作，前端有独立
+    的「收回」入口，文案也明示了后果。
+    """
+    from app.services.knowledge_tier_service import publish_capability
+    from app.services.tenancy import is_downgrade
+
+    # ── is_downgrade 本身：只回答"层级是否变低"，不管调用方拦不拦 ──────────
+    check("公司 → 部门 = 降级", is_downgrade(ACCESS_TENANT, ACCESS_DEPARTMENT))
+    check("公司 → 个人 = 降级（调用方需自行放行『收回』）",
+          is_downgrade(ACCESS_TENANT, ACCESS_PRIVATE))
+    check("部门 → 个人 = 降级", is_downgrade(ACCESS_DEPARTMENT, ACCESS_PRIVATE))
+    check("个人 → 部门 = 不是降级", not is_downgrade(ACCESS_PRIVATE, ACCESS_DEPARTMENT))
+    check("部门 → 公司 = 不是降级", not is_downgrade(ACCESS_DEPARTMENT, ACCESS_TENANT))
+    check("同层级 = 不是降级", not is_downgrade(ACCESS_TENANT, ACCESS_TENANT))
+    check("未知层级按个人库处理（None → 部门 不是降级）",
+          not is_downgrade(None, ACCESS_DEPARTMENT))
+
+    owner_id = uuid.uuid4()
+    dept_head = _user(User.ROLE_DEPT_MANAGER, department_id="tech", uid=owner_id)
+    kb_admin = _user(User.ROLE_KB_ADMIN, uid=owner_id)
+
+    personal = _StubDoc(owner_id=owner_id, access_level=ACCESS_PRIVATE)
+    dept_doc = _StubDoc(owner_id=owner_id, access_level=ACCESS_DEPARTMENT,
+                        department_id="tech")
+    company_doc = _StubDoc(owner_id=owner_id, access_level=ACCESS_TENANT)
+
+    # ── 核心：公司库文档不能被"发布"到部门库 ──────────────────────────────
+    cap = publish_capability(dept_head, company_doc)
+    check("部门负责人对本公司库文档：不能再『发布到部门库』← 本次修复的核心",
+          not cap["can_publish_department"])
+    check("被拒时给出层级原因，而不是误报『你的角色暂无发布权限』"
+          f"（reason={cap['publish_denied_reason']!r}）",
+          "更低的层级" in cap["publish_denied_reason"])
+
+    # ── 不能误伤：向上 / 同层 / 本人文档的发布能力保持原样 ────────────────
+    cap = publish_capability(dept_head, personal)
+    check("个人文档：部门负责人仍可直接发布到部门库（未被误伤）",
+          cap["can_publish_department"])
+    cap = publish_capability(dept_head, dept_doc)
+    check("部门库文档：同层级不算降级，发布能力保留",
+          cap["can_publish_department"])
+
+    cap = publish_capability(kb_admin, dept_doc)
+    check("部门库文档：知识库管理员仍可『发布到公司库』（向上，未被误伤）",
+          cap["can_publish_company"])
+    cap = publish_capability(kb_admin, personal)
+    check("个人文档：知识库管理员两级都能发",
+          cap["can_publish_department"] and cap["can_publish_company"])
+
+
+def test_only_upward_transitions_are_requestable():
+    """申请只能向上：平级/向下都要挡住（向下批准即文档降级）。"""
+    check("个人库 → 部门库：向上，可申请",
+          is_upward_transition(ACCESS_PRIVATE, ACCESS_DEPARTMENT))
+    check("个人库 → 公司库：向上，可申请",
+          is_upward_transition(ACCESS_PRIVATE, ACCESS_TENANT))
+    check("部门库 → 公司库：向上，可申请",
+          is_upward_transition(ACCESS_DEPARTMENT, ACCESS_TENANT))
+    check("部门库 → 部门库：平级，不可申请",
+          not is_upward_transition(ACCESS_DEPARTMENT, ACCESS_DEPARTMENT))
+    check("公司库 → 部门库：**向下，不可申请**（批准会把文档降级）",
+          not is_upward_transition(ACCESS_TENANT, ACCESS_DEPARTMENT))
+    check("公司库 → 公司库：平级，不可申请",
+          not is_upward_transition(ACCESS_TENANT, ACCESS_TENANT))
+    check("未知层级按个人库处理（老数据语义）",
+          is_upward_transition(None, ACCESS_DEPARTMENT)
+          and is_upward_transition("whatever", ACCESS_DEPARTMENT))
+
+
+def test_company_request_is_routed_to_company_reviewers():
+    """
+    部门负责人申请"公司库"时，审核人必须是**公司级**（知识库管理员 /
+    企业管理员 / 平台管理员），落到部门负责人自己手里就是自审自批。
+
+    同时校验跨公司隔离：B 公司的审核人看不到 A 公司的申请。
+    """
+    try:
+        from app.services.share_service import can_review, review_scope
+    except ImportError as exc:      # pragma: no cover — 宿主机缺依赖
+        print(f"  SKIP share_service 不可导入（{exc}）")
+        return
+
+    class _StubRequest:
+        def __init__(self, *, tenant_id, target_level, requester_id,
+                     target_department_id=None):
+            self.tenant_id = tenant_id
+            self.target_level = target_level
+            self.target_department_id = target_department_id
+            self.requester_id = requester_id
+
+    requester = _user(User.ROLE_DEPT_MANAGER, department_id="tech")
+    same_dept_head = _user(User.ROLE_DEPT_MANAGER, department_id="tech")
+    other_dept_head = _user(User.ROLE_DEPT_MANAGER, department_id="sales")
+    kb_admin = _user(User.ROLE_KB_ADMIN)
+    company_admin = _user(User.ROLE_COMPANY_ADMIN)
+    other_company_kb = _user(User.ROLE_KB_ADMIN, tenant_id="company_b")
+    platform_admin = _user(User.ROLE_ADMIN, tenant_id="company_c")
+
+    to_company = _StubRequest(
+        tenant_id="company_a", target_level=ACCESS_TENANT,
+        requester_id=requester.id,
+    )
+
+    check("部门负责人：审核范围是部门级", review_scope(requester) == "department")
+    check("部门负责人：审不了『公司库』申请（不能自审自批）",
+          not can_review(to_company, same_dept_head))
+    check("知识库管理员：可审本公司的公司库申请",
+          can_review(to_company, kb_admin))
+    check("企业管理员：可审本公司的公司库申请",
+          can_review(to_company, company_admin))
+    check("平台管理员：可审任意公司的申请",
+          can_review(to_company, platform_admin))
+    check("跨公司：B 公司的知识库管理员审不了 A 公司的申请（公司隔离）",
+          not can_review(to_company, other_company_kb))
+    check("申请人本人：不能审自己的申请",
+          not can_review(to_company, requester))
+
+    to_dept = _StubRequest(
+        tenant_id="company_a", target_level=ACCESS_DEPARTMENT,
+        requester_id=requester.id, target_department_id="tech",
+    )
+    check("部门库申请：本部门负责人可审", can_review(to_dept, same_dept_head))
+    check("部门库申请：其他部门负责人审不了",
+          not can_review(to_dept, other_dept_head))
+    check("部门库申请：知识库管理员（公司级）也能审",
+          can_review(to_dept, kb_admin))
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 6. 「转为部门文档」：公司级管理者把已共享的文档改归到指定部门
+# ═════════════════════════════════════════════════════════════════════════════
+
+def test_transfer_department_capability():
+    """
+    公司 HR 把公司文档转为部门文档 —— 谁能做、在什么状态下能做.
+
+    这条能力与「发布到部门知识库」必须分得清，它们是两个字段：
+
+        can_publish_department  发到**自己的**部门（部门负责人），无选择余地
+        can_transfer_department 指定**任意一个**本公司部门（公司 HR）
+
+    前者按"角色 + 文档层级不得降级"判定；后者按"是不是公司级管理者"判定，
+    而且**刻意包含降级**（公司库 → 部门库正是它的用途）。合并成一个布尔
+    会立刻出事：要么部门负责人获得把公司库文档改派到别的部门的权力，要么
+    HR 的这次操作被防降级补丁拦死。
+    """
+    from app.services.knowledge_tier_service import publish_capability
+
+    owner_id = uuid.uuid4()
+    employee = _user(User.ROLE_EMPLOYEE, department_id="tech", uid=owner_id)
+    dept_head = _user(User.ROLE_DEPT_MANAGER, department_id="tech", uid=owner_id)
+    kb_admin = _user(User.ROLE_KB_ADMIN, uid=owner_id)
+    company_admin = _user(User.ROLE_COMPANY_ADMIN, uid=owner_id)
+    platform_admin = _user(User.ROLE_ADMIN, tenant_id="company_c", uid=owner_id)
+
+    personal = _StubDoc(owner_id=owner_id, access_level=ACCESS_PRIVATE)
+    dept_doc = _StubDoc(owner_id=owner_id, access_level=ACCESS_DEPARTMENT,
+                        department_id="tech")
+    company_doc = _StubDoc(owner_id=owner_id, access_level=ACCESS_TENANT)
+
+    # ── 公司库文档：只有公司级管理者能改归部门 ────────────────────────────────
+    check("普通员工：不能把公司文档转为部门文档",
+          not publish_capability(employee, company_doc)["can_transfer_department"])
+    check("部门负责人：**不能**把公司文档改派到其他部门（越权整理组织资产）",
+          not publish_capability(dept_head, company_doc)["can_transfer_department"])
+    check("知识库管理员：可以把公司文档转为部门文档",
+          publish_capability(kb_admin, company_doc)["can_transfer_department"])
+    check("企业管理员（HR）：可以把公司文档转为部门文档",
+          publish_capability(company_admin, company_doc)["can_transfer_department"])
+    check("平台管理员：可跨公司把公司文档转为部门文档",
+          publish_capability(platform_admin, company_doc)["can_transfer_department"])
+
+    # ── 部门库文档：换部门归属（平级调动）也归这条能力 ────────────────────────
+    check("知识库管理员：可把部门文档改归到另一个部门",
+          publish_capability(kb_admin, dept_doc)["can_transfer_department"])
+    check("部门负责人：不能把本部门文档改归到其他部门",
+          not publish_capability(dept_head, dept_doc)["can_transfer_department"])
+
+    # ── 个人库文档：先共享，再谈归属 ──────────────────────────────────────────
+    cap = publish_capability(kb_admin, personal)
+    check("个人文档：不能直接『转为部门文档』（应先用「发布到部门知识库」）",
+          not cap["can_transfer_department"])
+    check("个人文档被拒时给出可执行的中文原因",
+          "发布到部门知识库" in cap["transfer_denied_reason"])
+
+    # ── 关键回归：新能力不能把上一轮的防降级补丁撞开 ──────────────────────────
+    cap = publish_capability(kb_admin, company_doc)
+    check("公司库文档：知识库管理员的『发布到部门库』仍被防降级收窄（不被新功能绕过）",
+          not cap["can_publish_department"])
+    check("公司库文档：转为部门文档走的是一条独立能力，两者不互相污染",
+          cap["can_transfer_department"] and not cap["can_publish_department"])
+
+
+def test_merge_department_rows():
+    """
+    部门清单的合并规则（「转为部门文档」的可选目标）.
+
+    清单来自成员归属的 group by 结果，两份数据最容易出问题的地方在这里：
+    按 **ID** 聚合（不是按名字）、空名回填、空 ID 丢弃。写错的直接后果是
+    "管理者选中的部门 ID 与显示的名字对不上"，文档被发进一个谁都不在的部门
+    —— 对全公司静默不可见。
+    """
+    from app.services.knowledge_tier_service import merge_department_rows
+
+    rows = [
+        ("d_tech", "技术部", 3),
+        ("d_sales", "销售部", 2),
+        # 同一部门因成员改过名而出现两行：必须按 ID 合并、人数累加
+        ("d_tech", "研发部", 4),
+        # 名称缺失 → 后续用非空名回填，不让界面显示哈希 ID
+        ("d_hr", None, 1),
+        ("d_hr", "人力资源部", 2),
+        # 空 ID / None → 不属于任何部门，直接丢弃
+        ("", "无部门组", 5),
+        (None, "无部门组", 5),
+    ]
+    merged = merge_department_rows(rows)
+    by_id = {item["department_id"]: item for item in merged}
+
+    check("按 ID 聚合：同一部门的重复行合为一条", len(merged) == 3)
+    check("人数累加（技术部 3 + 4 = 7）", by_id["d_tech"]["member_count"] == 7)
+    check("空 ID 的行被丢弃", "" not in by_id and "None" not in by_id)
+    check("缺失的名称被非空名回填（不显示哈希 ID）",
+          by_id["d_hr"]["department_name"] == "人力资源部")
+    check("名称缺失时先以 ID 兜底，界面永远有字可显示",
+          merge_department_rows([("d_x", None, 1)])[0]["department_name"] == "d_x")
+    check("按部门名排序（人力资源部 / 技术部 / 销售部 的中文字典序）",
+          [item["department_name"] for item in merged]
+          == ["人力资源部", "技术部", "销售部"])
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     for fn in (
@@ -397,6 +718,12 @@ if __name__ == "__main__":
         test_visibility_and_read_all,
         test_scope_for_matches_acl,
         test_acl_clause_never_opens_private,
+        test_request_capability_is_per_level,
+        test_direct_publish_cannot_downgrade,
+        test_only_upward_transitions_are_requestable,
+        test_company_request_is_routed_to_company_reviewers,
+        test_transfer_department_capability,
+        test_merge_department_rows,
     ):
         print(f"\n▶ {fn.__name__}")
         fn()

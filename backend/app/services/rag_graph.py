@@ -198,6 +198,14 @@ def _build_llm(settings) -> ChatOllama:
         reasoning=True,                    # stream qwen3 thinking separately in
                                            # additional_kwargs["reasoning_content"]
                                            # instead of dropping it silently
+        # ⚠️ 必须显式传 num_ctx，且必须与其它节点（路由/改写/评估）一致：
+        #   1) 不传时 Ollama 用模型自带默认（qwen3 是 40960），KV cache 需 ~1.5GB+
+        #      常驻内存，小显存/小内存机器直接 OOM —— 这是本项目踩过的坑；
+        #   2) 传了但**与其它节点不同**同样有害：num_ctx 是 Ollama 缓存常驻实例的
+        #      键之一，一变就必须卸载重载。本机实测每次重载 ≈11s，而一次问答里
+        #      "辅助节点(4096) ↔ 生成节点"必然交替，等于每轮白付 20 秒左右。
+        # 统一入口见 config.Settings.chat_num_ctx。
+        num_ctx=settings.chat_num_ctx,
     )
 
 
@@ -579,7 +587,11 @@ def _friendly_error(exc: Exception) -> str:
         or "network is unreachable" in lowered
         or "failed to establish a new connection" in lowered
     ):
-        return "无法连接 Ollama 服务，请确认 Ollama 正在运行（默认端口 11434）且模型已下载。"
+        return (
+            "无法连接 Ollama 服务。请确认 Ollama 正在运行（默认端口 11434）"
+            "且模型已下载；若确认已在运行，通常是模型正在加载或内存不足导致"
+            "推理服务重启，请稍后重试。"
+        )
     if "timed out" in lowered or "timeout" in lowered or "readerror" in lowered:
         return "模型响应超时，请稍后重试。"
     if "model" in lowered and ("not found" in lowered or "not_found" in lowered):

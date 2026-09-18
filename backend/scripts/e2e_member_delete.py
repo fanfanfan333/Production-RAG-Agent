@@ -27,7 +27,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, or_, select
 
 from app.db.conversation_models import Conversation, Message
 from app.db.models import Document, DocumentMetadataRow, DocumentStatus
@@ -68,7 +68,15 @@ async def expect_staff_error(coro, keyword: str) -> tuple[bool, str]:
 
 
 async def purge() -> None:
-    """清掉本脚本可能留下的全部临时数据（开头与结尾各跑一次）。"""
+    """清掉本脚本可能留下的全部临时数据（开头与结尾各跑一次）。
+
+    ⚠️ 删 ``Document`` 行之前必须先清 Qdrant 向量。历史上这里只删 PG 行，
+    每跑一轮就往向量库里留一批孤儿点；本仓库实测积累到 177 个孤儿 document_id
+    （占集合 95%），并实测把平台管理员的检索候选池挤掉 80%。详见
+    ``scripts/_e2e_purge.py`` 的模块说明。
+    """
+    from _e2e_purge import delete_vectors_for_documents
+
     async with get_db_session() as s:
         uids = list(
             (
@@ -77,6 +85,19 @@ async def purge() -> None:
                 )
             ).scalars().all()
         )
+        # 先把待删文档的 id 收集齐（按 owner 与按文件名前缀两路），统一清向量
+        doc_rows = await s.execute(
+            select(Document.id).where(
+                or_(
+                    Document.owner_id.in_(uids) if uids else False,
+                    Document.filename.like(f"{TAG}%"),
+                )
+            )
+        )
+        doc_ids = [d for (d,) in doc_rows.all()]
+        if doc_ids:
+            await delete_vectors_for_documents(doc_ids)
+
         if uids:
             await s.execute(delete(Conversation).where(Conversation.owner_id.in_(uids)))
             await s.execute(delete(Collection).where(Collection.owner_id.in_(uids)))

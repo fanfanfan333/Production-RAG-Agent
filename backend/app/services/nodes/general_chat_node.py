@@ -110,6 +110,6 @@ def build_general_chat_llm():
         streaming=True,
         reasoning=True,           # qwen3 思考流照常透出
         # 与 master_graph._build_streaming_llm 同一套小显存防护
-        num_ctx=settings.OLLAMA_NUM_CTX,
+        num_ctx=settings.chat_num_ctx,
         num_gpu=settings.OLLAMA_NUM_GPU,
     )

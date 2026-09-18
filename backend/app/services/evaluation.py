@@ -206,6 +206,59 @@ def average_precision(
     return cumulative / len(needles) if hits else 0.0
 
 
+def gold_score_profile(
+    ranked: Sequence[RetrievedItem], relevant: Iterable[str]
+) -> dict:
+    """
+    单条用例的"金标分数画像" —— 相对分带的判别力就藏在这三个量里.
+
+    返回 ``{"best_score", "gold_scores", "min_gold_ratio"}``：
+
+        best_score     头名（= 精排第 1 名）的分数，即分带公式里的 ``head``
+        gold_scores    命中的每条金标 → 它的检索分
+        min_gold_ratio 命中的金标里**最弱者** ÷ 头名
+
+    为什么必须是"最弱者 ÷ 头名"
+    ────────────────────────────
+    分带判据是 ``c.score >= head.score × ratio``，它对**每一条**候选独立生效，
+    所以决定"分带会不会砍掉这条金标"的，永远是**最弱的那条金标**：
+
+        min_gold_ratio >= ratio   ⇒ 该用例的所有金标都能过带
+        min_gold_ratio <  ratio   ⇒ 至少一条金标会被带砍掉 → 该用例 recall 掉分
+
+    这正是旧金标集**结构上测不出**的东西：11 个用例的金标全是头名本身
+    （``head`` 就是金标），于是 ``min_gold_ratio ≡ 1.0``，分带开到 1.0 也不掉分 ——
+    "提高 ratio 不损召回"在该集上是**恒真命题**，无法作为调参依据。补了多证据
+    用例（金标 2 条以上、且弱者明显弱于头名）之后，这个量才第一次有信息量。
+
+    ⚠️ 使用限制（很重要，否则会被误读成"安全上界"）
+    ────────────────────────────────────────────
+    若本次检索**已经开着阈值过滤**，被带砍掉的那条金标根本不会出现在
+    *ranked* 里 → 它不进 ``gold_scores`` → ``min_gold_ratio`` 被算**偏高**。
+    因此本函数的值在"过滤开启"时只是**上界**，不能直接当作"ratio 还能调多高"
+    的依据。要拿真实安全上界，必须在不带过滤的那一态测量（见
+    ``scripts/run_eval_baseline.py`` 的 ``measure_band_headroom``）。
+
+    全部未命中或 *ranked* 为空 → ``min_gold_ratio`` 为 None（无从判断，不猜）。
+    """
+    needles = set(relevant or ())
+    scores: dict[str, float] = {}
+    for n in sorted(needles):
+        hit = next((i for i in ranked if i.matches({n})), None)
+        if hit is not None:
+            scores[n] = round(float(hit.score), 4)
+    best = max((float(i.score) for i in ranked), default=None)
+    if best is None or not scores:
+        return {"best_score": None if best is None else round(best, 4),
+                "gold_scores": scores, "min_gold_ratio": None}
+    weakest = min(scores.values())
+    return {
+        "best_score": round(best, 4),
+        "gold_scores": scores,
+        "min_gold_ratio": round(weakest / best, 4) if best > 0 else None,
+    }
+
+
 def ndcg_at_k(
     ranked: Sequence[RetrievedItem],
     grades: Mapping[str, float] | None,
@@ -335,6 +388,18 @@ class CaseResult:
     ap: float | None = None
     ndcg: dict[int, float] = field(default_factory=dict)      # k → ndcg
     missed: tuple[str, ...] = ()                              # 一条都没召回的标准答案
+    # ── 分带（relative band）风险所需的量 ────────────────────────────────────
+    # 只靠 recall 这一层看不到"这条证据是被绝对下限砍的、还是被相对分带砍的"，
+    # 而两者的处置完全不同（前者是校准问题，后者是纵深防御调过头）。
+    gold_count: int = 0                                       # 该用例标注了几条金标
+    best_score: float | None = None                           # 头名检索分（精排口径）
+    gold_scores: dict[str, float] = field(default_factory=dict)  # 命中的金标 → 其检索分
+    min_gold_ratio: float | None = None                       # 命中最弱者 / 头名
+
+    @property
+    def all_gold_found(self) -> bool:
+        """该用例的金标是否**一条不漏**都被召回（保序截断前的完整召回）. """
+        return self.gold_count > 0 and not self.missed
 
     def as_dict(self) -> dict:
         return {
@@ -348,6 +413,11 @@ class CaseResult:
             "ap": self.ap,
             "ndcg": self.ndcg,
             "missed": list(self.missed),
+            "gold_count": self.gold_count,
+            "best_score": self.best_score,
+            "gold_scores": self.gold_scores,
+            "min_gold_ratio": self.min_gold_ratio,
+            "all_gold_found": self.all_gold_found,
         }
 
 
@@ -368,6 +438,16 @@ class EvalReport:
     map_score: float | None = None
     # 按模态分组（图片召回单独看，避免被文本高分掩盖）
     by_modality: dict[str, dict] = field(default_factory=dict)
+    # 按"答案需要几条证据"分组（single_evidence / multi_evidence）
+    #
+    # 为什么单独切一刀：单证据用例问的是"找得到吗"，多证据用例问的是
+    # "**次要证据**还在吗"。两者的失效机制不同 —— 前者靠粗排召回，
+    # 后者还会被相对分带、同父衰减、top_k 截断各自吃掉一遍。混在一起算，
+    # 多证据用例的退化会被单证据用例的高分淹没（旧集 11 例全是单证据，
+    # 于是"分带是否误杀"这个维度**完全没有观测点**）。
+    evidence_slices: dict[str, dict] = field(default_factory=dict)
+    # 金标分数画像汇总（分带安全上界的原料）
+    gold_ratio: dict = field(default_factory=dict)
     # 引用准确率（本轮若有金标引用）
     citation: dict | None = None
     cases: tuple[CaseResult, ...] = ()
@@ -389,6 +469,14 @@ class EvalReport:
             out[f"precision@{k}"] = self.precision.get(k)
             out[f"ndcg@{k}"] = self.ndcg.get(k)
             out[f"hit@{k}"] = self.hit_rate.get(k)
+        multi = self.evidence_slices.get("multi_evidence") or {}
+        if multi:
+            out["multi_evidence_cases"] = multi.get("cases")
+            out["multi_evidence_recall@10"] = multi.get("recall@10")
+            out["multi_evidence_all_found_rate"] = multi.get("all_gold_found_rate")
+        ceil = (self.gold_ratio or {}).get("min_gold_ratio")
+        if ceil is not None:
+            out["min_gold_ratio"] = ceil
         if self.citation:
             out["citation_precision"] = self.citation.get("precision")
             out["citation_recall"] = self.citation.get("recall")
@@ -408,6 +496,8 @@ class EvalReport:
             "mrr": self.mrr,
             "map": self.map_score,
             "by_modality": self.by_modality,
+            "evidence_slices": self.evidence_slices,
+            "gold_ratio": self.gold_ratio,
             "citation": self.citation,
             "cases": [c.as_dict() for c in self.cases],
             "generated_at": self.generated_at,
@@ -461,6 +551,62 @@ def aggregate(
             entry[f"recall@{k}"] = _mean([r.recall.get(k) for r in group])
         report.by_modality[modality] = entry
 
+    # ── 分组：按"答案需要几条证据"切一刀 ─────────────────────────────────
+    #
+    # 这一刀是为了让"相对分带会不会砍掉次要证据"**有观测点**。判据与命名都
+    # 刻意写死：``gold_count >= 2`` 才算多证据。不按"本轮实际召回了 2 条"
+    # 来切 —— 那会让"次要证据被砍掉"的用例自动掉出该分组，正好把要测的
+    # 现象测没了（幸存者偏差）。
+    for label, subset in (
+        ("single_evidence", [r for r in results if r.gold_count == 1]),
+        ("multi_evidence", [r for r in results if r.gold_count >= 2]),
+    ):
+        if not subset:
+            continue
+        entry = {
+            "cases": len(subset),
+            "mrr": _mean([r.rr for r in subset]),
+            "map": _mean([r.ap for r in subset]),
+            # 一条不漏的用例占比 —— 多证据场景下比 recall 更直白：
+            # 只要漏一条就是"答案只答了一半"。
+            "all_gold_found_rate": _mean(
+                [1.0 if r.all_gold_found else 0.0 for r in subset]
+            ),
+            "cases_missing_gold": [
+                r.query for r in subset if r.gold_count and r.missed
+            ],
+        }
+        for k in ks:
+            entry[f"recall@{k}"] = _mean([r.recall.get(k) for r in subset])
+        report.evidence_slices[label] = entry
+
+    # ── 金标分数画像（分带安全上界的原料）────────────────────────────────
+    #
+    # ⚠️ 读法（写在这里而不是文档里，因为误读的代价是"把参数调坏"）：
+    # 本次检索若**开着**阈值过滤，被砍掉的金标根本不会进入 ranked，
+    # 于是这里的 min_gold_ratio 是**上界**（偏高）。要拿真实安全上界，
+    # 必须在不带过滤的那一态测（scripts/run_eval_baseline.py 会做），
+    # 并把结果记进 golden 集的 known_limitation / baseline 的 band 段。
+    multi = [r for r in results if r.gold_count >= 2 and r.min_gold_ratio is not None]
+    report.gold_ratio = {
+        "computed_over_cases": len(multi),
+        "min_gold_ratio": min((r.min_gold_ratio for r in multi), default=None),
+        "per_case": [
+            {
+                "query": r.query,
+                "best_score": r.best_score,
+                "min_gold_ratio": r.min_gold_ratio,
+                "gold_scores": r.gold_scores,
+                "all_gold_found": r.all_gold_found,
+            }
+            for r in multi
+        ],
+        "note": (
+            "仅覆盖 gold_count>=2 的用例（单金标用例的 gold/head 恒为 1.0，"
+            "无信息量）。阈值过滤开启时此值是**上界**，不是安全上界。"
+        ),
+    }
+
     return report
 
 
@@ -490,6 +636,13 @@ def score_case(
     result.missed = tuple(
         key for key in sorted(case.relevant or ()) if not any(i.matches([key]) for i in ranked)
     )
+    # 金标分数画像（分带判别力）—— 与 recall 互补：recall 说"掉没掉分"，
+    # 画像说"为什么掉、离边界还有多远"。
+    result.gold_count = len(case.relevant or ())
+    profile = gold_score_profile(ranked, case.relevant)
+    result.best_score = profile["best_score"]
+    result.gold_scores = profile["gold_scores"]
+    result.min_gold_ratio = profile["min_gold_ratio"]
     return result
 
 
@@ -586,6 +739,7 @@ def record_eval_run(report: EvalReport) -> None:
         "recall": dict(report.recall),
         "ndcg": dict(report.ndcg),
         "by_modality": report.by_modality,
+        "evidence_slices": report.evidence_slices,
         "citation": report.citation,
     }
     _HISTORY.append(entry)
@@ -603,6 +757,191 @@ def reset_eval_history() -> None:
     _HISTORY.clear()
 
 
+# ── 运行历史（持久化：跨重启保留，供跨版本回归对比）──────────────────────────
+#
+# 上面那个 deque 是**进程内**的：后端一重启就归零。而"改配置 → 重启 → 再评测"
+# 恰好是评测最常见的用法，于是 /eval/history 永远是 []。下面这组函数把每轮
+# 聚合结果写进 PostgreSQL 的 eval_runs 表，让"基线"真的存在。
+
+
+def _i18n_keys(d: Mapping | None) -> dict:
+    """JSON 的键只能是字符串：{1: 0.9} → {"1": 0.9}（读回来时再转回 int）."""
+    if not d:
+        return {}
+    return {str(k): v for k, v in d.items()}
+
+
+def _int_keys(d: Mapping | None) -> dict[int, float | None]:
+    """把库里存的 {"1": 0.9} 还原成 {1: 0.9}（与进程内口径一致）."""
+    if not d:
+        return {}
+    out: dict[int, float | None] = {}
+    for k, v in d.items():
+        try:
+            out[int(k)] = v
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _config_snapshot() -> dict:
+    """
+    评测当时的检索配置快照.
+
+    没有它，"分数变了"无法归因到"改了什么" —— 只能看到一条下降的曲线，
+    却不知道是精排阈值、多查询开关还是 Embedding 换了。这里是特意把
+    影响召回的关键旋钮记下来，且**读配置失败不能拖垮评测**（评测本身
+    已经跑完，落库失败只应记日志）。
+    """
+    try:
+        from app.config import get_settings
+
+        s = get_settings()
+        return {
+            "hybrid_search": s.HYBRID_SEARCH_ENABLED,
+            "reranker": s.RERANKER_ENABLED,
+            "rerank_min_score": s.RERANK_MIN_SCORE,
+            "rerank_min_score_ratio": getattr(s, "RERANK_MIN_SCORE_RATIO", None),
+            "rerank_min_score_filter": s.RERANK_MIN_SCORE_FILTER,
+            "evidence_gate_min_top_score": s.EVIDENCE_GATE_MIN_TOP_SCORE,
+            "retrieval_min_score": s.RETRIEVAL_MIN_SCORE,
+            "retrieval_max_gap": s.RETRIEVAL_MAX_GAP,
+            "multi_query_max_extra": getattr(s, "MULTI_QUERY_MAX_EXTRA", None),
+            "query_rewrite_enabled": getattr(s, "QUERY_REWRITE_ENABLED", None),
+            "acl_prefilter_enabled": getattr(s, "ACL_PREFILTER_ENABLED", None),
+            "hierarchical_rag": getattr(s, "HIERARCHICAL_RAG_ENABLED", None),
+            "parent_score_decay": getattr(s, "PARENT_SCORE_DECAY", None),
+        }
+    except Exception:  # noqa: BLE001
+        logger.exception("eval config snapshot failed")
+        return {}
+
+
+async def persist_eval_run(
+    report: EvalReport,
+    *,
+    run_by: str | None = None,
+    tenant_id: str | None = None,
+    collection_id: str | None = None,
+    top_k: int = 0,
+    description: str = "",
+) -> bool:
+    """
+    把一轮评测的聚合结果落库（``eval_runs`` 表）.
+
+    刻意与 ``record_eval_run``（进程内 deque）并存：看板读 DB 拿历史，
+    单测与极端降级路径仍可依赖内存副本。落库失败**不抛异常** —— 评测
+    本身已经跑完，写历史失败不该让调用方以为评测失败；失败仅记日志。
+
+    Returns:
+        True = 已落库；False = 落库失败（已记日志），调用方不应据此判定评测失败。
+    """
+    try:
+        from app.db.eval_models import EvalRunRow
+        from app.db.postgres import get_db_session
+
+        try:
+            generated = datetime.fromisoformat(report.generated_at)
+        except (TypeError, ValueError):
+            generated = datetime.now(timezone.utc)
+
+        row = EvalRunRow(
+            name=report.eval_set or "default",
+            description=description,
+            run_by=run_by,
+            tenant_id=tenant_id,
+            collection_id=collection_id,
+            total_cases=report.total_cases,
+            scored_cases=report.scored_cases,
+            top_k=top_k,
+            mrr=report.mrr,
+            map_score=report.map_score,
+            recall=_i18n_keys(report.recall),
+            precision=_i18n_keys(report.precision),
+            ndcg=_i18n_keys(report.ndcg),
+            hit_rate=_i18n_keys(report.hit_rate),
+            by_modality=report.by_modality or {},
+            citation=report.citation,
+            k_values=[int(k) for k in report.k_values],
+            # 先行指标（见 EvalRunRow 里这两个字段的说明）：不落库的话，
+            # "分带余量侵蚀"这段过程永远无法回溯，只能等 recall 掉下来才知道。
+            evidence_slices=report.evidence_slices or {},
+            gold_ratio=report.gold_ratio or {},
+            config=_config_snapshot(),
+            generated_at=generated,
+        )
+        async with get_db_session() as session:
+            session.add(row)
+        logger.info(
+            "eval_run persisted: set=%s cases=%d/%d mrr=%s",
+            row.name, row.scored_cases, row.total_cases, row.mrr,
+        )
+        return True
+    except Exception:  # noqa: BLE001
+        logger.exception("persist_eval_run failed (evaluation result NOT stored)")
+        return False
+
+
+async def eval_history_persisted(limit: int = 10) -> list[dict]:
+    """
+    从 ``eval_runs`` 表读最近若干轮评测摘要（最新在前）.
+
+    落库不可用（表未建 / DB 抖动）时**回退到进程内历史**，而不是返回空 ——
+    "面板显示空"比"面板显示旧数据"更容易被误读成"从来没评测过"。
+    """
+    try:
+        from sqlalchemy import select
+
+        from app.db.eval_models import EvalRunRow
+        from app.db.postgres import get_db_session
+
+        async with get_db_session() as session:
+            rows = (
+                await session.execute(
+                    select(EvalRunRow)
+                    .order_by(EvalRunRow.generated_at.desc())
+                    .limit(max(1, min(50, limit)))
+                )
+            ).scalars().all()
+        return [
+            {
+                "id": str(r.id),
+                "generated_at": r.generated_at.isoformat() if r.generated_at else "",
+                "eval_set": r.name,
+                "description": r.description,
+                "run_by": r.run_by,
+                "tenant_id": r.tenant_id,
+                "collection_id": r.collection_id,
+                "cases": r.total_cases,
+                "scored": r.scored_cases,
+                "top_k": r.top_k,
+                "mrr": r.mrr,
+                "map": r.map_score,
+                "recall": _int_keys(r.recall),
+                "precision": _int_keys(r.precision),
+                "ndcg": _int_keys(r.ndcg),
+                "hit_rate": _int_keys(r.hit_rate),
+                "by_modality": r.by_modality or {},
+                "citation": r.citation,
+                "k_values": list(r.k_values or []),
+                "config": r.config or {},
+                # 多证据分组 + 分带余量：看板据此画"余量趋势"。
+                # 存量库补齐前的老行这两个字段为空 dict —— 读侧用 ``or {}`` 兜底，
+                # 不把"没存过"渲染成"这轮测出来是 0"。
+                "evidence_slices": r.evidence_slices or {},
+                "gold_ratio": r.gold_ratio or {},
+                "source": "database",
+            }
+            for r in rows
+        ]
+    except Exception:  # noqa: BLE001
+        logger.exception("eval_history_persisted failed — falling back to in-process history")
+        fallback = eval_history(limit=limit)
+        for item in fallback:
+            item.setdefault("source", "in_process")
+        return fallback
+
+
 __all__ = [
     "CaseResult",
     "EvalCase",
@@ -614,10 +953,13 @@ __all__ = [
     "average_precision",
     "citation_prf",
     "eval_history",
+    "eval_history_persisted",
     "evaluate",
+    "gold_score_profile",
     "hit_at_k",
     "item_from_chunk",
     "ndcg_at_k",
+    "persist_eval_run",
     "precision_at_k",
     "recall_at_k",
     "reciprocal_rank",

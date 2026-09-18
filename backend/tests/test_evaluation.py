@@ -8,7 +8,9 @@
   * 别名命中 —— 同一张图片用 image_id 或"文件::页::序号"标注都应判对；
   * 图文分开统计 —— 图片召回差不会被文本高分掩盖；
   * 单条检索失败不炸整轮；
-  * 引用准确率 —— 没引用时 precision 为 None 而非 0。
+  * 引用准确率 —— 没引用时 precision 为 None 而非 0；
+  * 结果持久化 —— 指标键 JSON 往返不丢、写库失败不抛异常、读库失败回退进程内
+    （三条都是"旁路失效不报错"的沉默路径，必须显式钉住）。
 
 评测模块是纯计算（不碰 DB / 网络），宿主机无后端依赖时也能跑。
 """
@@ -251,6 +253,326 @@ def test_history_records_runs() -> None:
     assert "recall" in hist[0]
     reset_eval_history()
     print("  ok test_history_records_runs")
+
+
+# ── 评测结果持久化（eval_runs 表）──────────────────────────────────────────
+#
+# 这组用例守的是一条"沉默失效"路径：落库/读取历史都属于**旁路**，出问题
+# 不会让评测本身失败，只会让"基线"悄悄不存在 —— 面板显示空，看起来像
+# "从来没评测过"，而不是"写库坏了"。因此必须用测试把边界钉死。
+
+
+def test_metric_keys_survive_json_roundtrip() -> None:
+    """JSON 的键只能是字符串：{1: 0.9} 存进去、读回来必须还是 {1: 0.9}."""
+    from app.services.evaluation import _i18n_keys, _int_keys
+
+    stored = _i18n_keys({1: 0.9, 10: 0.5})
+    assert stored == {"1": 0.9, "10": 0.5}, "落库前必须转成字符串键"
+    back = _int_keys(stored)
+    assert back == {1: 0.9, 10: 0.5}, "读回来必须还原成 int 键，否则 k 值对不上"
+    assert _i18n_keys(None) == {} and _int_keys(None) == {}
+    # 脏数据（非数字键）只跳过，不能抛异常把整个历史读空
+    assert _int_keys({"1": 1.0, "bad": 2.0}) == {1: 1.0}
+    print("  ok test_metric_keys_survive_json_roundtrip")
+
+
+def test_persist_eval_run_swallows_db_failure() -> None:
+    """写库失败必须返回 False 而不是抛异常：评测已经跑完了，不该被判成失败."""
+    from app.services import evaluation as ev
+
+    async def _retrieve(query: str):
+        return _items(["a"])
+
+    eval_set = EvalSet(name="persist-fail", cases=(
+        EvalCase(query="q", relevant=frozenset({"a"})),
+    ))
+    report = asyncio.run(evaluate(_retrieve, eval_set, k_values=(1,)))
+
+    import app.db.postgres as pg
+
+    original = pg.get_db_session
+
+    def _boom():
+        raise RuntimeError("simulated DB outage")
+
+    pg.get_db_session = _boom  # type: ignore[assignment]
+    try:
+        ok = asyncio.run(ev.persist_eval_run(report, run_by="tester"))
+    finally:
+        pg.get_db_session = original  # type: ignore[assignment]
+    assert ok is False, "落库失败应显式返回 False（不抛异常）"
+    print("  ok test_persist_eval_run_swallows_db_failure")
+
+
+def test_persisted_history_falls_back_to_in_process() -> None:
+    """读库失败必须回退到进程内历史，而不是返回空列表."""
+    from app.services import evaluation as ev
+
+    reset_eval_history()
+
+    async def _retrieve(query: str):
+        return _items(["a"])
+
+    eval_set = EvalSet(name="fallback", cases=(
+        EvalCase(query="q", relevant=frozenset({"a"})),
+    ))
+    asyncio.run(evaluate(_retrieve, eval_set, k_values=(1,)))
+
+    import app.db.postgres as pg
+
+    original = pg.get_db_session
+
+    def _boom():
+        raise RuntimeError("simulated DB outage")
+
+    pg.get_db_session = _boom  # type: ignore[assignment]
+    try:
+        hist = asyncio.run(ev.eval_history_persisted(limit=5))
+    finally:
+        pg.get_db_session = original  # type: ignore[assignment]
+
+    assert len(hist) == 1, "读库挂了也要拿得到进程内那一轮，不能显示成空"
+    assert hist[0]["eval_set"] == "fallback"
+    assert hist[0]["source"] == "in_process", "必须标明来源，避免把降级数据当库里的"
+    reset_eval_history()
+    print("  ok test_persisted_history_falls_back_to_in_process")
+
+
+# ── 4. 多证据 / 相对分带判别力 ────────────────────────────────────────────────
+#
+# 这一组守的是本次修复的**判别力地基**：旧金标集 11 例的金标块全是精排第 1 名
+# （gold == head），于是 gold/head ≡ 1.0 —— "提高相对分带会不会误杀次要证据"
+# 在那套集上是**恒真命题**，测不出来。下面用合成数据把这两件事分别钉住：
+#   · 画像口径正确（最弱者 ÷ 头名，而不是命中数或均值）；
+#   · 分组口径**抗幸存者偏差**（次要证据被砍掉的用例必须留在多证据组里，
+#     否则"要观测的现象"会自己掉出观测集合）。
+
+
+def test_gold_score_profile_uses_weakest_gold_over_head() -> None:
+    """
+    分带判据对**每一条**候选独立生效，所以决定"会不会被砍"的永远是最弱那条金标.
+
+    画像必须报 ``最弱者 ÷ 头名``：
+      · 报"平均"→ 一条强一条弱会被平均成"余量充足"，恰好看不见要测的东西；
+      · 报"命中数"→ 与 ratio 无关，没有判别力。
+    """
+    from app.services.evaluation import gold_score_profile
+
+    # 头名 0.9（同时是第一条金标），第二条金标只有 0.07
+    ranked = [
+        RetrievedItem(key="g1", score=0.9),
+        RetrievedItem(key="noise", score=0.5),
+        RetrievedItem(key="g2", score=0.07),
+    ]
+    profile = gold_score_profile(ranked, {"g1", "g2"})
+    assert profile["best_score"] == 0.9
+    assert profile["gold_scores"] == {"g1": 0.9, "g2": 0.07}
+    assert abs((profile["min_gold_ratio"] or 0) - round(0.07 / 0.9, 4)) < 1e-9, (
+        f"应为最弱金标/头名，实际={profile['min_gold_ratio']}"
+    )
+    print("  ok test_gold_score_profile_uses_weakest_gold_over_head")
+
+
+def test_gold_score_profile_blindness_on_single_evidence_set() -> None:
+    """
+    **旧集为什么测不出分带风险** —— 用合成数据把那个结构性盲区演示出来.
+
+    单金标用例里金标就是头名本身 ⇒ ratio ≡ 1.0。也就是说：只要评测集全是
+    单金标用例，无论把分带调到多高，画像都会回答"余量 1.0 倍，很安全" ——
+    这不是"参数被验证过"，而是**根本没有观测点**。
+    """
+    from app.services.evaluation import gold_score_profile
+
+    for head, noise in ((0.99, 0.001), (0.22, 0.0005), (0.83, 0.12)):
+        ranked = [RetrievedItem(key="g", score=head),
+                  RetrievedItem(key="n", score=noise)]
+        profile = gold_score_profile(ranked, {"g"})
+        assert profile["min_gold_ratio"] == 1.0, (
+            f"单金标用例的 gold/head 应恒为 1.0（head={head}），"
+            f"实际={profile['min_gold_ratio']}"
+        )
+
+    # 对照：同一条噪声，一旦它也是金标，画像立刻有信息量
+    ranked = [RetrievedItem(key="g", score=0.83),
+              RetrievedItem(key="g2", score=0.12)]
+    profile = gold_score_profile(ranked, {"g", "g2"})
+    assert profile["min_gold_ratio"] is not None and profile["min_gold_ratio"] < 0.2
+    print("  ok test_gold_score_profile_blindness_on_single_evidence_set")
+
+
+def test_gold_score_profile_is_none_when_nothing_found() -> None:
+    """一条金标都没命中 / 结果为空 → ratio 为 None（不猜、不报 0 或 1）."""
+    from app.services.evaluation import gold_score_profile
+
+    assert gold_score_profile(_items(["x", "y"]), {"g"})["min_gold_ratio"] is None
+    assert gold_score_profile([], {"g"})["min_gold_ratio"] is None
+    assert gold_score_profile([], set())["min_gold_ratio"] is None
+    assert gold_score_profile([], set())["best_score"] is None
+    # 空集不能零除：best=0 时 ratio 为 None
+    assert gold_score_profile([RetrievedItem(key="g", score=0.0)], {"g"})["min_gold_ratio"] is None
+    print("  ok test_gold_score_profile_is_none_when_nothing_found")
+
+
+def test_evidence_slices_split_by_gold_count_not_by_outcome() -> None:
+    """
+    分组必须按"答案**需要**几条证据"切，不能按"本轮召回了几个".
+
+    按回收结果切会把"次要证据被砍掉"的用例自动移出多证据组 —— 于是
+    ``all_gold_found_rate`` 永远漂亮，而真正要观测的失效**恰好**不被观测到
+    （幸存者偏差）。这条测试用"一条被砍"的用例钉住分组口径。
+    """
+    from app.services.evaluation import aggregate
+
+    multi_ok = EvalCase(query="多证据-完好", relevant=frozenset({"a", "b"}))
+    multi_broken = EvalCase(query="多证据-次证被砍", relevant=frozenset({"c", "d"}))
+    single = EvalCase(query="单证据", relevant=frozenset({"e"}))
+
+    results = [
+        score_case(_items(["a", "b"]), multi_ok, k_values=(10,)),
+        # d 被分带砍掉 → 只剩 c
+        score_case(_items(["c"]), multi_broken, k_values=(10,)),
+        score_case(_items(["e"]), single, k_values=(10,)),
+    ]
+    report = aggregate(results, eval_set="slices", k_values=(10,))
+
+    multi = report.evidence_slices["multi_evidence"]
+    single_slice = report.evidence_slices["single_evidence"]
+    assert multi["cases"] == 2, (
+        "被砍掉次要证据的用例必须仍留在多证据组里，否则观测集合自己缩水"
+    )
+    assert single_slice["cases"] == 1
+    assert abs(multi["all_gold_found_rate"] - 0.5) < 1e-9, (
+        f"2 个多证据用例里只有 1 个一条不漏 → 0.5，实际={multi['all_gold_found_rate']}"
+    )
+    assert multi["cases_missing_gold"] == ["多证据-次证被砍"], (
+        "必须点名是哪条用例漏了金标（否则只知道'有事'、不知道'哪件'）"
+    )
+    # 被砍那条的 recall@10 只有 0.5，整体 recall 被拉低 —— 门禁因此能变红
+    assert abs((multi["recall@10"] or 0) - 0.75) < 1e-9
+    print("  ok test_evidence_slices_split_by_gold_count_not_by_outcome")
+
+
+def test_gold_ratio_aggregate_covers_multi_evidence_only() -> None:
+    """汇总只统计多证据用例，并取**最小**比值 —— 上界由最危险的用例决定."""
+    from app.services.evaluation import aggregate
+
+    r_multi_a = score_case(
+        [RetrievedItem(key="a1", score=0.9), RetrievedItem(key="a2", score=0.81)],
+        EvalCase(query="m1", relevant=frozenset({"a1", "a2"})),
+        k_values=(10,),
+    )
+    r_multi_b = score_case(
+        [RetrievedItem(key="b1", score=0.83), RetrievedItem(key="b2", score=0.12)],
+        EvalCase(query="m2", relevant=frozenset({"b1", "b2"})), k_values=(10,),
+    )
+    r_single = score_case(
+        _items(["c1"]), EvalCase(query="s1", relevant=frozenset({"c1"})), k_values=(10,),
+    )
+    report = aggregate([r_multi_a, r_multi_b, r_single], eval_set="gr", k_values=(10,))
+
+    assert report.gold_ratio["computed_over_cases"] == 2, "单金标用例不得计入（恒为 1.0）"
+    expected = min(r_multi_a.min_gold_ratio or 1.0, r_multi_b.min_gold_ratio or 1.0)
+    assert abs((report.gold_ratio["min_gold_ratio"] or 0) - expected) < 1e-9
+    # summary() 要把它平铺出来，供日志/看板直接消费
+    assert "min_gold_ratio" in report.summary()
+    assert "multi_evidence_all_found_rate" in report.summary()
+    print("  ok test_gold_ratio_aggregate_covers_multi_evidence_only")
+
+
+def test_band_would_kill_secondary_evidence_at_high_ratio() -> None:
+    """
+    端到端把"分带误杀次要证据"复现成一条断言（与实盘 bug 同形）.
+
+    组合：绝对下限 0.05（已校准，放行）；相对分带 ratio 取 0.10（旧值）。
+    次证 0.0685 过了绝对下限，却低于带 0.832×0.10=0.0832 → **整条被砍**，
+    该用例 recall@10 从 1.0 掉到 0.5。这正是实测到的召回损失
+    （golden_v1.json 里的『分带哨兵』用例），也说明为什么 ratio 必须
+    ≤ 实测上界：它砍的不是噪声，是合法证据。
+    """
+    from app.services.evaluation import aggregate
+    from app.services.reranker import filter_by_min_score
+
+    class _C:
+        def __init__(self, score: float) -> None:
+            self.score = score
+
+    head, weak = 0.832, 0.0685
+    case = EvalCase(query="元组能不能被修改？打开文件时怎么指定编码？",
+                    relevant=frozenset({"head", "weak"}))
+
+    honest = [RetrievedItem(key="head", score=head), RetrievedItem(key="weak", score=weak)]
+    assert (recall_at_k(honest, case.relevant, 10) or 0) == 1.0
+
+    # ratio=0.10 → 带 = 0.0832 > 0.0685 → 次证被砍
+    killed = filter_by_min_score([_C(head), _C(weak)], 0.05, ratio=0.10)
+    assert [round(c.score, 4) for c in killed] == [head], (
+        "预期次证被 0.10 的带砍掉（这正是要复现的失效）"
+    )
+    after_kill = [RetrievedItem(key="head", score=head)]
+    assert (recall_at_k(after_kill, case.relevant, 10) or 0) == 0.5
+
+    # ratio=0.05 → 带 = 0.0416 < 0.0685 → 次证保住
+    kept = filter_by_min_score([_C(head), _C(weak)], 0.05, ratio=0.05)
+    assert len(kept) == 2, "0.05 应同时保住主/次证据"
+    report = aggregate([score_case(honest, case, k_values=(10,))], k_values=(10,))
+    assert report.evidence_slices["multi_evidence"]["all_gold_found_rate"] == 1.0
+    print("  ok test_band_would_kill_secondary_evidence_at_high_ratio")
+
+
+def test_persist_eval_run_carries_discriminative_metrics() -> None:
+    """
+    先行指标（``evidence_slices`` / ``gold_ratio``）必须真的被写进 row.
+
+    为什么值得单独测：这两个字段**此前根本没落库**，而丢字段这件事没有任何症状 ——
+    整体 recall 恒 1.0 时，分带余量可能已经从 1.4 倍掉到 1.02 倍，指标上看不出来。
+    于是一旦它们不进 ``eval_runs``，"余量侵蚀"那段过程在跨重启的基线里永远查不到，
+    只能等 recall 突然掉下来才知道（这正是本次修复要消灭的那类盲区在持久化层的翻版）。
+
+    用替身 session 捕获 row，**刻意不写真实 DB** —— 评测表就是基线本身，
+    往里塞测试行会污染历史，让"上一轮是多少"变得不可信。
+    """
+    from app.db.eval_models import EvalRunRow
+    from app.services import evaluation as ev
+
+    captured: dict = {}
+
+    class _Session:
+        def add(self, row) -> None:
+            captured["row"] = row
+
+    class _CM:
+        async def __aenter__(self):
+            return _Session()
+
+        async def __aexit__(self, *exc):
+            return False
+
+    async def _retrieve(query: str):
+        return _items(["a", "b"])
+
+    case = EvalCase(query="q", relevant=frozenset({"a", "b"}))
+    report = asyncio.run(
+        evaluate(_retrieve, EvalSet(name="persist-fields", cases=(case,)), k_values=(10,))
+    )
+    assert report.evidence_slices, "多证据分组为空 → 本测试没有覆盖到目标字段"
+
+    import app.db.postgres as pg
+
+    original = pg.get_db_session
+    pg.get_db_session = lambda: _CM()  # type: ignore[assignment]
+    try:
+        ok = asyncio.run(ev.persist_eval_run(report, run_by="tester"))
+    finally:
+        pg.get_db_session = original  # type: ignore[assignment]
+
+    assert ok is True, "落库返回 False（替身 session 不该失败）"
+    row = captured.get("row")
+    assert isinstance(row, EvalRunRow), f"没有向 session 添加 EvalRunRow，实际={row!r}"
+    assert row.evidence_slices == report.evidence_slices, "evidence_slices 没有落库"
+    assert row.gold_ratio == report.gold_ratio, "gold_ratio 没有落库"
+    # 模型层也必须有这两列，否则在真实 DB 上 INSERT 会因列不存在而失败
+    assert {"evidence_slices", "gold_ratio"} <= set(EvalRunRow.__table__.columns.keys())
+    print("  ok test_persist_eval_run_carries_discriminative_metrics")
 
 
 if __name__ == "__main__":

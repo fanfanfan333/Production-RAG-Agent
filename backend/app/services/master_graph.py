@@ -1148,7 +1148,7 @@ def _build_streaming_llm(settings):
         streaming=True,
         reasoning=True,
         # 不传 num_ctx 时 Ollama 默认 40960 —— 小显存机器必 OOM 的元凶
-        num_ctx=settings.OLLAMA_NUM_CTX,
+        num_ctx=settings.chat_num_ctx,
         # 小显存机器可通过 OLLAMA_NUM_GPU=0 强制 CPU / 部分层 offload
         num_gpu=settings.OLLAMA_NUM_GPU,
     )

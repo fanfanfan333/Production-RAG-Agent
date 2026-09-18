@@ -101,19 +101,83 @@ def dedup_candidates(chunks: "list[RetrievedChunk]") -> "list[RetrievedChunk]":
 def filter_by_min_score(
     ranked: "list[RetrievedChunk]",
     min_score: float,
+    ratio: float = 0.0,
 ) -> "list[RetrievedChunk]":
     """
     Relevance Threshold（框架图精排 → Top 3~5 → 相关性阈值）：
     丢弃精排置信度低于阈值的候选，不让"擦边"证据进入上下文诱导幻觉.
 
-    可能返回空列表 —— 全员低于阈值说明证据确实不行，交给上层 grader
-    走 retry/refuse 路径，比硬塞噪声证据给 LLM 更诚实。
+    接受条件（**必须同时**满足）：
+
+        c.score >= min_score          绝对下限（针对已校准模型的绝对水位）
+        c.score >= best * ratio       相对分带（在同一批内砍掉与头名差距过大的尾巴）
+
+    ⚠️ 两条之间必须是 **AND**，不能是 OR —— 这是一个已实测过的语义坑：
+    ``band = best × ratio`` 且 ``ratio ≤ 1``，所以 ``band`` 恒 ≤ ``best``,
+    ``score >= band`` 永远比 ``score >= min_score`` 更容易满足。写成 OR 之后
+    ``score >= min_score or score >= band`` 等价于把生效下限降成
+    ``min(min_score, best × ratio)``：**分带只能放宽、永远不能收紧**，
+    它宣称的"砍尾巴"从未生效（实测 7 档 ratio∈[0, 0.5] 指标逐位相同），
+    同时把校准过的绝对下限**静默削弱** —— ``best=0.22`` 时真实下限从 0.05
+    掉到 0.022，"距噪声上界约 100 倍"的校准保证被悄悄作废，而这正是
+    ``test_rerank_threshold_below_weakest_true_positive`` 那套校准门禁
+    所依赖的前提（config.py 对同一旋钮的描述也是"低于下限**且**低于相对
+    分带"，与本函数旧实现的 OR 相互矛盾）。
+
+    为什么两条并存
+    ──────────────
+    主判据是校准过的**绝对下限**（*min_score*）：实测（bge-reranker-base +
+    本仓库中文语料）金标分片 0.22~0.9999、"库里根本没有"的问题 ≤0.0005，
+    两者可分。
+    **相对分带**（*ratio*）是纵深防御：绝对分水位会随模型换版、语料语言与
+    体裁整体漂移；以"本次检索的最好结果"为基准即随分布自适应。它只在
+    **已过绝对下限**的候选里做二次收紧（"同档证据"= 与头名相差不超过
+    1/ratio 倍）。
+    检索层的职责是召回与排序，不该因为一个常数把整批证据清空 —— 因此
+    本批全被收紧时**保留头名**，够不够格进上下文仍由下游
+    evidence_gate / 路由守卫判定（那里有独立的分数+覆盖率判据）。
+
+    ⚠️ 本函数的前提是 ``c.score`` **确实是精排分**。若上游跳过了精排
+    （历史实现里"候选 ≤1 条就跳过"），这里拿到的是**粗排分**（向量余弦 /
+    关键词占位 0.30），与 *min_score* 不同量纲 —— 那会让一条毫不相关的
+    候选看起来"分数尚可"从而绕过拒答。该泄漏点已在
+    ``retrieval_service`` 修掉，并有门禁测试看住。
+
+    ``ratio=0`` 时退化为纯绝对阈值 —— 与升级前行为一致，便于回滚与单测。
+
+    返回空：仅当 *ranked* 本身为空，或 ``ratio=0`` 时整批都低于绝对下限。
+    后者是校准阈值的正常产物（"库里确实没有"），交给上层 grader 走
+    retry/refuse 路径，比硬塞噪声证据给 LLM 更诚实；``ratio>0`` 时头名兜底
+    保证非空。
     """
-    kept = [c for c in ranked if c.score >= min_score]
+    if not ranked:
+        return []
+
+    kept = ranked
+    if min_score > 0.0 or ratio > 0.0:
+        head = ranked[0]                      # 调用方已按分数降序排列
+        # ① 绝对下限（硬下限）。ratio<=0 时这就是全部判据 ——
+        #    与升级前逐字一致，便于回滚与既有单测。
+        kept = [c for c in ranked if c.score >= min_score]
+        # ② 相对分带：只在"已过绝对下限"的集合里砍尾。
+        #    不可写成 `or`（见 docstring：OR 下分带只放宽、不收紧，还会把
+        #    生效下限降成 min(min_score, best*ratio)，静默废掉校准锁）。
+        if ratio > 0.0:
+            # ratio>1 属配置错误（band 会超过头名 → 清空证据），按 1.0 夹紧。
+            band = head.score * min(ratio, 1.0)
+            kept = [c for c in kept if c.score >= band]
+            # ③ 恒非空：整批都没过绝对下限时保留头名。
+            #    只要 head 过了 min_score 就必然也在 ② 中存活
+            #    （head.score >= head.score*ratio），所以这条兜底最多只交出一条，
+            #    不会把噪声成批带进来。
+            if not kept:
+                kept = [head]
+
     if len(kept) != len(ranked):
         logger.info(
-            "relevance threshold: %d → %d chunks (min_score=%.2f)",
-            len(ranked), len(kept), min_score,
+            "relevance threshold: %d → %d chunks "
+            "(min_score=%.3f ratio=%.2f best=%.4f)",
+            len(ranked), len(kept), min_score, ratio, ranked[0].score,
         )
     return kept
 
@@ -291,15 +355,33 @@ async def rerank_chunks(
 
     - chunk.score 被替换为归一化精排分（[0,1]，可直接用于
       RERANK_MIN_SCORE 幻觉守卫和前端"相关度 %"展示）。
+    - **只有一个候选时也要打分**：直接返回会把粗排/关键词分留在 score 上，
+      造成量纲泄漏（详见函数内注释）。只有"精排不可用"（降级）才允许保留原分，
+      此时 except 分支会显式记录。
     - 任一异常都降级为"保持粗排顺序"——精排失败不应让查询失败。
-    - 候选数为 0/1 时直接返回，省掉模型调用。
     """
     settings = get_settings()
     if not chunks:
         return []
-    if len(chunks) == 1 or top_k <= 0:
-        return chunks[:top_k]
+    if top_k <= 0:
+        return []
 
+    # ⚠️ 单候选**不能**直接返回（除非精排不可用）。
+    #
+    # 历史实现是 `if len(chunks) == 1: return chunks[:top_k]` —— 看着是省一次
+    # 推理，实际是一个**量纲泄漏**：返回时 `c.score` 仍是**粗排分**
+    # （向量余弦，基线普遍 0.1~0.4）或关键词腿的占位分（0.30），
+    # 而下游所有消费方（rag_graph 的幻觉守卫、evidence_gate、
+    # retrieval_grader、前端"相关度 %"）都按**精排 sigmoid 分**口径解读它。
+    #
+    # 后果不是"少了点精度"，而是**决策错向**：关键词腿把一条语义上毫不相关的
+    # chunk（向量分 ≈0.19）提为唯一候选时，它带着 0.19 的余弦分被当作"精排判它
+    # 相关"送进上下文 —— 实测两条"库里根本没有"的问题就是这样绕过拒答的
+    # （见 tests/test_reliability_guards.py 的门禁）。而交叉编码器真打分通常
+    # 接近 0，本可以正确拒答。
+    #
+    # 代价只是一次 forward pass（单条），换来 `chunk.score` **始终**是精排分 ——
+    # 这条不变式是下面那个绝对阈值能有意义的前提。
     try:
         reranker = get_reranker()
 
@@ -331,9 +413,18 @@ async def rerank_chunks(
             chunk.score = round(float(score), 4)
             reranked.append(chunk)
 
-        # 3) 相关性阈值（可能返回空 —— 证据不行就交给上层 retry/refuse）
+        # 3) 相关性阈值（绝对下限 **AND** 相对分带；仅当输入为空才会返回空，见
+        #    filter_by_min_score 的说明）
+        #
+        #    ⚠️ 这里曾写着"绝对下限 OR 相对分带" —— 与实现（AND）矛盾。注释不是
+        #    装饰：滤器写错方向时，读代码的人会依据注释推断成"分带只能放宽"，
+        #    从而放过一次真实的收紧失效（实测 7 档 ratio 指标逐位相同）。
         if min_score is not None:
-            reranked = filter_by_min_score(reranked, min_score)
+            reranked = filter_by_min_score(
+                reranked,
+                min_score,
+                float(getattr(settings, "RERANK_MIN_SCORE_RATIO", 0.0) or 0.0),
+            )
 
         # 4) 截断到 top_k
         reranked = reranked[:top_k]

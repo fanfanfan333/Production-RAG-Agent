@@ -88,6 +88,41 @@ ACCESS_ORDER: dict[str, int] = {
 }
 
 
+def is_upward_transition(current: str | None, target: str | None) -> bool:
+    """
+    *target* 是否**严格高于** *current* 所在层级.
+
+    判定「这一层还能不能申请」的唯一依据。申请共享这条链路的设计意图是
+    "自己没有的权限，通过申请向上要"，所以只有向上的目标才成立。
+
+    允许平级/向下申请的后果不是文案错误，而是**静默的可见性收缩**：一份已经
+    发布到公司库的文档，申请人可以再提一份"申请共享到部门库"，批准后
+    ``set_document_access_level`` 会把它真的降级成部门库 —— 对正在引用它的
+    其他部门同事，文档无声消失。同一层级则纯属重复申请（"已在公司知识库中"）。
+    """
+    return ACCESS_ORDER.get(
+        normalize_access_level(target), 0
+    ) > ACCESS_ORDER.get(normalize_access_level(current), 0)
+
+
+def is_downgrade(current: str | None, target: str | None) -> bool:
+    """
+    *target* 是否**低于** *current* 所在层级（可见性收缩）.
+
+    与 :func:`is_upward_transition` 是一对，但用在不同位置：
+    申请链路用前者（只能向上申请），**直接发布**链路用本函数 —— 发布不需要
+    审批，所以"向下"在这里更危险：一次 PATCH 就能把公司库文档降成部门库，
+    其他部门同事静默失去访问权，审计日志里却只是一条正常的"层级变更"。
+
+    注意 ``private`` 不在拦截范围内：把文档**收回个人库**是归属人的正当操作
+    （"已共享的成员将无法再检索到"是明示后果），属于刻意保留的能力，调用方
+    需要自行放行。本函数只回答"层级是否变低"，不替调用方决定要不要拦。
+    """
+    return ACCESS_ORDER.get(
+        normalize_access_level(target), 0
+    ) < ACCESS_ORDER.get(normalize_access_level(current), 0)
+
+
 def access_label(level: str | None) -> str:
     """把 access_level 归一化成中文层级标注（未知值按个人库处理）。"""
     value = (level or "").strip()

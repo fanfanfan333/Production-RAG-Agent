@@ -164,7 +164,7 @@ async def route_query(
             # 以上的延迟，因此显式关闭。（生成类节点仍保留 reasoning=True）
             reasoning=False,
             num_predict=64,
-            num_ctx=min(4096, settings.OLLAMA_NUM_CTX),
+            num_ctx=settings.chat_num_ctx,
         )
 
         # 带最近一轮历史，帮助判断"再总结一遍"这类省略式追问

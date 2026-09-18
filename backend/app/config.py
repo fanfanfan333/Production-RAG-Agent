@@ -126,7 +126,13 @@ class Settings(BaseSettings):
     # 任一不达标即拒答，不再把"形态上明显不够"的证据交给模型硬答。
     EVIDENCE_GATE_ENABLED: bool = True
     EVIDENCE_GATE_MIN_CHUNKS: int = 1            # 至少 N 条证据
-    EVIDENCE_GATE_MIN_TOP_SCORE: float = 0.25    # 最高精排分下限（与 RERANK_MIN_SCORE 对齐）
+    # 最高精排分下限 —— **必须与 RERANK_MIN_SCORE 保持一致**：两者是同一件
+    # 事的两个执行点（前者在 rag_graph 的路由守卫，后者在证据门控节点）。只要
+    # 有一个还停在旧值，更严的那个就会继续把合格证据判为不合格，修复等于没做。
+    EVIDENCE_GATE_MIN_TOP_SCORE: float = 0.05    # 与 RERANK_MIN_SCORE 对齐（校准依据见上）
+    # 关键词覆盖率是**独立于分数的词面佐证**：分数单独放行时，它负责拦住
+    # "高分但与问题毫不相关"的证据。因此分数下限放宽后，拒答能力并没有丢 ——
+    # 库里确实没有的查询，覆盖率同样过不去。
     EVIDENCE_GATE_MIN_COVERAGE: float = 0.20     # 问题关键词在证据中的覆盖率下限
     # 证据正文总长度下限 —— 这是一道**空壳检查**（拦"检索返回空/垃圾 payload"），
     # 阈值刻意很低：设高会误杀合法的短结构化块（一张 40 字的小表格本身就能
@@ -160,6 +166,20 @@ class Settings(BaseSettings):
     RETRIEVAL_TOP_K: int = 5                # default chunks to retrieve per query
     RETRIEVAL_MIN_SCORE: float = 0.30        # minimum cosine similarity score threshold (bge-zh good matches score ~0.4-0.6)
     RETRIEVAL_MAX_GAP: float = 0.05          # maximum score difference from top score to keep a candidate
+    # 向量腿过取倍数（召回率防御）。
+    #
+    # 检索是"先 ANN 取候选、再按 PG 可见性/状态过滤"。两道过滤的口径并不完全一致
+    # —— Qdrant 前置过滤是刻意 fail-open 的（老向量 payload 缺字段就不排除，交给
+    # PG 兜底），加上"已删除但向量还在"的孤儿点，都会让**取回的候选被大量丢掉**。
+    # 实测本仓库（186 个孤儿 document_id / 214 点）：平台管理员 ANN top-20 里只有
+    # 4 条属于现存文档，候选池 80% 名额被吃掉 —— 表现为"库里明明有却搜不到"。
+    #
+    # 过取把"候选池 N 条"的语义从「取 N 条原始候选」纠正为「最终保留 N 条可用候选」，
+    # 于是召回不再取决于脏数据比例。代价只是一次 ANN 多返回几十个点的 payload
+    # （毫秒级），相比它换回的召回是划算的。
+    # 置 1 关闭过取（退化为升级前行为，便于 A/B 对照）。
+    ANN_OVERFETCH_FACTOR: int = 4
+    ANN_OVERFETCH_MAX: int = 400             # 过取上限，防止异常配置把 ANN 打爆
     MAX_HISTORY_PAIRS: int = 3             # conversation turns kept in context window
 
     # ── Hybrid retrieval (BM25 + vector RRF fusion, 召回质量优化) ────────────────
@@ -201,10 +221,55 @@ class Settings(BaseSettings):
 
     # ── Hallucination guard（幻觉守卫：低置信度直接拒答，不硬答） ───────────────
     HALLUCINATION_GUARD_ENABLED: bool = True # 精排分低于阈值时短路拒答
-    RERANK_MIN_SCORE: float = 0.25           # 精排置信度阈值（cross-encoder sigmoid 概率）
+    # ⚠️ 这个常数只在"候选分**确实**是精排分"时才有意义 —— 前提由
+    # retrieval_service 保证（只要有候选就必须进精排，见那里的量纲泄漏说明）。
+    #
+    # 为什么必须校准、不能照抄：cross-encoder（bge-reranker 系列）用 margin loss
+    # 训练，输出的是**无界相关性分**、不是概率；代码里做 sigmoid 只是把量纲统一
+    # 到 [0,1] 便于展示与比较 —— sigmoid 后的 0.22 **不等于**"22% 相关概率"。
+    #
+    # 实测（BAAI/bge-reranker-base + 本仓库中文语料）：
+    #     金标分片（真阳性，主证据）  0.22 ~ 0.9999   ← 最弱主证据 = 0.22
+    #     金标分片（次要证据）        0.0582         ← 最弱合法证据（多证据用例实测）
+    #     "库里根本没有"的问题        ≤ 0.0005       ← 3 条否定对照实测
+    # 两者相差约 116 倍（按最弱的 0.0582 算），可分。0.05 落在中间且仍在下限之下，
+    # 但**余量薄**（0.0582/0.05 = 1.16 倍）—— 见 RERANK_MIN_SCORE_RATIO 末尾的警示。
+    #
+    # 旧值 0.25 高于"最弱真阳性 0.22" —— 后果是**金标分片在向量腿排第 1、
+    # 精排也排第 1，却因为 0.22 < 0.25 被整体丢弃**，检索返回空 → 拒答节点
+    # 告诉用户"知识库里没有"，而答案就在库里。这是最糟的失败：**确定性地
+    # 答错"没有"**。（旧值之所以被设得这么高，是因为当时精排分与粗排分混用，
+    # 需要高阈值压住"余弦基线偏高"的假阳性 —— 修复量纲后不再需要。）
+    RERANK_MIN_SCORE: float = 0.05           # 精排分下限（sigmoid 归一化后的无界分）
     RERANK_MIN_SCORE_FILTER: bool = True     # Relevance Threshold：精排后逐条丢弃低于
-                                             # RERANK_MIN_SCORE 的候选，不让擦边证据进上下文；
-                                             # 全员低于阈值时返回空 → grader 走 retry/refuse
+                                             # 下限且低于相对分带的候选，不让擦边证据进上下文
+    # 相对分带（relevance band）：候选分 ≥ 本次最高分 × 该比例时保留。
+    #
+    # 定位是**纵深防御 + 非空保证**，不是主判据（主判据是上面校准过的绝对下限）：
+    #   · 绝对分的水位会随**模型换版 / 语料语言与体裁**整体漂移。相对分带以
+    #     "本次检索的最好结果"为基准，分布漂移时仍能保住同档证据。
+    #   · 它**天然保证非空**（最高分恒满足 best ≥ best × ratio，ratio ≤ 1）——
+    #     检索层不该因为一个常数而返回空；够不够格进上下文由下游
+    #     evidence_gate / 路由守卫判定（那里有独立的分数+覆盖率判据）。
+    #
+    # 0.05 = 与最高分相差 20 倍以内的候选仍算同档证据。
+    #
+    # ⚠️ 为什么从 0.10 降到 0.05（这是一次被**实测数据**推翻的取值，不是口味调整）
+    # 0.10 是旧金标集下"扫 7 档指标逐位相同"时拍下来的，而旧集 11 例的金标
+    # **全是精排第 1 名**（gold == head），所以 gold/head ≡ 1.0 —— 分带风险在
+    # 那套集上**恒真地测不出**，0.10 从未被真正验证过。
+    # 补 5 条多证据用例后立刻测出：复合问句的次要证据可以弱到头名分的 1/14
+    # （实测最弱 0.0582 / 0.832 = 0.07），ratio=0.10 算出的带（0.0832）高于它
+    # → **整条合法证据被砍，答案只答一半**（召回 2→1）。降到 0.05 后恢复。
+    # 代价实测很小：11 例集上平均返回条数 1.91 → 2.09（+0.18 条/查询），
+    # precision@3 不变（0.8182）。而砍过头的代价是**确定性地答错**（见上）。
+    #
+    # 上界 0.07 由 backend/eval/golden_v1.json 的 thresholds.max_rerank_min_score_ratio
+    # 声明，scripts/run_eval_baseline.py 每次会重新测量并要求配置值严格小于它。
+    # 同时由本模块的 ``RERANK_MIN_SCORE_RATIO_CEILING``（不可被环境变量覆盖的
+    # 模块级常量）在**进程启动时**把关：main.py 的 lifespan 会在此值 ≥ 上界时
+    # 打印 ERROR。两条护栏是刻意的冗余 —— 门禁挡 CI，启动检查挡"直接改 .env 上线"。
+    RERANK_MIN_SCORE_RATIO: float = 0.05
 
     # ── Context Compression（架构图 Relevance Threshold → Compression → LLM）────
     # 查询感知的句子级抽取式压缩：与问题无关的句子被裁掉，控制父块回填后的
@@ -395,6 +460,34 @@ class Settings(BaseSettings):
     QDRANT_PORT: int = 6333
     QDRANT_API_KEY: str | None = None        # optional; required for Qdrant Cloud
     QDRANT_COLLECTION: str = "documents"
+
+    @property
+    def chat_num_ctx(self) -> int:
+        """
+        所有聊天类节点统一使用的上下文窗口（**必须全项目一致**）.
+
+        为什么"每个节点各挑一个合适的 num_ctx"是个陷阱
+        ────────────────────────────────────────────────
+        Ollama 按 **(模型, 运行参数)** 缓存常驻实例，而 ``num_ctx`` 决定了 KV cache
+        的分配大小，因此**它一变，整个模型必须卸载重载**。实测本机 qwen3:8b：
+
+            num_ctx 8192 → 8192   138ms / 92ms      load_duration ≈ 5ms     （命中常驻实例）
+            num_ctx 8192 → 4096   11,508ms          load_duration ≈ 11,000ms（重载）
+            再 4096 → 8192        11,478ms          load_duration ≈ 11,000ms（重载）
+
+        而一次问答的节点序列天然是"辅助节点 ↔ 生成节点"交替：路由(小) → 改写(小)
+        → 评估(小) → 生成(大)。只要两侧取值不同，**每一步交替就白付 11 秒**，
+        且这笔开销在监控面板上完全不可见（只记了 total 时延）—— 实测线上
+        knowledge_qa 平均 87 秒里约有 22 秒是模型反复加载，不是推理。
+
+        "辅助节点用 4096 省内存"是**假的节省**：同一时刻只会有一个实例常驻，
+        而生成节点本来就需要 8192，峰值分配由后者决定 —— 用小窗口并不能降低峰值，
+        只换来反复重载。所以正确做法是统一，而不是各取所需。
+
+        改这里即可全局生效；任何节点都不应再自己写 ``min(4096, ...)`` 之类的表达式，
+        否则会把"11 秒 × 每次交替"重新引回来。
+        """
+        return int(self.OLLAMA_NUM_CTX)
 
     @property
     def qdrant_url(self) -> str:
@@ -591,6 +684,24 @@ class Settings(BaseSettings):
     # ── CORS ───────────────────────────────────────────────────────────────────
     # Never use "*" in production. Configure the exact frontend origin(s).
     CORS_ORIGINS: list[str] = ["*"]
+
+
+# ── 相对分带的硬上界（护栏常数）──────────────────────────────────────────────
+# 刻意写成**模块级常量**而不是 Settings 字段。
+#
+# 为什么不能是字段：Settings 的每个字段都可被环境变量覆盖（env > default，
+# 这是 pydantic-settings 的既定行为）。把护栏做成可覆盖的字段，等于没护栏 ——
+# 一个 `.env` 里残留的旧值就能把护栏连同被护栏保护的对象一起改掉。
+# 这正是本次踩到的坑：`.env` 里 `RERANK_MIN_SCORE=0.25` 会静默覆盖代码里的
+# 0.05（`docker compose config` 已证实解析结果为 "0.25"），重构镜像后
+# 「金标被阈值误杀」的旧 bug 会原样复活，而代码看起来已经修好了。
+#
+# 取值依据（实测，见 backend/eval/golden_v1.json 的 band_headroom_measured）：
+#   多证据用例的 min(次证分 / 头名分) = 0.0582 / 0.832 = 0.07
+#   ⇒ ratio ≥ 0.07 时，至少一条**合法**次要证据会被带砍掉（答案只答一半）。
+# 该上界随语料与精排模型漂移，换模型/换语料后必须重测；
+# scripts/run_eval_baseline.py 每次都会重新测量并与金标集声明的值对账。
+RERANK_MIN_SCORE_RATIO_CEILING: float = 0.07
 
 
 @lru_cache(maxsize=1)

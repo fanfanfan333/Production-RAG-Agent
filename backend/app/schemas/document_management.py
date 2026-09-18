@@ -60,7 +60,16 @@ class DocumentSummary(BaseModel):
     can_request_delete: bool = False
     can_publish_department: bool = False
     can_publish_company: bool = False
+    # 申请能力**按目标层级**下发：能直接发的那层不给申请入口，不能直接发的层给。
+    # 两者对不同层级可同时为真 —— 部门负责人就是这种形态（发部门 / 申请公司）。
+    can_request_department: bool = False
+    can_request_company: bool = False
     needs_share_request: bool = False
+    # 公司级管理者（企业管理员 / 知识库管理员 / 平台管理员）可把已共享的文档
+    # **改归到指定部门** —— 界面据此渲染「转为部门文档」入口。
+    # 与 can_publish_department 是两件事：后者发的是"我自己的部门"，无选择。
+    can_transfer_department: bool = False
+    transfer_denied_reason: str = ""
     publish_denied_reason: str = ""
     pending_share_request: bool = False
 

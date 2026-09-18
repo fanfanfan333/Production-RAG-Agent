@@ -30,6 +30,7 @@ from app.services.tenancy import (
     scoped_cache_key,
 )
 from app.utils.logging import get_logger
+from app.utils.timing import timed_stage
 
 logger = get_logger(__name__)
 
@@ -1113,6 +1114,7 @@ def _search_query_sets(
     return both, vector_only
 
 
+@timed_stage("retrieval")
 async def retrieve_chunks(
     query: str,
     top_k: int = 5,
@@ -1285,6 +1287,19 @@ async def retrieve_chunks(
     # Wider vector candidate pool so RRF fusion has material to work with
     candidate_pool = max(top_k * 4, top_k + 8, settings.RERANKER_MAX_CANDIDATES)
 
+    # ── 过取（召回率防御，见 config.ANN_OVERFETCH_FACTOR 的说明）─────────────
+    # candidate_pool 是"**可用**候选"的目标条数；下面 Qdrant 侧要多取几倍，因为在
+    # PG 可见性/状态校验之后会有一部分被丢掉（老向量 fail-open、已删文档的孤儿点、
+    # 元数据冲突）。不过取时 ann_limit == candidate_pool，行为与升级前完全一致。
+    overfetch_factor = max(1, int(getattr(settings, "ANN_OVERFETCH_FACTOR", 4) or 1))
+    overfetched = overfetch_factor > 1
+    ann_limit = candidate_pool
+    if overfetched:
+        ann_limit = min(
+            candidate_pool * overfetch_factor,
+            max(candidate_pool, int(getattr(settings, "ANN_OVERFETCH_MAX", 400) or 400)),
+        )
+
     # ── 向量腿：每路查询独立 ANN，结果按 chunk 去重合并 ─────────────────────
     # 多路查询用 gather 并发发出（框架图 Vector Search 与 BM25 Search 并行），
     # 每路一次 RTT 而不是串行 N 次 RTT；单路失败会随 gather 整体抛出，
@@ -1293,7 +1308,7 @@ async def retrieve_chunks(
         return await client.search(
             collection_name=coll,
             query_vector=query_vector,
-            limit=candidate_pool,
+            limit=ann_limit,
             with_payload=True,
             query_filter=search_filter,
         )
@@ -1427,6 +1442,22 @@ async def retrieve_chunks(
 
     # Ensure descending order by best vector score
     valid_candidates = sorted(merged.values(), key=lambda c: c.score, reverse=True)
+
+    # ── 过取收敛：在"**可用**候选"里取前 candidate_pool 条 ──────────────────
+    # 走到这里，merged 里的每个 key 都已经过了 valid_docs（COMPLETED + 租户/ACL）
+    # 与元数据校验 —— 所以这里的截断才配得上"候选池"这个说法。不过取时
+    # valid_candidates 本来就 ≤ ann_limit == candidate_pool，这段不生效。
+    if overfetched and len(valid_candidates) > candidate_pool:
+        keep = {_chunk_key(c) for c in valid_candidates[:candidate_pool]}
+        dropped = len(merged) - len(keep)
+        merged = {k: v for k, v in merged.items() if k in keep}
+        valid_candidates = valid_candidates[:candidate_pool]
+        logger.info(
+            "ANN over-fetch: %d raw ANN hit(s) → %d usable candidate(s); "
+            "dropped %d beyond the pool of %d",
+            ann_limit, len(keep), dropped, candidate_pool,
+        )
+
     # Rebuild the primary (original-query) rank list restricted to merged keys
     primary_keys = set(merged.keys())
     vector_rank_lists = [
@@ -1688,7 +1719,15 @@ async def retrieve_chunks(
 
     if fallback_path:
         candidates = _apply_score_filters(valid_candidates, fetch_final)
-        if settings.RERANKER_ENABLED and len(candidates) > 1:
+        # ⚠️ 只要**有**候选就必须进精排，不能因为"只有 1 条"就跳过 ——
+        # 跳过会让 chunk.score 停留在**粗排分**（向量余弦 / 关键词占位 0.30），
+        # 而下游（rag_graph 幻觉守卫、evidence_gate、retrieval_grader、
+        # 前端"相关度 %"）统一按**精排 sigmoid 分**口径解读。
+        # 实测后果：一条语义上毫不相关的 chunk 被关键词腿提为唯一候选时，
+        # 带着 0.1~0.3 的余弦分被当作"精排判它相关"，直接绕过拒答回答
+        # "库里根本没有"的问题（余弦基线在小语料里普遍偏高，而交叉编码器
+        # 对同一对文本会给出接近 0 的分）。代价仅一次 forward pass。
+        if settings.RERANKER_ENABLED and candidates:
             from app.services.reranker import rerank_chunks
 
             chunks = await rerank_chunks(
@@ -1733,7 +1772,8 @@ async def retrieve_chunks(
         # 粗排候选池：截断到精排上限，控制 cross-encoder 推理量
         candidates = [c for _, c in survivors[: settings.RERANKER_MAX_CANDIDATES]]
 
-        if settings.RERANKER_ENABLED and len(candidates) > 1:
+        # 同 fallback 分支：只要有候选就要打分，避免粗排分冒充精排分（量纲泄漏）。
+        if settings.RERANKER_ENABLED and candidates:
             from app.services.reranker import rerank_chunks
 
             chunks = await rerank_chunks(

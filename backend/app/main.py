@@ -29,13 +29,14 @@ from app.api.quality import router as quality_router
 from app.api.query import router as query_router
 from app.api.share_requests import router as share_requests_router
 from app.api.staff import router as staff_router
-from app.config import get_settings
+from app.config import RERANK_MIN_SCORE_RATIO_CEILING, get_settings
 from app.middleware.gateway import gateway_middleware
 from app.db import models  # noqa: F401 — registers Phase 2 tables with Base.metadata
 from app.db import conversation_models  # noqa: F401 — registers Phase 4 tables
 from app.db import feedback_models  # noqa: F401 — registers answer_feedback table
 from app.db import badcase_models  # noqa: F401 — registers bad_cases table (回流队列)
 from app.db import quality_models  # noqa: F401 — registers quality_events table (质量监控)
+from app.db import eval_models  # noqa: F401 — registers eval_runs table (评测基线，跨重启保留)
 from app.db import user_models  # noqa: F401 — registers users/collections/audit_logs
 from app.db import share_models  # noqa: F401 — registers share_requests (三层知识库)
 from app.db import staff_models  # noqa: F401 — registers staff_requests (企业身份验证)
@@ -73,6 +74,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             logger.warning("Production gateway Origin enforcement is disabled")
         if not _settings.TRUSTED_PROXY_IPS:
             logger.info("No trusted proxy configured; X-Forwarded-For is ignored")
+
+    # ── 检索参数护栏（fail-loud，而不是"看着正常其实错了"）────────────────────
+    for level, message in check_retrieval_config_guards(_settings):
+        getattr(logger, level)(message)
 
     # ── Startup: create PostgreSQL tables ────────────────────────────────────
     engine = get_engine()
@@ -119,6 +124,53 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     await dispose_engine()
     await close_qdrant_client()
     logger.info("Shutdown complete")
+
+
+# ── 检索参数护栏 ──────────────────────────────────────────────────────────────
+#
+# 这一组检查存在的理由：它要拦的这类错误**不会让任何请求失败**，只会让检索
+# 静默地少给证据 / 误杀合法证据 —— 表象是"模型答得不全"，根因却在配置。
+#
+# 而配置有两个入口：代码默认值、环境变量；后者会**静默覆盖**前者且不留痕
+# （pydantic-settings 的 env > default）。本次实测就踩到了：`backend/.env`
+# 里残留的 `RERANK_MIN_SCORE=0.25` 会被 `docker compose` 原样注入容器
+# （`docker compose config` 已证实），一个 `up -d` 就能让上一轮修好的 bug
+# 原样复活，而 diff 看起来是干净的。
+#
+# 抽成纯函数而不是内联在 lifespan 里，是为了**可测**：启动路径本身不好在单测
+# 里跑，而"配错了要报出来"这件事必须被钉住，否则护栏会变成注释。
+def check_retrieval_config_guards(settings) -> list[tuple[str, str]]:
+    """
+    检查检索链路的配置一致性，返回 ``[(日志级别, 消息)]``（健康时为空列表）.
+
+    级别用 "error" 而不是 "warning"：这两个值配错都不会抛异常，只会让回答
+    悄悄退化成"只答一半"或"答没有"。既然故障是静默的，护栏就不能也是静的。
+    """
+    problems: list[tuple[str, str]] = []
+
+    ratio = float(settings.RERANK_MIN_SCORE_RATIO)
+    if ratio >= RERANK_MIN_SCORE_RATIO_CEILING:
+        problems.append((
+            "error",
+            f"RERANK_MIN_SCORE_RATIO={ratio} 已达到/超过实测安全上界 "
+            f"{RERANK_MIN_SCORE_RATIO_CEILING} —— 多证据用例中的次要证据会被"
+            "相对分带砍掉（答案只答一半，且不报错）。请降到上界以下，或按当前"
+            "语料/精排模型重新测量上界（见 backend/eval/golden_v1.json 的 "
+            "band_headroom_measured，并在容器内跑 scripts/run_eval_baseline.py 复测）。"
+        ))
+
+    if float(settings.RERANK_MIN_SCORE) != float(settings.EVIDENCE_GATE_MIN_TOP_SCORE):
+        problems.append((
+            "error",
+            "两道证据闸门的分数下限不一致："
+            f"RERANK_MIN_SCORE={settings.RERANK_MIN_SCORE} vs "
+            f"EVIDENCE_GATE_MIN_TOP_SCORE={settings.EVIDENCE_GATE_MIN_TOP_SCORE} "
+            "—— 只要有一个停在旧值，更严的那个就会继续把合格证据判为不合格，"
+            "修复等于没做（历史上这两个值都曾停在 0.25，导致金标分片被整体"
+            "丢弃 → 确定性地答错「库里没有」）。"
+        ))
+
+    return problems
 
 
 # ── Application factory ───────────────────────────────────────────────────────

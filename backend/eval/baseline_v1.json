@@ -1,0 +1,88 @@
+{
+  "golden_set": "golden-v1",
+  "accepted_at": "2026-09-18T07:26:02Z",
+  "updated_at": "2026-09-18T08:15:00Z",
+  "revision": 2,
+  "revision_note": "rev2：修掉相对分带 OR→AND 的语义缺陷后复测。指标除 precision@5/10 与负例最高分外与 rev1 一致（修复只是让分带真正开始砍尾，不动召回）。",
+  "note": "检索质量基线。此后任何改动都要用 scripts/run_eval_baseline.py 复跑并与本文件对比；低于 thresholds 即为回归。",
+  "measured_by": "scripts/run_eval_baseline.py（POST /eval/run，管理员口径，top_k=10）；rev2 由等效的进程内复测（evaluate + persist_eval_run）复核，结果一致且已落 eval_runs 表。",
+  "cases": 11,
+  "scored_cases": 11,
+  "metrics": {
+    "recall@1": 0.9545,
+    "recall@3": 1.0,
+    "recall@5": 1.0,
+    "recall@10": 1.0,
+    "precision@1": 1.0,
+    "precision@3": 0.8182,
+    "precision@5": 0.7985,
+    "precision@10": 0.7985,
+    "mrr": 1.0,
+    "map": 1.0,
+    "ndcg@1": 1.0,
+    "ndcg@3": 1.0,
+    "ndcg@5": 1.0,
+    "ndcg@10": 1.0,
+    "hit_rate@1": 1.0,
+    "hit_rate@10": 1.0,
+    "avg_returned_chunks_per_case": 1.91
+  },
+  "metric_reading_notes": {
+    "recall@1": "0.9545 = (10 例满分 + 1 例 0.5) / 11。唯一不满分的是『紫罗兰计划的年度预算是多少，由谁负责审批？』：两份同内容文档（紫罗兰计划-1z5pp.txt / -bjld8.txt，分属不同租户）各在 chunk 0，文本完全相同 → 精排分相同（0.9999），k=1 时只能取其一，故该例 recall@1=0.5。这是标注口径（命中任一即算对）决定的，不是检索缺陷。",
+    "avg_returned_chunks_per_case": "1.91 是相对分带收紧后的实测值（修复前为 2.09）。"
+  },
+  "negative_cases": {
+    "total": 3,
+    "refused": 3,
+    "top_scores": [0.0, 0.0, 0.0005],
+    "note": "证据闸阈值 0.05。三条域外问题的精排最高分为 0.0 / 0.0 / 0.0005，距闸门 100 倍以上余量，拒答不依赖运气。第三条 0.0005 是『头名兜底』交出的那一条（非空不变量），远低于闸门，不构成泄漏。"
+  },
+  "config_snapshot": {
+    "hybrid_search": true,
+    "reranker": true,
+    "hierarchical_rag": true,
+    "rerank_min_score": 0.05,
+    "rerank_min_score_ratio": 0.1,
+    "rerank_min_score_filter": true,
+    "evidence_gate_min_top_score": 0.05,
+    "retrieval_min_score": 0.3,
+    "retrieval_max_gap": 0.05,
+    "multi_query_max_extra": 4,
+    "query_rewrite_enabled": true,
+    "acl_prefilter_enabled": true,
+    "parent_score_decay": 0.85
+  },
+  "rerank_band_sweep": {
+    "why": "RERANK_MIN_SCORE_RATIO 的取值 0.10 原先没有数据支撑。扫一遍 7 档，用它来回答『该旋钮是否需要调』。",
+    "fixed_bug": "旧实现把判据写成 `score >= min_score or score >= band`。因 band = best*ratio ≤ best，OR 使分带**只能放宽、永不收紧**：实测 7 档指标逐位相同（avg_returned 全为 2.09），同时把生效下限降成 min(min_score, best*ratio)（best=0.22 时 0.05 被悄悄降为 0.022），废掉了『距噪声 100 倍』的校准前提。修成 AND 后分带立即分化。",
+    "arms_after_fix": [
+      {"ratio": 0.00, "recall@10": 1.0, "recall@3": 1.0, "mrr": 1.0, "precision@3": 0.8182, "avg_returned": 2.09, "negatives_refused": "3/3"},
+      {"ratio": 0.05, "recall@10": 1.0, "recall@3": 1.0, "mrr": 1.0, "precision@3": 0.8182, "avg_returned": 2.09, "negatives_refused": "3/3"},
+      {"ratio": 0.10, "recall@10": 1.0, "recall@3": 1.0, "mrr": 1.0, "precision@3": 0.8182, "avg_returned": 1.91, "negatives_refused": "3/3", "is_current": true},
+      {"ratio": 0.15, "recall@10": 1.0, "recall@3": 1.0, "mrr": 1.0, "precision@3": 0.8182, "avg_returned": 1.91, "negatives_refused": "3/3"},
+      {"ratio": 0.20, "recall@10": 1.0, "recall@3": 1.0, "mrr": 1.0, "precision@3": 0.8485, "avg_returned": 1.64, "negatives_refused": "3/3"},
+      {"ratio": 0.30, "recall@10": 1.0, "recall@3": 1.0, "mrr": 1.0, "precision@3": 0.8939, "avg_returned": 1.55, "negatives_refused": "3/3"},
+      {"ratio": 0.50, "recall@10": 1.0, "recall@3": 1.0, "mrr": 1.0, "precision@3": 0.9091, "avg_returned": 1.27, "negatives_refused": "3/3"}
+    ],
+    "decision": "维持 0.10，不上调。",
+    "decision_reasoning": [
+      "分带现在确实在工作：0.10 已把平均返回条数从 2.09 压到 1.91（砍掉填充噪声），召回零损失。",
+      "0.20/0.30/0.50 的 precision@3 提升在 11 例金标上只是**1 例之差**（0.8182=9/11 → 0.9091=10/11），不足以支撑把参数翻 2~5 倍。",
+      "风险不对称：砍过头会切掉『真实但较弱』的证据 → 确定性地答错『库里没有』（config.py 记录的最糟失败模式）；砍不够只是上下文多几条噪声。",
+      "经验安全上界：已知合法金标分可低至 0.22（回归哨兵用例），已知头名最高 0.9999 → 跨用例上限 = 0.22/0.9999 = 0.2200（留 25% 稳健折扣 → 0.165）。0.10 在包线内且余量充足。"
+    ],
+    "cross_case_safe_ceiling": 0.22,
+    "recommended_upper_bound_with_margin": 0.165
+  },
+  "context": {
+    "why_this_baseline_exists": "建立它之前 /eval/history 恒为空：评测结果只存在进程内 deque 里，后端一重启就丢，于是『改完是变好还是变坏』无法回答。现在评测结果落 eval_runs 表，重启后仍在（已实测：source=database）。",
+    "what_it_guards": [
+      "recall@10 不得低于 1.0（11 条正例必须全部召回）",
+      "mrr 不得低于 0.95（首条命中不得退化）",
+      "precision@3 不得低于 0.75（防止为了召回把噪声堆进 top-3）",
+      "3 条负例必须全部拒答（防止用『放低阈值换召回』刷分）"
+    ],
+    "known_regression_sentinel": "用例『各期交付物和完成时间分别是什么？』对应的块精排分只有 0.22，是历史上被阈值误杀的那一块，必须长期留在集里。",
+    "known_limitation": "⚠️ 本金标集**结构上无法度量相对分带的风险**：11 个用例里每个用例的金标块都恰好是精排第 1 名（gold == head），因此 gold/head 恒等于 1.0，分带开到 1.0 也测不出误杀。换言之『提高 ratio 在金标集上不损召回』是恒真的，不能作为上调依据。要真正评估分带，需要补**多证据用例**——答案需要 2 个以上分片、且第二个分片的精排分明显低于头名（如『对比 A 与 B 的差异』『完整列出各项…』）。这是下一轮该做的事。"
+  }
+}

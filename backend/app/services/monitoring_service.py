@@ -149,6 +149,20 @@ def record_latency(stage: str, seconds: float) -> None:
     _metrics.observe(f"latency.{stage}", seconds)
 
 
+def record_counter(key: str, value: int = 1) -> None:
+    """
+    记录一个自定义计数器（供分阶段/结果分类的细分指标使用）.
+
+    与 ``record_*`` 系列的区别：那些是**固定语义**的指标（拒答、引用校验…），
+    这里是给"某条支路到底有没有生效"这类**存在性**问题用的。典型场景：
+    查询增强层（改写/多查询扩展/HyDE）过去因超时而每轮静默回退，日志里只留一条
+    warning，监控面板上完全看不出"配置全开着但一次都没生效"。有了计数器，
+    ``rewrite.source.original`` 与 ``rewrite.source.llm`` 的比值就是**有效率**，
+    退化不再隐默。
+    """
+    _metrics.incr(key, value)
+
+
 def record_badcase(reason: str) -> None:
     _metrics.incr("badcase.captured")
     _metrics.incr(f"badcase.reason.{reason}")
@@ -463,6 +477,7 @@ __all__ = [
     "quality_stats",
     "record_badcase",
     "record_citation_check",
+    "record_counter",
     "record_evidence_gate",
     "record_latency",
     "record_output_guard",

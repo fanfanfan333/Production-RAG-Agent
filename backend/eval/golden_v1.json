@@ -1,0 +1,183 @@
+{
+  "name": "golden-v1",
+  "revision": 3,
+  "revision_note": "rev3：补 5 条**多证据用例**（答案需要 2 个分片，且第二个分片的精排分明显低于头名）。rev1/rev2 的 11 例金标**全是精排第 1 名**，导致 gold/head ≡ 1.0 —— 『提高 RERANK_MIN_SCORE_RATIO 会不会误杀次要证据』在该集上恒测不出。补集后该问题第一次可测，并当场测出当前值 0.10 已经在误杀（见 multi_evidence.probe_result 与 band_headroom_measured）。",
+  "description": "私有知识库 RAG 检索质量基线（16 条正例 = 11 单证据 + 5 多证据，3 条负例）。正例标注 (filename, chunk_index) 逻辑坐标，运行期解析为 document_id::chunk_index；负例用于验证“库里根本没有时必须拒答”。",
+  "corpus": {
+    "note": "口令化语料：6 份业务/制度文档 + 2 份 Python 手册，覆盖 private / department / tenant 三档可见性与 4 个租户。",
+    "documents": [
+      "研发部-2024年度技术方案-2e19.docx",
+      "Python AI大模型成神手册 (1).docx",
+      "A公司-印章使用与档案归档操作手册-李四.docx",
+      "B公司-2024年第四季度经营分析报告-王五.docx",
+      "B公司-固定资产盘点与办公用品领用规范-某某.docx",
+      "紫罗兰计划-1z5pp.txt",
+      "紫罗兰计划-bjld8.txt",
+      "探测载体-1z5pp.txt",
+      "探测载体-bjld8.txt"
+    ],
+    "scope_limitation": "⚠️ 9 份语料里只有 4 份（研发部技术方案 / Python 手册 / 紫罗兰计划×2 / 探测载体×2）在 **admin 口径**下可检索。另外 3 份（A公司印章手册、B公司经营分析报告、B公司固定资产规范）的 access_level=private 且归属人分别是李四/王五/某某，按设计『个人库在所有 scope 组合下都只有归属人可见』，平台管理员也看不到 —— 这是**权限隔离生效**，不是检索缺陷（已用 unrestricted=True 对照验证：同一查询在这三份文档上能取到 0.99 分）。代价是本评测集**结构上覆盖不到另外 3 份文档**（约 21 个分片）。要覆盖它们需要按归属人 scope 分别评测，见 known_limitation。"
+  },
+  "cases": [
+    {
+      "query": "研发部技术方案里，数据层承担哪些职责？",
+      "expect": [{"filename": "研发部-2024年度技术方案-2e19.docx", "chunk_index": 1}],
+      "note": "章节级定位；命中块是“3 数据层设计”"
+    },
+    {
+      "query": "这份技术方案采用的检索策略是什么？",
+      "expect": [{"filename": "研发部-2024年度技术方案-2e19.docx", "chunk_index": 2}],
+      "note": "“5 检索策略”"
+    },
+    {
+      "query": "反幻觉机制在检索阶段具体做了什么？",
+      "expect": [{"filename": "研发部-2024年度技术方案-2e19.docx", "chunk_index": 3}],
+      "note": "“7 反幻觉机制”"
+    },
+    {
+      "query": "项目的预算与资源投入是怎么安排的？",
+      "expect": [{"filename": "研发部-2024年度技术方案-2e19.docx", "chunk_index": 4}],
+      "note": "“9 预算与资源”"
+    },
+    {
+      "query": "各期交付物和完成时间分别是什么？",
+      "expect": [{"filename": "研发部-2024年度技术方案-2e19.docx", "chunk_index": 5}],
+      "note": "回归哨兵：此块精排分仅 0.22，是“单候选跳过精排 + 阈值 0.25”双重 BUG 下被误杀的那一块。这条用例必须长期留在集里。"
+    },
+    {
+      "query": "这份技术方案的文号和编制单位是什么？",
+      "expect": [{"filename": "研发部-2024年度技术方案-2e19.docx", "chunk_index": 0}],
+      "note": "文号类精确串（中科发〔2024〕7号），考 keyword 腿"
+    },
+    {
+      "query": "python 里打开文件的 mode 有哪些，各自含义是什么？",
+      "expect": [{"filename": "Python AI大模型成神手册 (1).docx", "chunk_index": 2}],
+      "note": "纯中文查询命中英文术语密集块"
+    },
+    {
+      "query": "pyecharts 怎么设置标题位置和图例？",
+      "expect": [{"filename": "Python AI大模型成神手册 (1).docx", "chunk_index": 3}],
+      "note": "专有名词 + 中文，考 BM25 与向量的互补"
+    },
+    {
+      "query": "元组和字符串能不能被修改？",
+      "expect": [{"filename": "Python AI大模型成神手册 (1).docx", "chunk_index": 1}],
+      "note": "短查询，语义与关键词都稀薄"
+    },
+    {
+      "query": "怎么提高 python 读入数据的效率？",
+      "expect": [{"filename": "Python AI大模型成神手册 (1).docx", "chunk_index": 0}],
+      "note": "“怎么做”型问题，考 HyDE/变体是否真的帮上忙"
+    },
+    {
+      "query": "紫罗兰计划的年度预算是多少，由谁负责审批？",
+      "expect": [
+        {"filename": "紫罗兰计划-1z5pp.txt", "chunk_index": 0},
+        {"filename": "紫罗兰计划-bjld8.txt", "chunk_index": 0}
+      ],
+      "note": "两份同内容文档分属不同租户/部门；平台管理员视角命中任一即算对（answer-bearing chunk 唯一）"
+    },
+
+    {
+      "query": "这份技术方案里，数据层承担哪些职责？检索策略又是怎么设计的？",
+      "expect": [
+        {"filename": "研发部-2024年度技术方案-2e19.docx", "chunk_index": 1},
+        {"filename": "研发部-2024年度技术方案-2e19.docx", "chunk_index": 2}
+      ],
+      "kind": "multi_evidence",
+      "note": "多证据｜跨「3 数据层设计」与「5 检索策略」两个分节；两问并列，缺任一条答案只答一半。实测 头名 0.9981 / 次证 0.8984（比值 0.9001）"
+    },
+    {
+      "query": "反幻觉机制在检索阶段做了什么？项目的预算与资源投入又是怎么安排的？",
+      "expect": [
+        {"filename": "研发部-2024年度技术方案-2e19.docx", "chunk_index": 3},
+        {"filename": "研发部-2024年度技术方案-2e19.docx", "chunk_index": 4}
+      ],
+      "kind": "multi_evidence",
+      "note": "多证据｜跨「7 反幻觉机制」与「9 预算与资源」。实测 头名 0.9939 / 次证 0.9475（0.9533）"
+    },
+    {
+      "query": "这份技术方案的文号和编制单位是什么？各期交付物和完成时间分别是什么？",
+      "expect": [
+        {"filename": "研发部-2024年度技术方案-2e19.docx", "chunk_index": 0},
+        {"filename": "研发部-2024年度技术方案-2e19.docx", "chunk_index": 5}
+      ],
+      "kind": "multi_evidence",
+      "note": "多证据｜把已有的 0.22 哨兵（里程碑表）套进复合问句。实测 头名 0.8195 / 次证 0.0876（**比值 0.1069**）—— 这是分带的分水岭：ratio>0.1069 就砍掉里程碑整块，答不出『各期交付物和完成时间』。"
+    },
+    {
+      "query": "python 打开文件的 mode 有哪些、各自含义是什么？pyecharts 的标题位置怎么设置？",
+      "expect": [
+        {"filename": "Python AI大模型成神手册 (1).docx", "chunk_index": 2},
+        {"filename": "Python AI大模型成神手册 (1).docx", "chunk_index": 3}
+      ],
+      "kind": "multi_evidence",
+      "note": "多证据｜跨两个主题块（文件操作 / pyecharts），顺带覆盖父子块回填路径。实测 0.8536 / 0.7009（0.8211）"
+    },
+    {
+      "query": "元组能不能被修改？打开文件时怎么指定编码？",
+      "expect": [
+        {"filename": "Python AI大模型成神手册 (1).docx", "chunk_index": 1},
+        {"filename": "Python AI大模型成神手册 (1).docx", "chunk_index": 2}
+      ],
+      "kind": "multi_evidence",
+      "note": "分带哨兵（最重要的新增例）｜次证精排分只有 0.0685（过带后按同父衰减 0.85 落到 0.0582），比值 0.07。旧值 RERANK_MIN_SCORE_RATIO=0.10 会算出带 0.0832 > 0.0685，**把这条合法证据整条砍掉**（实测召回 2→1）。降到 0.05 后恢复正常。以后谁再把 ratio 抬到 0.082 以上，本用例的 recall@10 立刻掉到 0.5，回归门禁随即变红。"
+    }
+  ],
+  "negative_cases": [
+    {
+      "query": "公司员工餐厅下周三的午餐菜单是什么？",
+      "note": "同域但库里没有：最容易被“像答案的段落”蒙混过去"
+    },
+    {
+      "query": "2026 年东京奥运会的中国代表团名单有哪些人？",
+      "note": "域外事实，库里绝无"
+    },
+    {
+      "query": "请告诉我量子计算机的制冷机型号和采购价格。",
+      "note": "技术味浓的域外问题，语义上最接近库内文档"
+    }
+  ],
+  "thresholds": {
+    "note": "回归门禁下限。取 2026-09-18 修复后的实测值留出安全余量，不是“目标值”。",
+    "min_recall_at_10": 1.0,
+    "min_mrr": 0.95,
+    "min_precision_at_3": 0.75,
+    "max_zero_return_cases": 0,
+    "negative_cases_must_refuse": true,
+    "min_multi_evidence_all_found_rate": 1.0,
+    "max_rerank_min_score_ratio": 0.07,
+    "max_rerank_min_score_ratio_why": "0.07 = 跨用例实测的安全上界（= min(各多证据用例的 次证分/头名分) = 分带哨兵例的 0.0582/0.832）。配置值必须**严格小于**它，否则至少一条合法次要证据会被带砍掉。此上界随语料与精排模型变化，换模型或换语料后必须重测（run_eval_baseline 每次都会重新测量并与此值对账）。"
+  },
+  "multi_evidence": {
+    "why": "旧集 11 例的金标块**全是精排第 1 名**（gold == head），于是 gold/head ≡ 1.0 —— 『提高 RERANK_MIN_SCORE_RATIO 会不会误杀次要证据』在本集上**恒真地测不出**。这是所有检索参数调优的判别力地基：一个没有观测点的旋钮，调它是拍脑袋，不调它也是拍脑袋。",
+    "what_makes_a_valid_case": [
+      "答案**真的**分成 2 个分片（缺任一条就是答一半）—— 不是硬凑两条相关块",
+      "两条分片的分数**明显不同档**：弱证据的 次证/头名 比值进入配置值的可调区间（本例 0.07~0.11），否则仍然测不出边界",
+      "标注粒度用 (filename, chunk_index)，语料重导不失效（与既有 11 例一致）"
+    ],
+    "probe_result": {
+      "method": "容器内进程复跑 retrieve_chunks（admin scope, top_k=10），两态对照：态 A = 生产配置（过滤开，ratio=0.10）；态 B = 关闭阈值过滤（RERANK_MIN_SCORE_FILTER=False, ratio=0）",
+      "why_two_states": "只看态 A 会把『已被分带砍掉』的证据误读成『本来就不存在』—— 这正是旧集测不出分带风险的同一种盲区。",
+      "measured": [
+        {"case": "研发部 1+2 （数据层/检索策略）", "head": 0.9981, "weakest_gold": 0.8984, "ratio": 0.9001, "态A召回": "2/2", "态B召回": "2/2"},
+        {"case": "研发部 3+4 （反幻觉/预算）", "head": 0.9939, "weakest_gold": 0.9475, "ratio": 0.9533, "态A召回": "2/2", "态B召回": "2/2"},
+        {"case": "研发部 0+5 （文号/里程碑）", "head": 0.8195, "weakest_gold": 0.0876, "ratio": 0.1069, "态A召回": "2/2", "态B召回": "2/2"},
+        {"case": "Python 2+3 （mode/pyecharts）", "head": 0.8536, "weakest_gold": 0.7009, "ratio": 0.8211, "态A召回": "2/2", "态B召回": "2/2"},
+        {"case": "Python 1+2 （元组/编码）", "head": 0.832, "weakest_gold": 0.0582, "ratio": 0.07, "态A召回": "**1/2**", "态B召回": "2/2"}
+      ],
+      "verdict": "当前 RERANK_MIN_SCORE_RATIO=0.10 **已经在误杀合法次要证据**（Python 1+2 例：带 = 0.832×0.10 = 0.0832 > 次证 0.0685 → 整条被砍）。这不是理论风险，是实测到的召回损失。已把该参数降到 0.05。",
+      "replaces_old_conclusion": "rev1/rev2 据此算出的『跨用例安全上界 = 0.22/0.9999 = 0.2200，推荐上界 0.165』只用了**主证据**口径，没有次要证据样本 → 偏乐观约 2.4 倍。含次要证据的实测上界是 0.07。"
+    },
+    "floor_headroom_note": "另一侧（绝对下限 RERANK_MIN_SCORE=0.05）同样只被旧集校准过：旧的『最弱真阳性 0.22』只覆盖主证据。含次要证据后最弱合法证据是 **0.0582**（带后；过带前 0.0685），距下限只有 1.16 倍 —— 意味着 `PARENT_SCORE_DECAY=0.85` 一旦调到 0.72 以下，同父第 2 条证据就会掉到下限之外。已用单测把 `min_score < 0.0582` 钉住，但这条余量偏薄，换模型时必须重测。"
+  },
+  "band_headroom_measured": {
+    "at": "2026-09-18T09:2xZ（rev3 复测）",
+    "safe_ceiling": 0.07,
+    "current_ratio": 0.05,
+    "margin": 1.4,
+    "measured_from": "多证据用例的 min(次证分/头名分)；测量态 = 关闭阈值过滤（否则被砍掉的证据不可见）",
+    "conservatism": "该比值取的是**过完整条流水线之后**的分数，因此已含 PARENT_SCORE_DECAY 的折损。用它当上界是**偏保守**的一侧（真实可容忍上界略高，本例约 0.0823），对护栏而言方向正确。"
+  },
+  "known_limitation": "⚠️ 已修（rev3）：『本集金标全是精排第 1 名、分带风险测不出』这一条已通过新增 5 条多证据用例解决（见 multi_evidence 段），并当场测出旧值 0.10 在误杀次要证据。\n\n仍存在的局限（按重要性排序）：\n1. **语料可见性覆盖不全**：admin 口径只看得到 4/9 份文档（private 归属他人的 3 份按权限设计不可见）。这 3 份共约 21 个分片完全没有观测点。要覆盖必须按归属人 scope 分别评测（多 scope 评测尚未实现）。\n2. **多证据用例只覆盖同文档内跨分节**，没有跨文档多证据用例（本语料里同为 admin 可见、且内容互补的文档对不存在）。\n3. **绝对下限余量偏薄**：含次要证据后最弱合法证据 0.0582 vs 下限 0.05，只有 1.16 倍。\n4. 负例只有 3 条，且都是『域外事实』型；缺少『同域但库内无可答内容』的负例（如『员工餐厅菜单』已含，但只有 1 条）。"
+}

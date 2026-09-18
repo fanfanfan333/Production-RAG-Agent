@@ -12,6 +12,7 @@ import {
   FileText,
   FileType,
   FileX2,
+  FolderInput,
   Image as ImageIcon,
   Loader2,
   Lock,
@@ -49,7 +50,10 @@ import {
 import { Skeleton } from "@/components/ui/skeleton";
 import { cn, describeIngestStage, formatBytes, formatRelativeTime } from "@/lib/utils";
 import { AccessTierBadge, tierScopeName } from "@/components/documents/access-badge";
-import { DocumentSharingDialog } from "@/components/documents/document-sharing-dialog";
+import {
+  DocumentSharingDialog,
+  type SharingDialogView,
+} from "@/components/documents/document-sharing-dialog";
 
 const typeIcons: Record<string, typeof FileText> = {
   PDF: FileText,
@@ -159,6 +163,16 @@ export function DocumentsList() {
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [viewingDoc, setViewingDoc] = useState<Document | null>(null);
   const [sharingDoc, setSharingDoc] = useState<Document | null>(null);
+  // 共享弹窗的落地视图：每个入口传入与之语义一致的落点，避免"点申请却落在发布段"
+  //   request   「申请共享」入口 → 主视图，且把「申请共享」区提到最前
+  //   delete    「申请删除」入口 → 主视图，且把「申请删除」区提到最前
+  //   transfer  「转为部门文档」入口 → 直达部门选择二级视图
+  //   main      「共享设置」入口 → 主视图常规顺序
+  const [sharingView, setSharingView] = useState<SharingDialogView>("main");
+  const openSharing = (doc: Document, view: SharingDialogView = "main") => {
+    setSharingView(view);
+    setSharingDoc(doc);
+  };
 
   const counts = useMemo(() => {
     const base: Record<AccessLevel | "all", number> = {
@@ -273,9 +287,14 @@ export function DocumentsList() {
               const level = doc.accessLevel ?? "private";
               const canPublish =
                 doc.canPublishDepartment || doc.canPublishCompany;
-              // 个人库 + 无发布权限 → 提示"申请共享"（权限矩阵第一行）
-              const showRequestHint =
-                level === "private" && doc.needsShareRequest && !doc.pendingShareRequest;
+              // 有"不能直接发、只能申请"的层级 → 显示「申请共享」入口。
+              //
+              // 不再限定 `level === "private"`：部门负责人把**已发布到部门库**的
+              // 文档提到公司库同样只能申请，而他在旧口径下（个人库 + 无发布权）
+              // 拿不到这个入口 —— 界面里只有"发布到部门知识库"，向上无路。
+              const canRequestShare =
+                Boolean(doc.canRequestDepartment || doc.canRequestCompany) &&
+                !doc.pendingShareRequest;
 
               return (
                 <motion.li
@@ -334,30 +353,48 @@ export function DocumentsList() {
                       )}
                   </div>
 
-                  {/* 个人文档上的「申请共享」入口 */}
-                  {showRequestHint && (
+                  {/* 「申请共享」入口：只要存在"只能申请、不能直接发"的层级就显示。
+                      以 request 落点打开，让申请区直接置顶，不用再往下找 */}
+                  {canRequestShare && (
                     <Button
                       variant="outline"
                       size="sm"
                       className="shrink-0 gap-1.5"
-                      onClick={() => setSharingDoc(doc)}
+                      onClick={() => openSharing(doc, "request")}
                     >
                       <Share2 className="size-3.5" />
                       申请共享
                     </Button>
                   )}
 
-                  {/* 有发布权限 / 已共享的文档：共享与层级管理 */}
-                  {!showRequestHint && (
+                  {/* 发布与层级管理。两个入口可同时出现（部门负责人既有部门库的
+                      发布权，又有公司库的申请权），弹窗里是同一份能力，不冲突 */}
+                  {(canPublish || !canRequestShare) && (
                     <Button
                       variant="ghost"
                       size="icon"
                       className="shrink-0 text-muted-foreground hover:text-foreground"
                       title={canPublish ? "发布与共享设置" : "共享设置"}
                       aria-label={`共享设置 ${doc.name}`}
-                      onClick={() => setSharingDoc(doc)}
+                      onClick={() => openSharing(doc)}
                     >
                       <Share2 className="size-4" />
+                    </Button>
+                  )}
+
+                  {/* 公司级管理者：把这份已共享的文档改归到指定部门。
+                      入口独立于「共享设置」，因为它是"选择目标部门"的动作，
+                      而弹窗主视图里的层级按钮发的是操作者自己的部门。 */}
+                  {doc.canTransferDepartment && (
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="shrink-0 text-muted-foreground hover:text-foreground"
+                      title="转为部门文档"
+                      aria-label={`转为部门文档 ${doc.name}`}
+                      onClick={() => openSharing(doc, "transfer")}
+                    >
+                      <FolderInput className="size-4" />
                     </Button>
                   )}
 
@@ -392,19 +429,24 @@ export function DocumentsList() {
                   </Button>
 
                   {/* 无删除权但看得见该文档 → 走「申请删除」由上级审核。
-                      与「申请共享」对称：自己没有的权限，通过申请向上要。 */}
-                  {doc.canRequestDelete && !doc.canDelete && (
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      className="shrink-0 gap-1.5"
-                      title="你没有删除权限，可提交申请由上级审核"
-                      onClick={() => setSharingDoc(doc)}
-                    >
-                      <FileX2 className="size-3.5" />
-                      申请删除
-                    </Button>
-                  )}
+                      与「申请共享」对称：自己没有的权限，通过申请向上要。
+                      以 delete 落点打开，直达删除申请区。
+                      已有待审申请时收口：后端会以 409 拒绝重复申请，且弹窗此时
+                      也不再展示删除区，界面不该留一个注定失败的按钮。 */}
+                  {doc.canRequestDelete &&
+                    !doc.canDelete &&
+                    !doc.pendingShareRequest && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="shrink-0 gap-1.5"
+                        title="你没有删除权限，可提交申请由上级审核"
+                        onClick={() => openSharing(doc, "delete")}
+                      >
+                        <FileX2 className="size-3.5" />
+                        申请删除
+                      </Button>
+                    )}
 
                   {/* 删除：无权限时禁用并把原因写在 title 上（不再点下去才 404） */}
                   <Button
@@ -458,6 +500,7 @@ export function DocumentsList() {
       <DocumentSharingDialog
         doc={sharingDoc}
         open={!!sharingDoc}
+        initialView={sharingView}
         onOpenChange={(open) => {
           if (!open) setSharingDoc(null);
         }}

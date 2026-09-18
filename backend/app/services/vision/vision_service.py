@@ -182,7 +182,7 @@ class VisionService:
                     "images": [b64],
                     "stream": False,
                     # 多模态解码开销大，给足上下文但不做无谓放大
-                    "options": {"temperature": 0.2, "num_ctx": settings.OLLAMA_NUM_CTX},
+                    "options": {"temperature": 0.2, "num_ctx": settings.chat_num_ctx},
                 },
                 timeout=timeout,
             )

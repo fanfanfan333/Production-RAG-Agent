@@ -37,6 +37,7 @@ from app.services.tenancy import (
     access_scope_name,
     effective_department_id,
     effective_tenant_id,
+    is_upward_transition,
     normalize_tenant_id,
 )
 from app.utils.logging import get_logger
@@ -174,6 +175,17 @@ async def create_share_request(
         if (doc.access_level or "private") == target_level:
             raise ShareError(
                 f"该文档已经在{access_scope_name(target_level)}中，无需重复申请"
+            )
+
+        # 申请只能**向上**。此处不能只挡"平级"：一份已发布到公司库的文档若被
+        # 允许申请"共享到部门库"，批准后 set_document_access_level 会真的把它
+        # 降级 —— 对正在引用它的其他部门同事是静默的可见性收缩，且日志里只有
+        # 一条正常的"层级变更"记录，排查时完全看不出这是一次权限回退。
+        if not is_upward_transition(doc.access_level, target_level):
+            raise ShareError(
+                f"这份文档当前在{access_scope_name(doc.access_level)}，"
+                f"不能再申请变更为{access_scope_name(target_level)}："
+                "「申请共享」只能向上申请更高层级"
             )
 
         # 同文档同目标只允许一份待审申请（防重复点击刷屏审核队列）
@@ -355,12 +367,18 @@ async def list_inbox(user: User, *, limit: int = 100) -> list[ShareRequest]:
         return []
 
     async with get_db_session() as session:
+        conditions = [ShareRequest.requester_id != user.id]
+        # 公司边界与 ``can_review`` 必须同源：平台管理员是唯一跨公司身份，
+        # 它要给所有公司配管理层、审所有公司的申请。此前这里无条件按
+        # ``tenant_id == 本人租户`` 过滤，于是平台管理员"有审核权但列表里没有"，
+        # 只能靠猜申请 id —— 与 can_review 的显式放行互相矛盾。
+        if not user.is_admin:
+            conditions.append(
+                ShareRequest.tenant_id == effective_tenant_id(user)
+            )
         stmt = (
             select(ShareRequest)
-            .where(
-                ShareRequest.tenant_id == effective_tenant_id(user),
-                ShareRequest.requester_id != user.id,
-            )
+            .where(*conditions)
             .order_by(ShareRequest.created_at.desc())
             .limit(limit)
         )
@@ -381,11 +399,16 @@ async def summary(user: User) -> dict:
     inbox_count = 0
     if scope is not None:
         async with get_db_session() as session:
-            stmt = select(func.count()).select_from(ShareRequest).where(
-                ShareRequest.tenant_id == effective_tenant_id(user),
+            conditions = [
                 ShareRequest.requester_id != user.id,
                 ShareRequest.status == ShareRequest.STATUS_PENDING,
-            )
+            ]
+            # 同上：平台管理员跨公司可见，其余角色锁在本租户内。
+            if not user.is_admin:
+                conditions.append(
+                    ShareRequest.tenant_id == effective_tenant_id(user)
+                )
+            stmt = select(func.count()).select_from(ShareRequest).where(*conditions)
             if scope == "department":
                 dept = effective_department_id(user)
                 if not dept:

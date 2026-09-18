@@ -281,8 +281,10 @@ async def update_document_visibility_endpoint(
     )
     from app.services.permissions import has_permission
     from app.services.tenancy import (
+        ACCESS_PRIVATE,
         ACCESS_TENANT,
         access_label,
+        is_downgrade,
         publish_requirement,
     )
 
@@ -308,6 +310,27 @@ async def update_document_visibility_endpoint(
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="只有文档归属人可以调整它的知识库层级",
+        )
+
+    # 层级只能**向上或平级**。这条比申请链路那条更关键：直接发布不需要任何人
+    # 审批，一次 PATCH 就能把公司库文档降成部门库，其他部门同事静默失去访问权，
+    # 而审计日志里只是一条正常的"层级变更"。能力字段（publish_capability）已经
+    # 把降级按钮收窄掉了，但**按钮隐藏不是权限控制** —— 直接构造请求照样能过，
+    # 所以接口必须独立兜底。
+    #
+    # 收回个人库不在拦截范围：它是归属人的正当操作（前端有独立的「收回」入口，
+    # 文案也明示了"已共享的成员将无法再检索到"）。
+    if (
+        body.access_level != ACCESS_PRIVATE
+        and is_downgrade(doc.access_level, body.access_level)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"这份文档当前在{access_label(doc.access_level)}，不能再变更到更低的"
+                f"「{access_label(body.access_level)}」；如需仅自己可见请点「收回至"
+                "个人知识库」"
+            ),
         )
 
     try:
@@ -336,6 +359,176 @@ async def update_document_visibility_endpoint(
             f"已{'发布到' if body.access_level != 'private' else '收回至'}"
             f"{access_label(body.access_level)}知识库"
         ),
+    }
+
+
+# ── 公司文档 → 部门文档（公司 HR / 知识库管理员的"改归部门"） ─────────────────
+#
+# 与上面 `/visibility` 的分工：那条管**层级升降**（个人/部门/公司之间），这条管
+# **归属哪个部门** —— 目标部门由操作者在"公司已有部门"里选定，而不是隐含地取
+# 操作者自己的部门（后者是「发布到部门知识库」的语义）。
+#
+# 为什么单独开一个端点，而不是给 visibility 加个 department_id 参数：这条路径
+# 携带一次**降级豁免**。公司库 → 部门库在其他所有路径上都被 is_downgrade 兜底
+# 拦掉（上一轮补的补丁，见 update_document_visibility_endpoint），因为那会让
+# 其他部门同事静默失去访问权；而公司 HR 主动把文档下沉到指定部门，恰恰是这次
+# 要的功能。把豁免严格圈在一个独立端点里，"谁能绕开防降级"是一眼可查的；
+# 塞进 visibility 则要把那条通用兜底改成"看角色再决定拦不拦"，防降级的语义
+# 立刻变得可以协商 —— 那正是最容易出越权的地方。
+
+
+class TransferDepartmentRequest(BaseModel):
+    department_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=64,
+        description="目标部门 ID（必须出现在该公司已有部门清单中）",
+    )
+    note: str | None = Field(
+        None, max_length=200, description="可选说明，一并写入审计日志",
+    )
+
+
+@router.get(
+    "/documents/{document_id}/transfer-targets",
+    summary="转为部门文档：可选的部门清单",
+    description=(
+        "返回这份文档可以转入的部门清单（该公司内已有成员归属的部门），"
+        "以及当前是否具备「转为部门文档」的能力。仅企业管理员 / 知识库管理员 / "
+        "平台管理员可用 —— 普通员工与部门负责人调用会被 403 拦下。"
+    ),
+)
+async def document_transfer_targets_endpoint(
+    document_id: Annotated[uuid.UUID, Path(description="UUID of the document.")],
+    user: Annotated[User, Depends(require_permission("document.read"))],
+) -> dict:
+    from app.services.knowledge_tier_service import (
+        list_department_options,
+        publish_capability,
+    )
+    from app.services.permissions import has_permission
+
+    # 可见性先行：跨公司/看不见的文档一律 404（不泄漏存在性），再谈权限。
+    async with get_db_session() as session:
+        doc = (
+            await session.execute(select(Document).where(Document.id == document_id))
+        ).scalar_one_or_none()
+    if doc is None or not can_access_document(doc, user):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="文档不存在或无权访问"
+        )
+
+    if not has_permission(user, "document.read.all"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "「转为部门文档」需要企业管理员或知识库管理员权限；"
+                "如需把文档共享给某个部门，请使用「申请共享」"
+            ),
+        )
+
+    capability = publish_capability(user, doc)
+    options = await list_department_options(getattr(doc, "tenant_id", None))
+    current_dept = (doc.department_id or "").strip()
+
+    return {
+        "document_id": str(document_id),
+        "current_level": capability["current_level"],
+        "current_label": capability["current_label"],
+        "department_id": doc.department_id,
+        # 当前部门的中文名（公司库文档为 None —— 它不属于任何部门）
+        "department_name": next(
+            (o["department_name"] for o in options if o["department_id"] == current_dept),
+            None,
+        ),
+        "can_transfer_department": capability["can_transfer_department"],
+        "transfer_denied_reason": capability["transfer_denied_reason"],
+        "options": options,
+    }
+
+
+@router.post(
+    "/documents/{document_id}/transfer-department",
+    summary="把公司文档转为指定部门的部门文档",
+    description=(
+        "公司 HR / 知识库管理员把一份已共享的文档**改归到指定部门**：\n"
+        "- 公司库 → 部门库：其他部门同事将无法再检索到这份文档；\n"
+        "- 部门库 → 另一部门：部门归属被改写，原部门同事将无法再检索到。\n\n"
+        "目标部门必须出现在该公司已有部门清单中（见 transfer-targets），"
+        "否则 400 —— 防的是把文档塞进不存在的部门，那等于一次无痕迹的软删除。"
+    ),
+)
+async def transfer_document_department_endpoint(
+    document_id: Annotated[uuid.UUID, Path(description="UUID of the document.")],
+    body: TransferDepartmentRequest,
+    user: Annotated[User, Depends(require_permission("document.write"))],
+) -> dict:
+    from app.services.knowledge_tier_service import (
+        TierError,
+        list_department_options,
+        publish_capability,
+        transfer_document_to_department,
+    )
+    from app.services.permissions import has_permission
+    from app.services.tenancy import access_label
+
+    async with get_db_session() as session:
+        doc = (
+            await session.execute(select(Document).where(Document.id == document_id))
+        ).scalar_one_or_none()
+    if doc is None or not can_access_document(doc, user):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="文档不存在或无权访问"
+        )
+
+    if not has_permission(user, "document.read.all"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "只有企业管理员 / 知识库管理员可以把文档转为部门文档；"
+                "部门负责人只能发布到本部门知识库"
+            ),
+        )
+
+    capability = publish_capability(user, doc)
+    if not capability["can_transfer_department"]:
+        # 个人库文档：先共享再谈归属（见 publish_capability 的判定注释）
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                capability["transfer_denied_reason"]
+                or "当前状态下不能把这份文档转为部门文档"
+            ),
+        )
+
+    try:
+        updated = await transfer_document_to_department(
+            document_id,
+            target_department_id=body.department_id,
+            actor_id=user.id,
+            actor_username=user.username,
+            note=body.note or "",
+        )
+    except TierError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+    # 只为把部门中文名写进给用户看的消息 —— 事实校验由服务层自己做了一遍
+    # （transfer_document_to_department 内部同样查询清单），这里不承担校验职责。
+    options = await list_department_options(getattr(doc, "tenant_id", None))
+    target_name = next(
+        (o["department_name"] for o in options
+         if o["department_id"] == (updated.department_id or "")),
+        body.department_id,
+    )
+
+    return {
+        "document_id": str(updated.id),
+        "access_level": updated.access_level,
+        "access_label": access_label(updated.access_level),
+        "department_id": updated.department_id,
+        "department_name": target_name,
+        "capability": publish_capability(user, updated),
+        "message": f"已转为「{target_name}」的部门文档，仅该部门成员可检索到",
     }
 
 

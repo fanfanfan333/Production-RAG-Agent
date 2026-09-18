@@ -320,6 +320,15 @@ def cleanup(prefixes: list[str], companies: list[str]) -> str:
                     )
                 )
             )
+            # ⚠️ 删 PG 行**之前**必须先清 Qdrant 向量。否则每跑一轮都在向量库里
+            # 留下一批"文档已不存在、向量还在"的孤儿点，它们会占满检索候选池
+            # （实测平台管理员 ANN top-20 里有 16 条是这种孤儿），把评测召回率
+            # 一起拖下去。见 scripts/_e2e_purge.py 的模块说明。
+            if doc_ids:
+                from _e2e_purge import delete_vectors_for_documents
+
+                await delete_vectors_for_documents(doc_ids)
+
             r_doc = await session.execute(
                 delete(Document).where(Document.id.in_(doc_ids)) if doc_ids
                 else None
@@ -673,11 +682,306 @@ def main() -> int:
                   bool(after) and after["access_level"] == "private",
                   f"level={after['access_level'] if after else None}")
 
+    # ── C2. 部门负责人：能直接发部门库，但**只能申请**公司库 ────────────────────
+    #
+    # 回归：publish_capability 曾把申请能力算成一个总布尔
+    # （`is_owner and not can_dept and not can_company`），前端据此把"直接发布"
+    # 与"申请共享"渲染成互斥两支。部门负责人 can_dept=True → 整个申请分支被隐藏，
+    # 界面里只剩"发布到部门知识库"，他想把文档提到公司库时无路可走。
+    section("C2. 部门负责人向上申请：能发部门库，只能申请公司库")
+
+    doc_up = f"负责人向上申请-{sfx}.txt"
+    upload(base, t_a_mgr, doc_up, f"负责人要把这份提到公司库 {sfx}".encode("utf-8"),
+           access_level="department")
+    st, res = list_docs(base, t_a_mgr)
+    items = res.get("items", []) if isinstance(res, dict) else []
+    up = find_doc(items, doc_up)
+    up_id = up["document_id"] if up else ""
+
+    if check("部门负责人直接把文档发到部门库",
+             bool(up) and up["access_level"] == "department",
+             f"level={up['access_level'] if up else None}"):
+        check("能力字段：可发部门库 + 只能申请公司库（两者对**不同层**同时为真）",
+              up.get("can_publish_department") is True
+              and up.get("can_request_department") is False
+              and up.get("can_request_company") is True
+              and up.get("needs_share_request") is True,
+              f"pub_dept={up.get('can_publish_department')} "
+              f"req_dept={up.get('can_request_department')} "
+              f"req_co={up.get('can_request_company')}")
+
+        st, res = call("POST", "/share-requests", base=base, token=t_a_mgr,
+                       payload={"document_id": up_id, "target_level": "tenant",
+                                "reason": f"公司级汇报需要汇总 {sfx}"})
+        ok = st == 201 and isinstance(res, dict)
+        check("部门负责人提交「公司库」申请成功（修复前界面上无此入口）", ok,
+              f"status={st} {detail(res)}")
+        rid_up = res["request"]["id"] if ok else ""
+
+        if rid_up:
+            st, res = call("POST", f"/share-requests/{rid_up}/review", base=base,
+                           token=t_a_mgr, payload={"approve": True})
+            check("部门负责人不能自审（公司级申请归公司级审核人）", st == 403,
+                  f"status={st} {detail(res)}")
+
+            st, inbox = call("GET", "/share-requests/inbox", base=base, token=t_a_kb)
+            rows = inbox.get("items", []) if isinstance(inbox, dict) else []
+            check("本公司知识库管理员在待办中看到该申请",
+                  any(r["id"] == rid_up for r in rows), f"inbox={len(rows)}")
+
+            st, res = call("POST", f"/share-requests/{rid_up}/review", base=base,
+                           token=t_a_kb,
+                           payload={"approve": True, "comment": "同意提升到公司库"})
+            check("知识库管理员批准该申请", st == 200, f"status={st} {detail(res)}")
+            check("批准后文档进入公司库",
+                  st == 200 and isinstance(res, dict)
+                  and res.get("published", {}).get("access_level") == "tenant",
+                  f"published={res.get('published') if isinstance(res, dict) else ''}")
+
+            # 已是公司库 → 不能再申请"部门库"：那不是共享，是**降级**。
+            # 这里要验证的是"被拒绝"，不是某一个具体状态码：能力闸门（角色本
+            # 就能直接发部门库 → 409「无需申请」）排在向上校验之前，部门负责人
+            # 先命中前者，普通员工才走到 400。两条都拦得住。
+            st, res = call("POST", "/share-requests", base=base, token=t_a_mgr,
+                           payload={"document_id": up_id, "target_level": "department"})
+            check("公司库文档不能再申请『部门库』（向下 = 降级，400/409 被拒）",
+                  st in (400, 409), f"status={st} {detail(res)}")
+
+            # ── 直接发布链路同样不能"向下" ────────────────────────────────
+            # 这条路比申请更危险：不需要任何人审批，一次 PATCH 就把文档降级。
+            # 能力字段（can_publish_department）已按层级收窄、按钮不再渲染，
+            # 但按钮隐藏不是权限控制 —— 接口必须独立兜底，所以这里绕过界面
+            # 直接构造请求。
+            st, res = call("PATCH", f"/documents/{up_id}/visibility", base=base,
+                           token=t_a_mgr, payload={"access_level": "department"})
+            check("部门负责人不能把公司库文档直接降级为部门库（400）", st == 400,
+                  f"status={st} {detail(res)}")
+
+            st, res = list_docs(base, t_a_mgr)
+            still = find_doc(docs_items(res), doc_up)
+            check("被拒的降级没有改动文档层级",
+                  bool(still) and still.get("access_level") == "tenant",
+                  f"level={still.get('access_level') if still else None}")
+
+            # 收回个人库是归属人的正当操作，不能被上面的闸门误伤
+            st, res = call("PATCH", f"/documents/{up_id}/visibility", base=base,
+                           token=t_a_mgr, payload={"access_level": "private"})
+            check("归属人仍可把公司库文档收回个人库（明示的正当操作）",
+                  st == 200, f"status={st} {detail(res)}")
+
     # 管理员无需申请
     st, res = call("POST", "/share-requests", base=base, token=t_a_mgr,
                    payload={"document_id": req_doc_id, "target_level": "department"})
     check("有直接发布权限的角色申请部门库被提示「无需申请」（409）",
           st in (409, 404), f"status={st} {detail(res)}")
+
+    # ══ C3. 公司文档 → 指定部门的部门文档 ═════════════════════════════════════
+    section("C3. 公司 HR 把公司文档转为指定部门的部门文档")
+
+    # 场景：一份全公司可见的文档需要收窄到某个具体部门。它不是"发布"（发布到
+    # 部门库发的是操作者自己的部门），而是**改归到指定部门** —— 公司级管理者
+    # 在"公司已有部门"里挑目标。验收重点有三条：
+    #   1. 目标部门必须真实存在（否则文档被塞进无人部门 = 无痕迹的软删除）
+    #   2. 只有公司级管理者能做（部门负责人不得跨部门改派）
+    #   3. 转换后可见性真的收缩（目标部门看得到、原部门看不到）
+    doc_move = f"公司转部门-{sfx}.txt"
+    upload(base, t_a_kb, doc_move,
+           f"全公司薪酬制度 {sfx}：涉及薪资结构，需按部门收窄查阅范围。".encode("utf-8"),
+           access_level="tenant")
+    mv = find_doc(docs_items(list_docs(base, t_a_kb)[1]), doc_move)
+    mv_id = mv["document_id"] if mv else ""
+    check("知识库管理员上传公司库文档（待转部门）",
+          bool(mv) and mv["access_level"] == "tenant",
+          f"level={mv['access_level'] if mv else None}")
+
+    if check("拿到待转换的公司文档 ID", bool(mv_id)):
+        check("能力字段：公司文档对知识库管理员开放「转为部门文档」",
+              mv.get("can_transfer_department") is True,
+              f"can_transfer={mv.get('can_transfer_department')}")
+        check("新能力不污染防降级：『发布到部门库』仍为 False",
+              mv.get("can_publish_department") is False,
+              f"can_publish_department={mv.get('can_publish_department')}")
+
+        # 部门负责人没有这个能力（他只能发本部门），接口必须独立拦住
+        st, res = call("GET", f"/documents/{mv_id}/transfer-targets",
+                       base=base, token=t_a_mgr)
+        check("部门负责人读取部门清单被拒（403）", st == 403,
+              f"status={st} {detail(res)}")
+
+        st, res = call("GET", f"/documents/{mv_id}/transfer-targets",
+                       base=base, token=t_a_kb)
+        options = res.get("options", []) if isinstance(res, dict) else []
+        check("公司已有部门清单返回（研发部 + 市场部）",
+              st == 200 and len(options) >= 2,
+              f"status={st} names={[o.get('department_name') for o in options]}")
+        by_name = {o["department_name"]: o for o in options}
+        dev_opt = by_name.get(dept_dev)
+        mkt_opt = by_name.get(dept_mkt)
+        check("清单按名字可辨认（不是哈希 ID）", bool(dev_opt) and bool(mkt_opt),
+              f"names={list(by_name)}")
+        check("清单项带成员数（管理者据此确认选对部门）",
+              bool(dev_opt) and dev_opt.get("member_count", 0) >= 1,
+              f"dev={dev_opt}")
+
+        # 白名单校验：目标部门必须是"本公司已有部门"
+        st, res = call("POST", f"/documents/{mv_id}/transfer-department",
+                       base=base, token=t_a_kb,
+                       payload={"department_id": "d_not_exist_9999"})
+        check("目标部门不在本公司清单中 → 400（防塞进无人部门）", st == 400,
+              f"status={st} {detail(res)}")
+
+        if mkt_opt:
+            st, res = call("POST", f"/documents/{mv_id}/transfer-department",
+                           base=base, token=t_a_mgr,
+                           payload={"department_id": mkt_opt["department_id"]})
+            check("部门负责人调用转换接口被拒（403，不得改派到别的部门）", st == 403,
+                  f"status={st} {detail(res)}")
+
+            st, res = call("POST", f"/documents/{mv_id}/transfer-department",
+                           base=base, token=t_a_kb,
+                           payload={"department_id": mkt_opt["department_id"],
+                                    "note": f"薪酬制度仅市场部查阅 {sfx}"})
+            ok = st == 200 and isinstance(res, dict)
+            check("知识库管理员把公司文档转为市场部文档", ok,
+                  f"status={st} {detail(res)}")
+            check("转换后层级 = 部门库、归属 = 市场部",
+                  ok and res.get("access_level") == "department"
+                  and res.get("department_id") == mkt_opt["department_id"],
+                  f"level={res.get('access_level') if ok else None} "
+                  f"dept={res.get('department_id') if ok else None}")
+
+            # 可见性收缩真的生效（这才是这次操作的意义所在）
+            seen_mkt = find_doc(docs_items(list_docs(base, t_a_emp2)[1]), doc_move)
+            check("市场部员工现在能检索到这份文档",
+                  bool(seen_mkt) and seen_mkt.get("access_level") == "department",
+                  f"found={bool(seen_mkt)}")
+            seen_dev = find_doc(docs_items(list_docs(base, t_a_mgr)[1]), doc_move)
+            check("研发部负责人已看不到它（可见性收缩生效）", seen_dev is None,
+                  f"still_visible={bool(seen_dev)}")
+
+            st, res = call("POST", f"/documents/{mv_id}/transfer-department",
+                           base=base, token=t_a_kb,
+                           payload={"department_id": mkt_opt["department_id"]})
+            check("重复转为同一部门 → 400（不静默成功）", st == 400,
+                  f"status={st} {detail(res)}")
+
+        # 个人库文档：先共享，再谈归属
+        doc_own = f"个人待转-{sfx}.txt"
+        upload(base, t_a_kb, doc_own, f"知识库管理员的私人笔记 {sfx}".encode("utf-8"))
+        own = find_doc(docs_items(list_docs(base, t_a_kb)[1]), doc_own)
+        own_id = own["document_id"] if own else ""
+        check("个人库文档：能力字段关闭「转为部门文档」",
+              bool(own) and own.get("can_transfer_department") is False,
+              f"can_transfer={own.get('can_transfer_department') if own else None}")
+        if own_id and mkt_opt:
+            st, res = call("POST", f"/documents/{own_id}/transfer-department",
+                           base=base, token=t_a_kb,
+                           payload={"department_id": mkt_opt["department_id"]})
+            check("个人库文档直接转部门被拒（400 + 引导先发布）", st == 400,
+                  f"status={st} {detail(res)}")
+
+    # ══ C4. 「转为部门文档」的攻击面 ══════════════════════════════════════════
+    #
+    # C3 验的是主路径和两条常规拒绝。这一节专门**构造请求**去撞它 —— 一个能
+    # 改派组织资产归属的接口，权限判定只要漏一格，后果是一整份文档对一批同事
+    # 静默消失，而且消失得"合情合理"（审计里只是一条正常的转为部门文档）。
+    #
+    # 最需要盯住的是**跨公司**：两个公司的同名部门（本脚本里甲乙公司都有
+    # `<dept_dev>`）经过 `department_id_from_name` 会得到**完全相同的 ID**，
+    # 部门维度根本无法区分公司 —— 公司边界只能靠 tenant 过滤来守。
+    section("C4. 「转为部门文档」越权 / 跨公司 / 脏输入")
+
+    doc_atk = f"攻击载具-{sfx}.txt"
+    upload(base, t_a_kb, doc_atk, f"甲公司公司库文档（攻击载具）{sfx}".encode("utf-8"),
+           access_level="tenant")
+    atk = find_doc(docs_items(list_docs(base, t_a_kb)[1]), doc_atk)
+    atk_id = atk["document_id"] if atk else ""
+
+    if check("攻击载具就位（甲公司 · 公司库）", bool(atk_id)):
+        # ── 1. 普通员工：连部门清单都不该看到 ────────────────────────────────
+        # 清单本身就是组织架构信息（有哪些部门、各多少人），不是文档数据。
+        st, res = call("GET", f"/documents/{atk_id}/transfer-targets",
+                       base=base, token=t_a_emp1)
+        check("普通员工读取部门清单被拒（403）", st == 403,
+              f"status={st} {detail(res)}")
+
+        st, res = call("POST", f"/documents/{atk_id}/transfer-department",
+                       base=base, token=t_a_emp1,
+                       payload={"department_id": "d_whatever_9999"})
+        check("普通员工调用转换接口被拒（403）", st == 403,
+              f"status={st} {detail(res)}")
+
+        # ── 2. 未通过身份验证的账号（注册了但没走完验证）─────────────────────
+        st, res = call("GET", f"/documents/{atk_id}/transfer-targets",
+                       base=base, token=tmp_token)
+        check("未通过身份验证的账号被身份闸门拦下（403）", st == 403,
+              f"status={st} {detail(res)}")
+
+        # ── 3. 跨公司：乙公司知识库管理员（同角色、不同公司）─────────────────
+        st, res = call("GET", f"/documents/{atk_id}/transfer-targets",
+                       base=base, token=t_b_kb)
+        check("跨公司读部门清单 → 404（不泄漏文档存在性）", st == 404,
+              f"status={st} {detail(res)}")
+
+        st, res = call("POST", f"/documents/{atk_id}/transfer-department",
+                       base=base, token=t_b_kb, payload={"department_id": "d_any_9999"})
+        check("跨公司调用转换接口 → 404", st == 404,
+              f"status={st} {detail(res)}")
+
+        # ── 4. 脏输入：空 / 空串 / 纯空白 ─────────────────────────────────────
+        for label, payload in (
+            ("未提供 department_id", {}),
+            ("department_id 为空串", {"department_id": ""}),
+            ("department_id 为纯空白", {"department_id": "   "}),
+        ):
+            st, res = call("POST", f"/documents/{atk_id}/transfer-department",
+                           base=base, token=t_a_kb, payload=payload)
+            check(f"{label} → 400/422（不得静默清空部门归属）", st in (400, 422),
+                  f"status={st} {detail(res)}")
+
+        still = find_doc(docs_items(list_docs(base, t_a_kb)[1]), doc_atk)
+        check("脏输入之后文档层级纹丝未动（仍为公司库）",
+              bool(still) and still.get("access_level") == "tenant",
+              f"level={still.get('access_level') if still else None}")
+
+        # ── 5. 平台管理员跨公司：可以改派，但只能改派到**文档所属公司**的部门 ──
+        st, res = call("GET", f"/documents/{atk_id}/transfer-targets",
+                       base=base, token=admin)
+        admin_opts = res.get("options", []) if isinstance(res, dict) else []
+        check("平台管理员可读甲公司部门清单（跨公司管理）",
+              st == 200 and len(admin_opts) >= 2,
+              f"status={st} names={[o.get('department_name') for o in admin_opts]}")
+
+        # ── 6. 同名部门跨公司不串（本节最关键的断言）────────────────────────
+        # 甲乙两公司都有 <dept_dev>，ID 相同。把甲公司文档转进该部门后，
+        # **乙公司同部门员工**绝不能看到它 —— 公司边界只能靠 tenant 守。
+        st, res = call("GET", f"/documents/{atk_id}/transfer-targets",
+                       base=base, token=t_a_kb)
+        opts_a = res.get("options", []) if isinstance(res, dict) else []
+        dev_target = next(
+            (o for o in opts_a if o["department_name"] == dept_dev), None
+        )
+        if check("甲公司清单里存在与乙公司同名的部门", bool(dev_target),
+                 f"names={[o['department_name'] for o in opts_a]}"):
+            st, res = call("POST", f"/documents/{atk_id}/transfer-department",
+                           base=base, token=t_a_kb,
+                           payload={"department_id": dev_target["department_id"],
+                                    "note": f"同名部门隔离验证 {sfx}"})
+            check("转为该部门成功（层级 = 部门库）",
+                  st == 200 and res.get("access_level") == "department",
+                  f"status={st} {detail(res)}")
+
+            same_id = dev_target["department_id"]
+            st, res = call("GET", "/documents?limit=100", base=base, token=t_b_emp)
+            names_b2 = {d["filename"] for d in docs_items(res)}
+            check("乙公司同部门员工看不到这份文档（公司边界未被同名部门穿透）",
+                  doc_atk not in names_b2, f"leaked={doc_atk in names_b2}")
+
+            st, res = call("GET", "/documents?limit=100", base=base, token=t_a_emp1)
+            seen_a = find_doc(docs_items(res), doc_atk)
+            check("甲公司同部门员工能看到（隔离不是靠'谁都看不到'实现的）",
+                  bool(seen_a) and seen_a.get("department_id") == same_id,
+                  f"found={bool(seen_a)}")
 
     # ══ D. 删除权限矩阵 ════════════════════════════════════════════════════════
     section("D. 删除权限矩阵（按层级裁定 + 「申请删除」闭环）")

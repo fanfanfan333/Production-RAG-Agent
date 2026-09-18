@@ -58,6 +58,15 @@ probe_*.py
 probe_*.txt
 /NVIDIA Corporation/
 
+# ── 会话调试输出（根目录不允许留，即便残留也不入库）──────────────
+/audit*.txt
+/cleanup_result.txt
+/final_check.txt
+/msg_check.txt
+/git_push*.txt
+/wmi_*.txt
+/root*.txt
+
 # ── 本机构建缓存 / 依赖镜像产物（不入库）────────────────────────
 .next-verify/
 backend/_wheels/

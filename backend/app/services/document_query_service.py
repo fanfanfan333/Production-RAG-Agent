@@ -196,7 +196,11 @@ async def list_documents(
                 "delete_denied_reason": "",
                 "can_publish_department": False,
                 "can_publish_company": False,
+                "can_request_department": False,
+                "can_request_company": False,
                 "needs_share_request": False,
+                "can_transfer_department": False,
+                "transfer_denied_reason": "",
                 "publish_denied_reason": "",
             }
         )
@@ -224,7 +228,15 @@ async def list_documents(
                 can_request_delete=bool(capability.get("can_request_delete")),
                 can_publish_department=bool(capability.get("can_publish_department")),
                 can_publish_company=bool(capability.get("can_publish_company")),
+                can_request_department=bool(capability.get("can_request_department")),
+                can_request_company=bool(capability.get("can_request_company")),
                 needs_share_request=bool(capability.get("needs_share_request")),
+                can_transfer_department=bool(
+                    capability.get("can_transfer_department")
+                ),
+                transfer_denied_reason=str(
+                    capability.get("transfer_denied_reason") or ""
+                ),
                 publish_denied_reason=str(capability.get("publish_denied_reason") or ""),
                 pending_share_request=row.id in pending_docs,
                 # 异步入库的进度（前端据此显示"解析中 / 向量化 3/12"）

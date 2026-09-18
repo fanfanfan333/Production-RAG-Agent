@@ -252,6 +252,11 @@ def cleanup(prefixes: list[str], companies: list[str]) -> str:
                 )
             )
             doc_ids = [d for (d,) in doc_rows.all()]
+            # 先清向量再删行 —— 直接删 PG 行会留下孤儿向量（详见 _e2e_purge）
+            if doc_ids:
+                from _e2e_purge import delete_vectors_for_documents
+
+                await delete_vectors_for_documents(doc_ids)
             r_doc = await session.execute(
                 delete(Document).where(Document.id.in_(doc_ids))
             )

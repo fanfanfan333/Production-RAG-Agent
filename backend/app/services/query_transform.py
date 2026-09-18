@@ -66,6 +66,7 @@ from app.services.prompt_security import (
     sanitize_document_context,
 )
 from app.utils.logging import get_logger
+from app.utils.timing import timed_stage
 
 if TYPE_CHECKING:      # 仅类型标注；运行时不导入（见 _invoke_rewrite_llm 的说明）
     from langchain_core.messages import BaseMessage
@@ -298,7 +299,34 @@ async def rewrite_query(
 
     任何失败路径都返回 ``RewriteResult(rewritten=query)`` —— 改写是增益而非
     依赖，绝不能拖垮主链路。
+
+    ⚠️ 这个"绝不失败"的性质有代价：**失败是静默的**。历史上改写器漏了
+    ``reasoning=False`` 而超时只有 12s，于是每轮都超时回退原查询，整条查询
+    增强层（多查询扩展 / 子问题 / HyDE）在生产里从未生效过，而日志里只有一条
+    warning、监控面板上什么都看不出来。因此这里额外打一个
+    ``rewrite.source.<llm|fastpath|original|drift_rejected>`` 计数器：
+    ``source=original`` 的占比就是"增强层没生效"的比率，能被监控看到。
+
+    （真正的实现体是 :func:`_rewrite_query_impl` —— 拆开是为了能在**所有**
+    出口统一记一笔，而不是在十几个 return 前各抄一遍。）
     """
+    result = await _rewrite_query_impl(query, history_messages)
+    try:
+        from app.services.monitoring_service import record_counter
+
+        record_counter(f"rewrite.source.{result.source or 'unknown'}")
+    except Exception:  # noqa: BLE001
+        # 监控是旁路，坏掉不能影响改写结果本身
+        pass
+    return result
+
+
+@timed_stage("query_rewrite")
+async def _rewrite_query_impl(
+    query: str,
+    history_messages: list[BaseMessage] | None = None,
+) -> RewriteResult:
+    """改写实现体：所有失败/回退分支都收敛到 RewriteResult(rewritten=query)."""
     settings = get_settings()
     history_messages = history_messages or []
 
@@ -349,7 +377,10 @@ async def rewrite_query(
             # 表现为"配置全开着、日志里却一条 rewrite 产物都没有"。
             reasoning=False,
             num_predict=768,          # rewritten+variants+subqueries+hyde，比原先长
-            num_ctx=min(4096, settings.OLLAMA_NUM_CTX),
+            # num_ctx 必须与生成节点一致：Ollama 会因 num_ctx 变化重载模型，
+            # 本机实测每次重载 ≈11s。改小并不省内存（峰值由生成节点决定），
+            # 只会让"辅助节点 ↔ 生成节点"来回交替时反复白等。见 config.chat_num_ctx。
+            num_ctx=settings.chat_num_ctx,
             format="json",            # 让 Ollama 保证输出是 JSON，省掉一轮解析失败
         )
         if has_history:

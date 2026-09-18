@@ -110,8 +110,20 @@ export function normalizeDocument(raw: Record<string, unknown>): Document {
     canPublishCompany: Boolean(
       pick<boolean>(raw, ["can_publish_company", "canPublishCompany"]) ?? false
     ),
+    canRequestDepartment: Boolean(
+      pick<boolean>(raw, ["can_request_department", "canRequestDepartment"]) ?? false
+    ),
+    canRequestCompany: Boolean(
+      pick<boolean>(raw, ["can_request_company", "canRequestCompany"]) ?? false
+    ),
     needsShareRequest: Boolean(
       pick<boolean>(raw, ["needs_share_request", "needsShareRequest"]) ?? false
+    ),
+    canTransferDepartment: Boolean(
+      pick<boolean>(raw, ["can_transfer_department", "canTransferDepartment"]) ?? false
+    ),
+    transferDeniedReason: String(
+      pick<string>(raw, ["transfer_denied_reason", "transferDeniedReason"]) ?? ""
     ),
     publishDeniedReason: String(
       pick<string>(raw, ["publish_denied_reason", "publishDeniedReason"]) ?? ""

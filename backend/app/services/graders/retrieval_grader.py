@@ -41,6 +41,7 @@ from app.config import get_settings
 from app.services.prompt_security import sanitize_document_context
 from app.services.retrieval_service import RetrievedChunk
 from app.utils.logging import get_logger
+from app.utils.timing import timed_stage
 
 logger = get_logger(__name__)
 
@@ -97,6 +98,7 @@ def _score_fallback_verdict(chunks: list[RetrievedChunk]) -> bool:
     return best >= settings.RERANK_MIN_SCORE
 
 
+@timed_stage("grader")
 async def grade_retrieval(
     query: str,
     chunks: list[RetrievedChunk],
@@ -137,7 +139,7 @@ async def grade_retrieval(
             # 因此关闭思考以保住 6s 超时预算。
             reasoning=False,
             num_predict=256,          # 需输出一个 verdicts 数组，比路由长
-            num_ctx=min(4096, settings.OLLAMA_NUM_CTX),
+            num_ctx=settings.chat_num_ctx,
         )
 
         # 每条证据截断，避免长文档把 prompt 撑爆（判定相关性看开头足够）。

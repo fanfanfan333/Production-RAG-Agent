@@ -56,8 +56,28 @@ export interface Document {
   canRequestDelete?: boolean;
   canPublishDepartment?: boolean;
   canPublishCompany?: boolean;
-  /** 是否必须走「申请共享」（普通员工对个人文档）。 */
+  /**
+   * 申请共享能力**按目标层级**下发（与 canPublish* 对同一层级互斥）。
+   *
+   * 部门负责人是典型形态：可直接发部门库、只能申请公司库 —— 二者不同层，
+   * 因此 canPublishDepartment 与 canRequestCompany 同时为真。界面不能再用
+   * "有任一发布权 → 隐藏申请入口"这种总布尔判断，否则他提不上去。
+   */
+  canRequestDepartment?: boolean;
+  canRequestCompany?: boolean;
+  /** 是否有任何一层需要走「申请共享」。 */
   needsShareRequest?: boolean;
+  /**
+   * 能否把这份文档**改归到指定部门**（公司级管理者：企业管理员 / 知识库管理员
+   * / 平台管理员）。与 canPublishDepartment 是两件事：后者发的是"我自己的
+   * 部门"，目标部门没有选择余地；本字段对应界面上的「转为部门文档」，由操作者
+   * 在「公司已有部门」清单里选定目标 —— 典型场景是 HR 把薪酬制度下沉给人力部。
+   *
+   * 只在文档已共享（部门库 / 公司库）时为真：个人库文档要先共享出去。
+   */
+  canTransferDepartment?: boolean;
+  /** 不能转为部门文档时的中文原因（个人库文档会带说明）。 */
+  transferDeniedReason?: string;
   publishDeniedReason?: string;
   /** 是否已有待审核的共享申请。 */
   pendingShareRequest?: boolean;
