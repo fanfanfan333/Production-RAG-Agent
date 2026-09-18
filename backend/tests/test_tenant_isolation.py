@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import sys
 import uuid
+from pathlib import Path
 
 _failures: list[str] = []
 
@@ -38,7 +39,15 @@ def check(name: str, condition: bool, detail: str = "") -> None:
         _failures.append(name)
 
 
+# ── pytest 门禁：让 check() 失败**真正** fail ─────────────────────────────────
+# check() 只 append 到 _failures，真正判定在 __main__ 的 sys.exit(1)；pytest 收集
+# 的 test_* 函数体不 raise ⇒ 全部 check 在 pytest 下形同虚设。下面用 module-scope
+# autouse fixture 在整份文件 teardown 时统一判定（定义在本块之后），既让 pytest 能
+# fail，又保留脚本模式"先收集全部失败再汇总退出"的诊断能力。
+
 try:
+    import pytest
+
     from app.services.tenancy import (
         ACCESS_DEPARTMENT,
         ACCESS_PRIVATE,
@@ -67,6 +76,16 @@ except ImportError as exc:  # 宿主机缺依赖 → 跳过（容器内已验证
     # 不能用 sys.exit()：pytest 在收集阶段导入本模块，抛 SystemExit 会让整个
     # 会话 INTERNALERROR，同目录其它用例全部跑不了。
     skip_module(f"missing dependency ({exc}) — run inside the backend container")
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _fail_module_if_any_check_failed():
+    """pytest 下让任何 check() 失败真正 fail（脚本模式仍走 __main__ 的汇总退出）。"""
+    yield
+    if _failures:
+        raise AssertionError(
+            f"check() 失败 {len(_failures)} 项:\n  - " + "\n  - ".join(_failures)
+        )
 
 
 # ── 测试替身 ──────────────────────────────────────────────────────────────────
@@ -337,12 +356,16 @@ def test_scoped_cache_key():
 
 def test_image_storage_layout(tmp_root=None):
     doc_id = str(uuid.uuid4())
+    # 每次运行随机租户 id：不受容器里历史残留目录影响（如历史上被 root 误建的
+    # uploads/tenant_A），也不会污染固定名 —— 让本测试可重现、可并跑。
+    tenant = f"t{uuid.uuid4().hex[:8]}"
+    other_tenant = f"t{uuid.uuid4().hex[:8]}"
     rel = image_relative_path(3, 1, "png")
     check("相对路径不含租户（payload 可移植）", rel == "images/page_3_image_1.png")
 
-    new_dir = document_dir(doc_id, tenant_id="tenant_A")
+    new_dir = document_dir(doc_id, tenant_id=tenant)
     check("新布局含租户级目录",
-          new_dir == storage_root() / "tenant_A" / doc_id,
+          new_dir == storage_root() / tenant / doc_id,
           str(new_dir))
     legacy_dir = document_dir(doc_id)
     check("旧布局无租户级目录", legacy_dir == storage_root() / doc_id)
@@ -353,14 +376,14 @@ def test_image_storage_layout(tmp_root=None):
 
     # 写入 → 新布局可解析；旧布局回退也可解析
     data = b"\x89PNG\r\n\x1a\n" + b"0" * 32
-    saved = save_image(doc_id, 3, 1, data, "png", tenant_id="tenant_A")
+    saved = save_image(doc_id, 3, 1, data, "png", tenant_id=tenant)
     check("save_image 返回相对路径", saved == rel)
-    resolved_new = resolve_image_path(doc_id, rel, tenant_id="tenant_A")
+    resolved_new = resolve_image_path(doc_id, rel, tenant_id=tenant)
     check("新布局解析命中", resolved_new is not None and resolved_new.is_file())
     resolved_scan = resolve_image_path(doc_id, rel)  # 不带租户 → 扫描回退
     check("不带租户时扫描回退命中", resolved_scan is not None)
 
-    traversal = resolve_image_path(doc_id, "../" * 5 + "etc/passwd", tenant_id="tenant_A")
+    traversal = resolve_image_path(doc_id, "../" * 5 + "etc/passwd", tenant_id=tenant)
     check("相对路径穿越被拒绝", traversal is None)
 
     legacy_doc = str(uuid.uuid4())
@@ -369,7 +392,7 @@ def test_image_storage_layout(tmp_root=None):
     check("旧布局解析命中",
           resolve_image_path(legacy_doc, saved_legacy) is not None)
     check("错租户不读到别的文件（回退到 legacy 命中同源文档）",
-          resolve_image_path(legacy_doc, saved_legacy, tenant_id="tenant_B") is not None)
+          resolve_image_path(legacy_doc, saved_legacy, tenant_id=other_tenant) is not None)
 
 
 def main() -> int:

@@ -18,10 +18,13 @@
 
 import sys
 import uuid
+from pathlib import Path
 
 print("── 三层知识库权限矩阵测试 ──")
 
 try:
+    import pytest
+
     from app.db.user_models import User
     from app.services.permissions import (
         ROLE_LABELS,
@@ -67,6 +70,22 @@ def check(label: str, condition: bool) -> None:
     else:
         print(f"  FAIL {label}")
         _failures.append(label)
+
+
+# ── pytest 门禁：让 check() 失败**真正** fail ─────────────────────────────────
+# 背景：check() 只 append 到 _failures，真正的失败判定在 __main__ 里 sys.exit(1)。
+# pytest 收集的是 test_* 函数，函数体没有 raise ⇒ 无论 check 过不过都报 passed，
+# 本文件全部 check 在 pytest 下等于"空气"（这些恰是本轮最核心的隔离断言）。
+# 这里用 module-scope 的 autouse fixture：整份文件全部 test_* 跑完后（teardown）
+# 统一判定 _failures —— 既让 pytest 能 fail，又保留脚本模式"先收集全部再汇总退出"
+# 的诊断能力（不在第一条失败就中断）。
+@pytest.fixture(autouse=True, scope="module")
+def _fail_module_if_any_check_failed():
+    yield
+    if _failures:
+        raise AssertionError(
+            f"check() 失败 {len(_failures)} 项:\n  - " + "\n  - ".join(_failures)
+        )
 
 
 class _StubUser:
@@ -241,10 +260,24 @@ def test_delete_permission_matrix():
     check("平台管理员：在**自建测试公司集合**内可删部门/公司库文档", ok)
     ok, _ = delete_permission_for(company_doc, platform_admin)
     check("平台管理员：对**非自建**公司不可删（收敛，不再跨全平台）", not ok)
-    ok, reason = delete_permission_for(personal, platform_admin)
+    # 生产路径：admin 在**自建测试公司集合**（这是它真实的可见范围）内遇到他人私库 ——
+    # 拒绝本身不能变，且要给出「个人库专属」文案（可读性/可解释性断言，强度不降）。
+    ok, reason = delete_permission_for(
+        personal, platform_admin,
+        tenant_ids=frozenset({"company_a"}),
+        owns_tenant_ids=frozenset({"company_a"}),
+    )
     check("平台管理员：**不能**删他人个人库文档（全平台 ≠ 看穿个人库）", not ok)
     check("平台管理员：拒绝原因说明个人库只属于归属人",
           "个人知识库" in reason)
+
+    # 保守兜底：**不传** tenant_ids 时 admin → 空集 fail-closed（防"漏传参数就回退
+    # 全平台"）⇒ 拒绝，且文案退化为「不存在」（不泄漏存在性）。两条路径都要有断言
+    # 保护：以后谁把 _default_tenant_ids_for 放宽或把 private 判定顺序改坏都会被抓。
+    ok_no_scope, reason_no_scope = delete_permission_for(personal, platform_admin)
+    check("平台管理员：漏传范围时按 fail-closed 拒绝（不回退全平台）", not ok_no_scope)
+    check("平台管理员：漏传范围时不泄漏存在性（按'不存在'表述）",
+          "不存在" in reason_no_scope)
 
 
 def test_delete_follows_tier_not_ownership():

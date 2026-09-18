@@ -22,6 +22,7 @@ PaddleOCR 只读出 3 个节点名，Vision（qwen2.5vl）读出了完整描述�
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
 _failures: list[str] = []
 
@@ -34,6 +35,8 @@ def check(name: str, condition: bool, detail: str = "") -> None:
 
 
 try:
+    import pytest
+
     from app.services.image_understanding.confidence import gate
     from app.services.image_understanding.engines.base import EngineOutput
     from app.services.image_understanding.quality import (
@@ -48,6 +51,16 @@ except ImportError as exc:      # 宿主机缺依赖 → 跳过（容器内已�
     # 不能用 sys.exit()：pytest 在收集阶段导入本模块，抛 SystemExit 会让整个
     # 会话 INTERNALERROR，同目录其它用例全部跑不了。
     skip_module(f"missing dependency ({exc}) — run inside the backend container")
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _fail_module_if_any_check_failed():
+    """pytest 下让任何 check() 失败真正 fail（脚本模式仍走 __main__ 的汇总退出）。"""
+    yield
+    if _failures:
+        raise AssertionError(
+            f"check() 失败 {len(_failures)} 项:\n  - " + "\n  - ".join(_failures)
+        )
 
 
 # 实测那条被误判的 VLM 原文（带列表编号）
