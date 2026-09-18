@@ -150,13 +150,14 @@ async def run_evaluation(
     )
 
     # 检索作用域跟随调用者：普通用户只评自己可见的知识库，避免评测变成
-    # 一条越权读取他人文档的旁路。三层隔离下锁定公司 + 部门 ACL，
-    # 平台管理员跨公司评测但也**不含**他人的个人库。
-    from app.services.tenancy import scope_for
+    # 一条越权读取他人文档的旁路。三层隔离下锁定公司集合 + 部门 ACL，
+    # 平台管理员在**自建测试公司集合**内评测但**不含**他人的个人库。
+    from app.services.tenancy import home_tenant_id, request_scope
 
-    scope = scope_for(user)
+    scope = await request_scope(user)
     owner_id = str(scope.owner_id) if scope.owner_id else None
-    tenant_id = scope.tenant_id
+    # 评测记录（第三层归属键）另用单一公司标识：admin 无归属公司 → None
+    tenant_id = home_tenant_id(user)
     department_id = scope.department_id
     collection_id = payload.collection_id
 
@@ -166,10 +167,10 @@ async def run_evaluation(
             top_k=top_k,
             owner_id=owner_id,
             collection_id=collection_id,
-            tenant_id=tenant_id,
+            tenant_ids=scope.tenant_ids,
             user_department_id=department_id,
             tenant_wide=scope.tenant_wide,
-            platform_wide=scope.platform_wide,
+            owns_tenant_ids=scope.owns_tenant_ids,
         )
         return [item_from_chunk(c) for c in chunks]
 

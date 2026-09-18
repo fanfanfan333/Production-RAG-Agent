@@ -262,7 +262,11 @@ async def create_delete_request(
         can_request_delete,
         delete_permission_for,
         normalize_access_level,
+        request_scope,
     )
+
+    # 可见范围（公司集合 + 自建测试公司）—— 三层隔离的唯一来源，供删除权判定使用
+    scope = await request_scope(user)
 
     async with get_db_session() as session:
         doc = (
@@ -271,16 +275,23 @@ async def create_delete_request(
         if doc is None:
             raise ShareError("文档不存在或已被删除", status_code=404)
 
-        if normalize_tenant_id(doc.tenant_id) != effective_tenant_id(user):
-            raise ShareError("文档不存在或无权访问", status_code=404)
-
-        allowed, deny_reason = delete_permission_for(doc, user)
+        # 跨公司 / 看不到一律 404（不泄漏存在性）：边界判定统一交给能力函数，
+        # 不再用单值 `doc.tenant_id == 我的租户`（那会把 admin 的自建集合误判成跨公司）。
+        allowed, deny_reason = delete_permission_for(
+            doc, user,
+            tenant_ids=scope.tenant_ids,
+            owns_tenant_ids=scope.owns_tenant_ids,
+        )
         if allowed:
             raise ShareError(
                 "你有权直接删除该文档，无需提交申请", status_code=409
             )
 
-        if not can_request_delete(doc, user):
+        if not can_request_delete(
+            doc, user,
+            tenant_ids=scope.tenant_ids,
+            owns_tenant_ids=scope.owns_tenant_ids,
+        ):
             # 个人库他人文档：连可见性都没有，不能拿它当探测接口
             raise ShareError("文档不存在或无权访问", status_code=404)
 
@@ -515,11 +526,19 @@ async def review_request(
             PermissionDenied as _DocPermissionDenied,
             delete_document as _delete_document,
         )
+        from app.services.tenancy import request_scope as _request_scope
 
         if document_id is None:
             raise ShareError("该文档已被删除，无需审核", status_code=409)
+        # 审核人自己的可见范围（公司集合 + 自建测试公司）—— 删除权判定必须带它
+        reviewer_scope = await _request_scope(reviewer)
         try:
-            await _delete_document(document_id, actor=reviewer)
+            await _delete_document(
+                document_id,
+                actor=reviewer,
+                tenant_ids=reviewer_scope.tenant_ids,
+                owns_tenant_ids=reviewer_scope.owns_tenant_ids,
+            )
             deleted = {"document_id": str(document_id), "document_name": document_name}
         except KeyError:
             # 文档已不在（别人先删了 / 重复审核）——按"目的已达成"处理，

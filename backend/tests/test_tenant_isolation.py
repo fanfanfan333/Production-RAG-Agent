@@ -140,7 +140,8 @@ def test_effective_tenant():
 def test_bm25_scroll_prefilter():
     """BM25 语料 scroll 必须带租户前置过滤（不是事后剔除）."""
     client = _FakeQdrantClient()
-    _run(_scroll_corpus(client, "documents", None, 10, tenant_id="company_A"))
+    _run(_scroll_corpus(client, "documents", None, 10,
+                        tenant_ids=frozenset({"company_A"})))
     f = client.scroll_filter
     check("scroll_filter 非空", f is not None)
     must = list(getattr(f, "must", None) or [])
@@ -150,9 +151,27 @@ def test_bm25_scroll_prefilter():
     check("tenant 值正确", cond.match.value == "company_A")
 
 
+def test_bm25_scroll_fail_closed_on_empty_set():
+    """空集 fail-closed：没有可访问公司时语料为空，绝不退化成'不限制'."""
+    client = _FakeQdrantClient()
+    corpus = _run(_scroll_corpus(client, "documents", None, 10, tenant_ids=frozenset()))
+    check("空租户集合 → 空语料", corpus == [])
+    check("空租户集合 → 未发起 scroll", client.scroll_filter is None)
+
+
+def test_bm25_scroll_multi_tenant_match_any():
+    """多公司集合 → MatchAny（admin 自建测试公司集合用得上）."""
+    client = _FakeQdrantClient()
+    _run(_scroll_corpus(client, "documents", None, 10,
+                        tenant_ids=frozenset({"company_A", "company_B"})))
+    cond = next(c for c in client.scroll_filter.must if c.key == "tenant_id")
+    check("多公司用 MatchAny", getattr(cond.match, "any", None) == ["company_A", "company_B"])
+
+
 def test_bm25_scroll_tenant_plus_collection():
     client = _FakeQdrantClient()
-    _run(_scroll_corpus(client, "documents", "col-1", 10, tenant_id="company_B"))
+    _run(_scroll_corpus(client, "documents", "col-1", 10,
+                        tenant_ids=frozenset({"company_B"})))
     keys = [c.key for c in client.scroll_filter.must]
     check("tenant + collection 双过滤",
           "tenant_id" in keys and "collection_id" in keys, f"keys={keys}")
@@ -249,13 +268,28 @@ def test_can_access_document():
     check("department：无部门用户不可见", not can_access_document(dept_doc, bob))
     check("跨租户一律拒绝（即使 tenant 共享）",
           not can_access_document(other_tenant_doc, alice))
-    check("admin 跨租户可见公司库（平台管理员的跨公司能力）",
-          can_access_document(other_tenant_doc, admin))
-    check("admin 跨租户**看不到**他人个人库",
+    # Rev2：admin 不再"跨全平台"，可见范围收敛为**自建测试公司集合**（按 created_by 锁定）。
+    check("admin 对**非自建**公司不可见（收敛，不再跨全平台）",
+          not can_access_document(other_tenant_doc, admin))
+    check("admin 在**自建测试公司集合**内可见公司库",
+          can_access_document(
+              other_tenant_doc, admin,
+              tenant_ids=frozenset({"company_B"}),
+              owns_tenant_ids=frozenset({"company_B"}),
+          ))
+    check("admin 跨租户**看不到**他人个人库（无 owns 例外时）",
           not can_access_document(
               _StubDoc(owner_id=bob.id, tenant_id="company_A",
                        access_level=ACCESS_PRIVATE),
               admin,
+          ))
+    check("admin 在自建集合内可见他人私库（owns 例外，Rev2）",
+          can_access_document(
+              _StubDoc(owner_id=bob.id, tenant_id="company_B",
+                       access_level=ACCESS_PRIVATE),
+              admin,
+              tenant_ids=frozenset({"company_B"}),
+              owns_tenant_ids=frozenset({"company_B"}),
           ))
     check("老数据(NULL)按 private：本人可见", can_access_document(legacy_doc, alice))
     check("老数据(NULL)按 private：他人不可见", not can_access_document(legacy_doc, bob))
@@ -268,24 +302,37 @@ def test_can_access_document():
 # ═════════════════════════════════════════════════════════════════════════════
 
 def test_scoped_cache_key():
+    from app.services.tenancy import tenant_scope_fingerprint
+
     u1 = _StubUser(tenant_id="company_A")
     u2 = _StubUser(tenant_id="company_A")
-    ctx1 = permission_context(u1)
-    ctx2 = permission_context(u2)
+    set_a = frozenset({"company_A"})
+    set_b = frozenset({"company_B"})
+    ctx1 = permission_context(u1, tenant_ids=set_a)
+    ctx2 = permission_context(u2, tenant_ids=set_a)
 
-    k_a = scoped_cache_key("company_A", ctx1, "query:报销流程")
-    k_b = scoped_cache_key("company_B", ctx1, "query:报销流程")
-    check("同键不同租户 → 不同缓存键", k_a != k_b)
-    check("缓存键含租户前缀", k_a.startswith("company_A::"))
+    k_a = scoped_cache_key(set_a, ctx1, "query:报销流程")
+    k_b = scoped_cache_key(set_b, ctx1, "query:报销流程")
+    check("同键不同租户集合 → 不同缓存键", k_a != k_b)
+    check("缓存键含租户集合指纹",
+          k_a.startswith(tenant_scope_fingerprint(set_a) + "::"))
 
-    k_a2 = scoped_cache_key("company_A", ctx2, "query:报销流程")
+    k_a2 = scoped_cache_key(set_a, ctx2, "query:报销流程")
     check("同租户不同权限上下文 → 不同缓存键", k_a != k_a2)
 
-    same = scoped_cache_key("company_A", ctx1, "query:报销流程")
+    same = scoped_cache_key(set_a, ctx1, "query:报销流程")
     check("同租户同上下文同查询 → 键稳定", k_a == same)
 
-    evil = scoped_cache_key("../../x", ctx1, "q")
-    check("非法租户被归一后入键", evil.startswith(f"{DEFAULT_TENANT_ID}::"))
+    # Rev2 第三层：三态互异 —— None（诊断"全库"）/ 空集（fail-closed）/ 非空集合
+    check("空集指纹 == 'none'", tenant_scope_fingerprint(frozenset()) == "none")
+    check("None 指纹 == 'all'", tenant_scope_fingerprint(None) == "all")
+    check("空集与 None 指纹不同",
+          tenant_scope_fingerprint(frozenset()) != tenant_scope_fingerprint(None))
+
+    # 同 owner、异租户集合 → 不同权限上下文（换租户/新建测试公司 → 缓存自然失效）
+    check("同 owner、异租户集合 → 不同权限上下文",
+          permission_context(u1, tenant_ids=set_a)
+          != permission_context(u1, tenant_ids=set_b))
 
 
 def test_image_storage_layout(tmp_root=None):

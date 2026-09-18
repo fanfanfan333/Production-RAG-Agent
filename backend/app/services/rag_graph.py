@@ -164,8 +164,14 @@ class RAGState(TypedDict):
     conversation_id: str           # always a str; uuid.UUID is not JSON-serialisable
     history_messages: list[BaseMessage]
     top_k: int
-    owner_id: str | None           # multi-user isolation (None = admin/all)
+    owner_id: str | None           # 个人库归属人（恒为本人 id）
     collection_id: str | None      # KB collection filter (None = all)
+    # 三层隔离（第一层公司集合 + 第二层部门 ACL），由 tenancy.request_scope 组装。
+    # None 仅表示「按身份推导（fail-closed）」，绝不回退全平台。
+    tenant_ids: frozenset[str] | None
+    owns_tenant_ids: frozenset[str]
+    department_id: str | None
+    tenant_wide: bool
     rewritten_query: str           # 指代消解后的自包含检索查询
     query_variants: list[str]      # 多查询扩展变体（多路召回）
     query_extra: list[str]         # 子问题 + 变体，进向量腿与关键词腿
@@ -181,7 +187,12 @@ class RelationState(TypedDict):
     query: str
     conversation_id: str
     history_messages: list[BaseMessage]
-    owner_id: str | None           # multi-user isolation (None = admin/all)
+    owner_id: str | None           # 个人库归属人（恒为本人 id）
+    # 三层隔离：公司集合 + 部门 ACL（见 RAGState 同名字段说明）
+    tenant_ids: frozenset[str] | None
+    owns_tenant_ids: frozenset[str]
+    department_id: str | None
+    tenant_wide: bool
     digests: list[dict]            # serialised DocumentDigest dicts
     answer: str
 
@@ -303,6 +314,12 @@ async def _retrieve_node(state: RAGState) -> dict:
         top_k=state["top_k"],
         owner_id=state.get("owner_id"),
         collection_id=state.get("collection_id"),
+        # 三层隔离：第一层公司集合 + 第二层部门 ACL（与 master_graph 同规则）。
+        # tenant_ids=None（漏传）会被 retrieve_chunks fail-closed 拒绝，绝不越权。
+        tenant_ids=state.get("tenant_ids"),
+        user_department_id=state.get("department_id"),
+        tenant_wide=bool(state.get("tenant_wide")),
+        owns_tenant_ids=state.get("owns_tenant_ids") or frozenset(),
         extra_queries=state.get("query_extra") or state.get("query_variants"),
         extra_vector_queries=(
             [state["query_hyde"]] if state.get("query_hyde") else None
@@ -471,7 +488,13 @@ async def _collect_digests_node(state: RelationState) -> dict:
         digests — serialised DocumentDigest dicts, emitted in the SSE
                   ``doc_digests`` event before any generated token.
     """
-    digests = await collect_document_digests(owner_id=state.get("owner_id"))
+    digests = await collect_document_digests(
+        owner_id=state.get("owner_id"),
+        tenant_ids=state.get("tenant_ids"),
+        user_department_id=state.get("department_id"),
+        tenant_wide=bool(state.get("tenant_wide")),
+        owns_tenant_ids=state.get("owns_tenant_ids") or frozenset(),
+    )
     logger.info(
         "collect_digests_node: %d document digests for query=%r",
         len(digests),
@@ -749,18 +772,19 @@ async def _stream_graph_events(
 async def _list_completed_documents(
     owner_id: str | None,
     collection_id: str | None,
-    tenant_id: str | None = None,
+    tenant_ids: frozenset[str] | None = None,
     user_department_id: str | None = None,
     tenant_wide: bool = False,
-    platform_wide: bool = False,
+    owns_tenant_ids: frozenset[str] = frozenset(),
 ) -> list[dict]:
     """
     List every completed document visible to the caller, most recent first.
 
-    Same visibility rules as retrieval: 第一层公司过滤 + 第二层 Document ACL；
-    平台管理员（platform_wide）跳过公司过滤但仍然看不到别人的个人库。
+    与检索同一套可见性规则（唯一 SQL 组装点 ``document_scope_clause``）：
+    可见集 = 公司边界（tenant ∈ 集合 ∧ ACL）∪ 自己的个人库。
+    ``tenant_ids=None`` 只表示"按身份推导"，绝不回退全平台。
     """
-    from app.services.tenancy import document_acl_clause, normalize_tenant_id
+    from app.services.tenancy import document_scope_clause
 
     async with get_db_session() as session:
         stmt = (
@@ -773,18 +797,19 @@ async def _list_completed_documents(
             .where(Document.status == DocumentStatus.COMPLETED)
             .order_by(Document.created_at.desc())
         )
-        if tenant_id and not platform_wide:
-            stmt = stmt.where(Document.tenant_id == normalize_tenant_id(tenant_id))
-        elif not platform_wide and owner_id:
-            # 无公司上下文的历史调用：退化为"仅本人"
-            stmt = stmt.where(Document.owner_id == uuid.UUID(owner_id))
-        if platform_wide or tenant_id or owner_id:
+        if (
+            owner_id is not None
+            or tenant_ids is not None
+            or tenant_wide
+            or owns_tenant_ids
+        ):
             stmt = stmt.where(
-                document_acl_clause(
+                document_scope_clause(
                     owner_id=uuid.UUID(owner_id) if owner_id else None,
                     department_id=user_department_id,
+                    tenant_ids=tenant_ids,
+                    owns_tenant_ids=owns_tenant_ids,
                     tenant_wide=tenant_wide,
-                    platform_wide=platform_wide,
                 )
             )
         if collection_id:
@@ -807,11 +832,12 @@ async def stream_document_list(
     conversation_id: str,
     owner_id: str | None = None,
     collection_id: str | None = None,
-    tenant_id: str | None = None,
+    tenant_ids: frozenset[str] | None = None,
     user_department_id: str | None = None,
     user_id: str | None = None,
     tenant_wide: bool = False,
-    platform_wide: bool = False,
+    owns_tenant_ids: frozenset[str] = frozenset(),
+    conversation_tenant_id: str | None = None,
 ) -> AsyncGenerator[dict, None]:
     """
     Answer "知识库里有哪些文档" questions deterministically — no LLM, no
@@ -820,12 +846,15 @@ async def stream_document_list(
     Reads completed documents straight from PostgreSQL and streams the
     formatted list as chunk events, then reports done. An empty knowledge
     base is answered honestly with "还没有文档".
+
+    ``tenant_ids`` / ``owns_tenant_ids`` 是文档可见性口径（第一层 + 个人库）；
+    ``conversation_tenant_id`` 只是第三层会话归属键（与可见性解耦）。
     """
     try:
         docs = await _list_completed_documents(
             owner_id, collection_id,
-            tenant_id=tenant_id, user_department_id=user_department_id,
-            tenant_wide=tenant_wide, platform_wide=platform_wide,
+            tenant_ids=tenant_ids, user_department_id=user_department_id,
+            tenant_wide=tenant_wide, owns_tenant_ids=owns_tenant_ids,
         )
     except Exception as exc:
         logger.exception("stream_document_list: DB query failed: %s", exc)
@@ -857,7 +886,7 @@ async def stream_document_list(
             user_message=query,
             assistant_message=answer,
             user_id=uuid.UUID(user_id) if user_id else None,
-            tenant_id=tenant_id,
+            tenant_id=conversation_tenant_id,
         )
     except Exception as exc:
         logger.warning(
@@ -887,6 +916,10 @@ async def stream_rag(
     top_k: int,
     owner_id: str | None = None,
     collection_id: str | None = None,
+    tenant_ids: frozenset[str] | None = None,
+    owns_tenant_ids: frozenset[str] = frozenset(),
+    department_id: str | None = None,
+    tenant_wide: bool = False,
 ) -> AsyncGenerator[dict, None]:
     """
     Execute the RAG graph and yield typed event dicts for the SSE layer.
@@ -903,9 +936,12 @@ async def stream_rag(
         conversation_id:   String UUID of the active conversation.
         history_messages:  Previous turns as LangChain messages.
         top_k:             Chunks to retrieve.
-        owner_id:          Restrict retrieval to this user's documents
-                           (None = admin / unrestricted).
+        owner_id:          个人库归属人（恒为本人 id；None = 看不到任何个人库）。
         collection_id:     Restrict retrieval to one KB collection.
+        tenant_ids:        第一层公司过滤集合（None = 按身份推导，fail-closed）。
+        owns_tenant_ids:   「可见他人 private」的租户集合（仅 admin = 自建测试公司）。
+        department_id:     第二层部门 ACL 条件。
+        tenant_wide:       本租户内部门库全通（企业/知识库管理员 / admin）。
     """
     initial_state: RAGState = {
         "query": query,
@@ -914,6 +950,10 @@ async def stream_rag(
         "top_k": top_k,
         "owner_id": owner_id,
         "collection_id": collection_id,
+        "tenant_ids": tenant_ids,
+        "owns_tenant_ids": owns_tenant_ids,
+        "department_id": department_id,
+        "tenant_wide": tenant_wide,
         "rewritten_query": "",
         "query_variants": [],
         "query_extra": [],
@@ -934,6 +974,10 @@ async def stream_doc_relations(
     conversation_id: str,
     history_messages: list[BaseMessage],
     owner_id: str | None = None,
+    tenant_ids: frozenset[str] | None = None,
+    owns_tenant_ids: frozenset[str] = frozenset(),
+    department_id: str | None = None,
+    tenant_wide: bool = False,
 ) -> AsyncGenerator[dict, None]:
     """
     Execute the cross-document relation graph (问题1) and yield SSE events.
@@ -947,6 +991,10 @@ async def stream_doc_relations(
         "conversation_id": conversation_id,
         "history_messages": history_messages,
         "owner_id": owner_id,
+        "tenant_ids": tenant_ids,
+        "owns_tenant_ids": owns_tenant_ids,
+        "department_id": department_id,
+        "tenant_wide": tenant_wide,
         "digests": [],
         "answer": "",
     }

@@ -398,9 +398,21 @@ async def resync_document_acl_payload(
     return applied
 
 
-def publish_capability(user, doc) -> dict:
+def publish_capability(
+    user,
+    doc,
+    *,
+    tenant_ids: frozenset[str] | None = None,
+    owns_tenant_ids: frozenset[str] = frozenset(),
+) -> dict:
     """
     描述 *user* 对 *doc* 的层级操作能力（前端按钮 + 后端校验共用）.
+
+    Args:
+        user:  操作者。
+        doc:   目标文档。
+        tenant_ids:      第一层公司集合（用于删除权判定里的公司边界）。
+        owns_tenant_ids: admin 自建测试公司集合（可读他人私库，但不可删）。
 
     返回：
         {
@@ -501,9 +513,21 @@ def publish_capability(user, doc) -> dict:
     )
     needs_request = can_request_dept or can_request_company
 
-    allowed, reason = delete_permission_for(doc, user) if user is not None else (False, "未登录")
+    allowed, reason = (
+        delete_permission_for(
+            doc, user, tenant_ids=tenant_ids, owns_tenant_ids=owns_tenant_ids
+        )
+        if user is not None
+        else (False, "未登录")
+    )
     # 自己没有删除权但看得见 → 走「申请删除」，由上级同意或拒绝
-    request_delete = can_request_delete(doc, user) if user is not None else False
+    request_delete = (
+        can_request_delete(
+            doc, user, tenant_ids=tenant_ids, owns_tenant_ids=owns_tenant_ids
+        )
+        if user is not None
+        else False
+    )
 
     if not (can_dept_role or can_company_role):
         publish_reason = (

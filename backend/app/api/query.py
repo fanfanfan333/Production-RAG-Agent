@@ -149,21 +149,24 @@ async def _generate_sse(
     and, when *collection_id* is set, to one knowledge-base collection.
     """
     # ── 1+2. Conversation setup (owner + tenant scoped) ───────────────────────
-    from app.services.tenancy import scope_for
+    from app.services.tenancy import home_tenant_id, request_scope
 
-    # 可见范围一处组装：平台管理员 = 全平台（跨公司部门库/公司库，但看不到
-    # 别人的个人库）；其他人 = 本公司内 个人 + 本部门 + 公司库。
-    scope = scope_for(user)
+    # 可见范围一处组装：平台管理员 = 自建测试公司集合（含其中他人私库，但
+    # 看不到别公司文档）；其他人 = 本公司内 个人 + 本部门 + 公司库。
+    scope = await request_scope(user)
     # 个人库归属**恒为本人**（含平台管理员）：owner_id 不再是"None = admin 全览"，
     # 因此这里必须是 user.id，否则管理员会连自己的个人库都检索不到。
     owner = scope.owner_id
-    tenant = scope.tenant_id
+    # 第三层（会话归属）用单一公司键：admin 无归属公司 → None（与改造前一致）
+    conversation_tenant = home_tenant_id(user)
     department = scope.department_id
     try:
         conv_id = await get_or_create_conversation(
-            conversation_id, owner_id=owner, tenant_id=tenant,
+            conversation_id, owner_id=owner, tenant_id=conversation_tenant,
         )
-        history = await load_history(conv_id, owner_id=owner, tenant_id=tenant)
+        history = await load_history(
+            conv_id, owner_id=owner, tenant_id=conversation_tenant
+        )
     except Exception as exc:
         logger.exception("Conversation setup failed: %s", exc)
         yield _sse({"type": "error", "message": f"Conversation setup failed: {exc}"})
@@ -181,11 +184,12 @@ async def _generate_sse(
             conversation_id=str(conv_id),
             owner_id=str(owner) if owner else None,
             collection_id=str(collection_id) if collection_id else None,
-            tenant_id=tenant,
+            tenant_ids=scope.tenant_ids,
             user_department_id=department,
             user_id=str(user.id),
             tenant_wide=scope.tenant_wide,
-            platform_wide=scope.platform_wide,
+            owns_tenant_ids=scope.owns_tenant_ids,
+            conversation_tenant_id=conversation_tenant,
         )
     else:
         # 其余全部交给 master graph：
@@ -203,12 +207,13 @@ async def _generate_sse(
             # 因此单独传真实用户身份（与检索权限解耦）。
             user_id=str(user.id),
             username=user.username,
-            # 三层隔离：第一层公司前置过滤 + 第二层部门 ACL + 第三层会话归属。
-            # tenant_id=None 仅表示"跨公司"（平台管理员），仍受 ACL 约束。
-            tenant_id=tenant,
+            # 三层隔离：第一层公司集合前置过滤 + 第二层部门 ACL + 第三层会话归属。
+            # tenant_ids=None 仅表示"按身份推导（fail-closed）"，绝不回退全平台。
+            tenant_ids=scope.tenant_ids,
             department_id=department,
             tenant_wide=scope.tenant_wide,
-            platform_wide=scope.platform_wide,
+            owns_tenant_ids=scope.owns_tenant_ids,
+            conversation_tenant_id=conversation_tenant,
         )
 
     try:

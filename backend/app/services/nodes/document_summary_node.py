@@ -83,19 +83,20 @@ _OVERVIEW_SYSTEM = """\
 
 async def collect_summary_digests(
     owner_id: str | None = None,
-    tenant_id: str | None = None,
+    tenant_ids: frozenset[str] | None = None,
+    owns_tenant_ids: frozenset[str] = frozenset(),
     user_department_id: str | None = None,
     tenant_wide: bool = False,
-    platform_wide: bool = False,
     document_ids: list[str] | None = None,
 ) -> list[dict]:
     """
     拉取全库文档摘要（供 Document Summary 分支使用）.
 
     复用 relation_service 的采样逻辑 —— 采样策略、权限过滤、上限控制
-    全部沿用，不重复实现。tenant_id / user_department_id 是三层隔离的
-    第一、二层过滤（摘要同样不能跨公司泄漏）；tenant_wide / platform_wide
-    把管理员的宽口径范围原样传下去，**个人库始终只有本人**。
+    全部沿用，不重复实现。tenant_ids / user_department_id 是三层隔离的
+    第一、二层过滤（摘要同样不能跨公司泄漏）；tenant_wide 把管理员的宽口径
+    范围原样传下去，owns_tenant_ids 表达 admin 自建测试公司集合（可见其中
+    他人私库），**个人库始终只有本人（+ admin 自建集合例外）**。
 
     document_ids 非空时只采样这几份文档（用户在提问里点名了）。
     整库总结的文档数上限用 DOC_SUMMARY_MAX_DOCUMENTS（map-reduce 的等待
@@ -111,10 +112,10 @@ async def collect_summary_digests(
             settings.DOC_SUMMARY_MAX_CHARS_PER_DOC,
         ),
         owner_id=owner_id,
-        tenant_id=tenant_id,
+        tenant_ids=tenant_ids,
+        owns_tenant_ids=owns_tenant_ids,
         user_department_id=user_department_id,
         tenant_wide=tenant_wide,
-        platform_wide=platform_wide,
         document_ids=document_ids,
     )
     logger.info(

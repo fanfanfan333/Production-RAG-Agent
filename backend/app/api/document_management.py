@@ -40,7 +40,7 @@ from app.services.tenancy import (
     can_access_document,
     effective_department_id,
     effective_tenant_id,
-    scope_for,
+    request_scope,
 )
 from app.utils.errors import clean_message
 from app.utils.logging import get_logger
@@ -87,10 +87,19 @@ async def list_documents_endpoint(
             description="只列出某一层知识库：private=个人 / department=部门 / tenant=公司",
         ),
     ] = None,
+    company_id: Annotated[
+        str | None,
+        Query(
+            description=(
+                "只列出归属某家公司的文档（文档页公司筛选）。取值来自 "
+                "`GET /companies/accessible`；超出可见范围的取值返回空集。"
+            )
+        ),
+    ] = None,
 ) -> DocumentListResponse:
-    # 可见范围由 tenancy.scope_for 一处组装（平台管理员 = 全平台，但仍看不到
-    # 别人的个人库；其他人 = 本公司内个人 + 本部门 + 公司库）。
-    scope = scope_for(user)
+    # 可见范围由 tenancy.request_scope 一处组装（平台管理员 = 自建测试公司集合，
+    # 仍看不到别公司文档与他人个人库；其他人 = 本公司内个人 + 本部门 + 公司库）。
+    scope = await request_scope(user)
 
     return await list_documents(
         page=page,
@@ -98,12 +107,14 @@ async def list_documents_endpoint(
         status=status,
         owner_id=scope.owner_id,
         collection_id=collection_id,
-        # 三层隔离：列表与检索同规则（公司 + ACL），共享文档按层级可见
-        tenant_id=scope.tenant_id,
+        # 三层隔离：列表与检索同规则（公司集合 + ACL），共享文档按层级可见
+        tenant_ids=scope.tenant_ids,
         user_department_id=scope.department_id,
         # 企业/知识库管理员可读本公司全部部门库（审核共享申请需要）
-        read_all=scope.tenant_wide,
-        platform_wide=scope.platform_wide,
+        tenant_wide=scope.tenant_wide,
+        owns_tenant_ids=scope.owns_tenant_ids,
+        # 文档页公司筛选：只保留归属该公司的文档（仍受可见范围上限约束）
+        company_id=company_id,
         # 逐条算出 is_owner / can_delete / 发布能力，前端按钮与后端校验同源
         viewer=user,
         access_level=access_level,
@@ -172,12 +183,13 @@ async def delete_document_endpoint(
     ],
     user: Annotated[User, Depends(require_permission("document.read"))],
 ) -> DocumentDeleteResponse:
-    scope = scope_for(user)
+    scope = await request_scope(user)
     try:
         result = await delete_document(
             document_id,
             owner_id=scope.owner_id,
-            tenant_id=scope.tenant_id,
+            tenant_ids=scope.tenant_ids,
+            owns_tenant_ids=scope.owns_tenant_ids,
             actor=user,
         )
     except KeyError as exc:
@@ -226,15 +238,15 @@ async def get_document_chunks_endpoint(
     document_id: uuid.UUID,
     user: Annotated[User, Depends(require_permission("document.read"))],
 ) -> dict:
-    scope = scope_for(user)
+    scope = await request_scope(user)
     try:
         return await get_document_chunks(
             document_id,
             owner_id=scope.owner_id,
-            tenant_id=scope.tenant_id,
+            tenant_ids=scope.tenant_ids,
+            owns_tenant_ids=scope.owns_tenant_ids,
             user_department_id=scope.department_id,
-            read_all=scope.tenant_wide,
-            platform_wide=scope.platform_wide,
+            tenant_wide=scope.tenant_wide,
         )
     except KeyError as exc:
         raise HTTPException(
@@ -289,11 +301,16 @@ async def update_document_visibility_endpoint(
     )
 
     # 先取文档做可见性 + 能力判定（404 不泄漏存在性）
+    scope = await request_scope(user)
     async with get_db_session() as session:
         doc = (
             await session.execute(select(Document).where(Document.id == document_id))
         ).scalar_one_or_none()
-    if doc is None or not can_access_document(doc, user):
+    if doc is None or not can_access_document(
+        doc, user,
+        tenant_ids=scope.tenant_ids,
+        owns_tenant_ids=scope.owns_tenant_ids,
+    ):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="文档不存在或无权访问"
         )
@@ -354,7 +371,11 @@ async def update_document_visibility_endpoint(
         "access_level": updated.access_level,
         "access_label": access_label(updated.access_level),
         "department_id": updated.department_id,
-        "capability": publish_capability(user, updated),
+        "capability": publish_capability(
+            user, updated,
+            tenant_ids=scope.tenant_ids,
+            owns_tenant_ids=scope.owns_tenant_ids,
+        ),
         "message": (
             f"已{'发布到' if body.access_level != 'private' else '收回至'}"
             f"{access_label(body.access_level)}知识库"
@@ -409,11 +430,16 @@ async def document_transfer_targets_endpoint(
     from app.services.permissions import has_permission
 
     # 可见性先行：跨公司/看不见的文档一律 404（不泄漏存在性），再谈权限。
+    scope = await request_scope(user)
     async with get_db_session() as session:
         doc = (
             await session.execute(select(Document).where(Document.id == document_id))
         ).scalar_one_or_none()
-    if doc is None or not can_access_document(doc, user):
+    if doc is None or not can_access_document(
+        doc, user,
+        tenant_ids=scope.tenant_ids,
+        owns_tenant_ids=scope.owns_tenant_ids,
+    ):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="文档不存在或无权访问"
         )
@@ -427,7 +453,11 @@ async def document_transfer_targets_endpoint(
             ),
         )
 
-    capability = publish_capability(user, doc)
+    capability = publish_capability(
+        user, doc,
+        tenant_ids=scope.tenant_ids,
+        owns_tenant_ids=scope.owns_tenant_ids,
+    )
     options = await list_department_options(getattr(doc, "tenant_id", None))
     current_dept = (doc.department_id or "").strip()
 
@@ -472,11 +502,16 @@ async def transfer_document_department_endpoint(
     from app.services.permissions import has_permission
     from app.services.tenancy import access_label
 
+    scope = await request_scope(user)
     async with get_db_session() as session:
         doc = (
             await session.execute(select(Document).where(Document.id == document_id))
         ).scalar_one_or_none()
-    if doc is None or not can_access_document(doc, user):
+    if doc is None or not can_access_document(
+        doc, user,
+        tenant_ids=scope.tenant_ids,
+        owns_tenant_ids=scope.owns_tenant_ids,
+    ):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="文档不存在或无权访问"
         )
@@ -490,7 +525,11 @@ async def transfer_document_department_endpoint(
             ),
         )
 
-    capability = publish_capability(user, doc)
+    capability = publish_capability(
+        user, doc,
+        tenant_ids=scope.tenant_ids,
+        owns_tenant_ids=scope.owns_tenant_ids,
+    )
     if not capability["can_transfer_department"]:
         # 个人库文档：先共享再谈归属（见 publish_capability 的判定注释）
         raise HTTPException(
@@ -527,7 +566,11 @@ async def transfer_document_department_endpoint(
         "access_label": access_label(updated.access_level),
         "department_id": updated.department_id,
         "department_name": target_name,
-        "capability": publish_capability(user, updated),
+        "capability": publish_capability(
+            user, updated,
+            tenant_ids=scope.tenant_ids,
+            owns_tenant_ids=scope.owns_tenant_ids,
+        ),
         "message": f"已转为「{target_name}」的部门文档，仅该部门成员可检索到",
     }
 
@@ -560,12 +603,18 @@ async def get_document_image_endpoint(
     from app.services.storage.image_store import IMAGES_SUBDIR
 
     # 三层隔离的可见性检查（404 without leaking foreign documents）：
-    # 第一、二层由 can_access_document 判定（本人 / 同公司且过 ACL /
-    # 平台管理员跨公司；**他人个人库对任何人都 404**）。
+    # 第一、二层由 can_access_document 判定（本人 / 公司集合内且过 ACL /
+    # 平台管理员在自建测试公司内；**他人个人库对任何人都 404**，admin 在
+    # 自建集合内可读但不可删）。
+    scope = await request_scope(user)
     async with get_db_session() as session:
         query = select(Document).where(Document.id == document_id)
         doc = (await session.execute(query)).scalar_one_or_none()
-    if doc is None or not can_access_document(doc, user):
+    if doc is None or not can_access_document(
+        doc, user,
+        tenant_ids=scope.tenant_ids,
+        owns_tenant_ids=scope.owns_tenant_ids,
+    ):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="文档不存在或无权访问",

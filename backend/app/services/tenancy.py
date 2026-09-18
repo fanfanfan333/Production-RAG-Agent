@@ -4,37 +4,35 @@ Multi-tenant isolation primitives（三层隔离的单一实现点）.
 三层模型：
 
     第一层 Tenant Isolation
-        每个用户属于一个 tenant（``users.tenant_id``，如 ``company_A``）。
+        每个用户属于一个租户（``users.tenant_id``，如 ``company_A``）。
         检索的**前置**过滤（Qdrant payload filter + BM25 语料 filter +
-        PostgreSQL valid_docs 校验）都必须带 tenant_id —— 跨租户的向量
-        在检索阶段就不可见，而不是 rerank 之后才剔除。
+        PostgreSQL valid_docs 校验）都必须带租户 —— 跨租户的向量在检索阶段
+        就不可见，而不是 rerank 之后才剔除。
 
-        **平台管理员（admin）是唯一的跨公司身份**：它没有"所属公司"，身份上
-        记为「全平台」（``PLATFORM_SCOPE_LABEL``），tenant_id 过滤对它不生效，
-        因此可以看到**所有公司**的部门库与公司库文档。但个人库（private）
-        对任何人都不开放（包括平台管理员）—— 见第二层。
+        **Rev2 口径（唯一正确性锚点）**：``private / NULL`` 层级只按
+        ``owner_id == 我`` 判定、**不参与租户过滤**；``department / tenant``
+        层级才受租户集合约束。因此「自己上传、落在任意租户（含 ``default``）
+        的个人库文档」永远可见。
+
+        **平台管理员（admin）不再是「全库」**：它的可见范围收敛为
+        「自己创建的测试公司集合」（``owns_tenant_ids``，按 ``created_by ==
+        当前 admin id`` 锁定）。无自建公司时 fail-closed 返回空，绝不回退全平台。
 
     第二层 Document ACL
         文档在租户内再按 ``access_level`` 细分可见性：
-            private    — 仅上传者本人（**任何人都不例外**，含平台管理员）
+            private    — 仅上传者本人；**唯一例外**是平台管理员在其
+                         自建测试公司内可见他人个人库（``owns_tenant_ids``）
             department — 同 department_id 的成员；知识库管理员/企业管理员/
-                         平台管理员另行放宽（见下）
-            tenant     — 租户内全员（公司库）；平台管理员跨租户可见
-        旧数据（迁移前）access_level 为 NULL/'private'，保持"仅本人可见"
-        的原语义，不会因为升级而意外共享。
-
-        private 的不可绕过是**产品硬约束**：个人知识库不是"管理员也能看，
-        只是普通同事看不到"，而是对所有人都私密。因此管理员失去对他人个人库
-        的阅读与合规删除能力 —— 想要他人个人库的内容，只能由本人主动「申请
-        共享」发布到部门/公司库。
+                         平台管理员另行放宽
+            tenant     — 租户内全员（公司库）
 
     第三层 User/Conversation Isolation
         会话与消息按 conversation_id + tenant_id + user_id 隔离；
-        图片落盘按 uploads/{tenant_id}/{document_id}/images/ 隔离；
-        一切缓存键 = tenant_id + 权限上下文 + 原始键。
+        一切缓存键 = 租户集合指纹 + 权限上下文 + 原始键。
 
 本模块只放纯函数与常量，不做 IO —— SQLAlchemy 查询条件的组装也在这里，
-保证"谁能看见什么"只有一个地方可以改。
+保证"谁能看见什么"只有一个地方可以改。唯一的例外是 ``request_scope``：
+它需要查注册表拿 admin 的自建公司集合，因此是 async。
 """
 
 from __future__ import annotations
@@ -44,7 +42,7 @@ import re
 import uuid
 from dataclasses import dataclass
 
-from sqlalchemy import and_, or_
+from sqlalchemy import and_, ColumnElement, false, or_, true
 
 from app.db.models import Document
 from app.db.user_models import User
@@ -56,8 +54,6 @@ from app.db.user_models import User
 DEFAULT_TENANT_ID = "default"
 
 # 平台管理员（admin）的**展示身份**：它不属于任何一家公司，而是横跨全平台。
-# 个人主页 / 成员列表 / 管理后台的「公司」一栏对 admin 都显示这个值 ——
-# 显示 "default" 会让人误以为它属于 default 这家"公司"。
 PLATFORM_SCOPE_LABEL = "全平台"
 
 ACCESS_PRIVATE = "private"        # 仅上传者        ——「个人知识库」
@@ -89,35 +85,14 @@ ACCESS_ORDER: dict[str, int] = {
 
 
 def is_upward_transition(current: str | None, target: str | None) -> bool:
-    """
-    *target* 是否**严格高于** *current* 所在层级.
-
-    判定「这一层还能不能申请」的唯一依据。申请共享这条链路的设计意图是
-    "自己没有的权限，通过申请向上要"，所以只有向上的目标才成立。
-
-    允许平级/向下申请的后果不是文案错误，而是**静默的可见性收缩**：一份已经
-    发布到公司库的文档，申请人可以再提一份"申请共享到部门库"，批准后
-    ``set_document_access_level`` 会把它真的降级成部门库 —— 对正在引用它的
-    其他部门同事，文档无声消失。同一层级则纯属重复申请（"已在公司知识库中"）。
-    """
+    """*target* 是否**严格高于** *current* 所在层级."""
     return ACCESS_ORDER.get(
         normalize_access_level(target), 0
     ) > ACCESS_ORDER.get(normalize_access_level(current), 0)
 
 
 def is_downgrade(current: str | None, target: str | None) -> bool:
-    """
-    *target* 是否**低于** *current* 所在层级（可见性收缩）.
-
-    与 :func:`is_upward_transition` 是一对，但用在不同位置：
-    申请链路用前者（只能向上申请），**直接发布**链路用本函数 —— 发布不需要
-    审批，所以"向下"在这里更危险：一次 PATCH 就能把公司库文档降成部门库，
-    其他部门同事静默失去访问权，审计日志里却只是一条正常的"层级变更"。
-
-    注意 ``private`` 不在拦截范围内：把文档**收回个人库**是归属人的正当操作
-    （"已共享的成员将无法再检索到"是明示后果），属于刻意保留的能力，调用方
-    需要自行放行。本函数只回答"层级是否变低"，不替调用方决定要不要拦。
-    """
+    """*target* 是否**低于** *current* 所在层级（可见性收缩）."""
     return ACCESS_ORDER.get(
         normalize_access_level(target), 0
     ) < ACCESS_ORDER.get(normalize_access_level(current), 0)
@@ -139,15 +114,13 @@ def access_scope_name(level: str | None) -> str:
 
 
 def normalize_access_level(level: str | None) -> str:
+    """把任意 access_level 归一化成三值之一；NULL/未知一律落入 private。"""
     value = (level or "").strip().lower()
     return value if value in VALID_ACCESS_LEVELS else ACCESS_PRIVATE
 
 
 # 新上传文档的默认可见性：**个人知识库**（仅上传者本人）。
-# 这正是图上"张三自己的个人知识库"的语义 —— 上传即私有，要共享必须显式
-# 发布（有权限的角色）或走"申请共享"（普通员工）。默认私有可以彻底避免
-# "新同事一登录就能看到全公司文档"这类越权观感。
-# 需要恢复旧行为（上传即是公司库）时把该值改为 tenant 即可，无需改代码。
+# 非 admin 上传行为不变；admin 上传的默认层级由 API 层在「决策 6」中收敛。
 DEFAULT_DOCUMENT_ACCESS_LEVEL = ACCESS_PRIVATE
 
 # tenant_id 允许字符：防目录穿越（它会出现在 uploads/{tenant_id}/ 路径里）
@@ -155,12 +128,7 @@ _TENANT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 
 
 def normalize_tenant_id(tenant_id: str | None) -> str:
-    """
-    把任意输入归一化成安全的 tenant_id.
-
-    None / 空串 / 非法字符 → DEFAULT_TENANT_ID。tenant_id 会拼进文件
-    系统路径与 Qdrant payload filter，这里必须堵住 ``..``、斜杠等穿越字符。
-    """
+    """把任意输入归一化成安全的 tenant_id（None/空/非法 → DEFAULT_TENANT_ID）。"""
     value = (tenant_id or "").strip()
     if not value or not _TENANT_ID_RE.match(value):
         return DEFAULT_TENANT_ID
@@ -169,17 +137,11 @@ def normalize_tenant_id(tenant_id: str | None) -> str:
 
 def company_id_from_name(name: str | None) -> str:
     """
-    公司**名称** → 稳定的 tenant_id（企业身份验证表单的唯一映射点）.
+    公司**名称** → 稳定的 tenant_id.
 
-    产品里用户填的是公司名称，中文、空格、全角符号都合法；而 tenant_id 会拼进
-    ``uploads/{tenant_id}/`` 路径与 Qdrant payload filter，必须是安全标识符
-    （见 ``normalize_tenant_id`` 的穿越防护）。这里做一层**确定性**映射：
-
-        纯 ASCII 安全名（``company_a`` / ``acme``）  → 原样用作 tenant_id
-        其余（``腾讯科技`` / ``ACME 中国``）          → ``c`` + sha1(name)[:12]
-
-    确定性是关键：同一个名称永远得到同一个 ID，公司内成员才能落进同一租户
-    互相可见；不同名称不会碰撞到同一租户（跨公司隔离的前提）。
+    ⚠️ **仅供一次性回填脚本使用**：业务新代码不再调用（名称→标识的权威源已换成
+    注册表查表 ``company_registry.find_by_name``）。保留它是为了兼容历史数据的
+    幂等回填，grep 到非脚本调用即视为缺陷。
     """
     raw = (name or "").strip()
     if not raw:
@@ -191,13 +153,7 @@ def company_id_from_name(name: str | None) -> str:
 
 
 def department_id_from_name(name: str | None) -> str | None:
-    """
-    部门**名称** → 稳定的 department_id（与 company_id_from_name 同一套规则）.
-
-    ``documents.access_level = department`` 的可见性靠 department_id 相等判定，
-    所以同一部门的成员必须映射到同一个 ID —— 规则与公司完全一致，只是前缀用
-    ``d`` 以便在日志里一眼区分公司与部门。
-    """
+    """部门**名称** → 稳定的 department_id（部门不是本轮的一等实体）。"""
     raw = (name or "").strip()
     if not raw:
         return None
@@ -209,14 +165,9 @@ def department_id_from_name(name: str | None) -> str | None:
 
 def company_display_name(user: User | None) -> str:
     """
-    用户所属公司的**展示名**.
+    用户所属公司的**展示名**（优先 ``users.company_name``，退回 tenant_id）。
 
-    优先用身份验证时填写的原始名称（``users.company_name``）；Keycloak 联邦
-    账号与老账号没有该字段时退回 tenant_id，保证界面上永远有字可显示。
-
-    平台管理员（admin）例外：它没有所属公司，显示「全平台」——它的权限范围
-    是所有公司，把它标成某一家公司（历史实现里是 ``default``）会让界面上
-    出现"管理员属于 default 公司"这种自相矛盾的描述。
+    平台管理员（admin）例外：它没有所属公司，显示「全平台」。
     """
     if user is None:
         return DEFAULT_TENANT_ID
@@ -227,18 +178,12 @@ def company_display_name(user: User | None) -> str:
 
 
 def is_platform_admin(user: User | None) -> bool:
-    """
-    是否平台管理员（跨公司身份）.
-
-    判定入口只有一个：``User.is_admin``（role == "admin"）。做成函数是为了让
-    "谁能跨公司"在所有模块里都能被 grep 到，而不是各自写 ``user.is_admin``
-    之后再各自解释一遍语义。
-    """
+    """是否平台管理员（跨公司身份）。判定入口只有一个：``User.is_admin``。"""
     return bool(user is not None and getattr(user, "is_admin", False))
 
 
 def department_display_name(user: User | None) -> str | None:
-    """用户所属部门的展示名（无部门时返回 None，个人主页显示「未设置」）。"""
+    """用户所属部门的展示名（无部门时返回 None）。"""
     if user is None:
         return None
     name = (getattr(user, "department_name", None) or "").strip()
@@ -246,7 +191,7 @@ def department_display_name(user: User | None) -> str | None:
 
 
 def effective_tenant_id(user: User | None) -> str:
-    """用户所属租户；未设置（老账号）时归入 default 租户."""
+    """用户所属租户；未设置（老账号）时归入 default 租户。"""
     if user is None:
         return DEFAULT_TENANT_ID
     return normalize_tenant_id(getattr(user, "tenant_id", None))
@@ -260,79 +205,175 @@ def effective_department_id(user: User | None) -> str | None:
     return dept or None
 
 
+def home_tenant_id(user: User | None) -> str | None:
+    """
+    用户**所属公司** —— 第三层（会话 / 消息 / 评测记录）的**单一**归属键.
+
+    它与文档可见性的 ``tenant_ids`` **集合**解耦：会话隔离只需要一个键。
+    平台管理员（admin）没有归属公司，返回 ``None``（与改造前 ``scope.tenant_id``
+    的取值完全一致，保证历史会话/评测记录的归属判定不变）。
+    """
+    if user is None or is_platform_admin(user):
+        return None
+    return effective_tenant_id(user)
+
+
 # ── 第二层：Document ACL ─────────────────────────────────────────────────────
 
-# 在**本租户内**可读全部部门库 / 公司库的角色（企业管理员、知识库管理员）：
-# 审核共享申请、执行合规删除需要跨部门视角。
-# 注意这里**不包含** admin —— 平台管理员的跨公司能力由 platform_wide 表达，
-# 而且他们同样看不到别人的个人库。
-# 该集合是权限矩阵 ``document.read.all`` 的唯一事实来源（permissions.py 引用它），
-# 避免"能删但看不见"这类矩阵不自洽。
+# 在**本租户内**可读全部部门库 / 公司库的角色（企业管理员、知识库管理员）。
+# 注意这里**不包含** admin —— 平台管理员的能力由 ``tenant_ids`` +
+# ``owns_tenant_ids`` 表达，且它同样看不到别公司/他人的个人库。
 TENANT_WIDE_READER_ROLES = frozenset(
     {User.ROLE_COMPANY_ADMIN, User.ROLE_KB_ADMIN}
 )
 
 
+def _default_tenant_ids_for(user: User | None) -> frozenset[str]:
+    """
+    调用点未显式给 ``tenant_ids`` 时的**保守兜底**（比设计更严的一侧）.
+
+    设计里 ``tenant_ids=None`` 只在 ``unrestricted`` 诊断路径表示「不限制」；
+    但 ``can_access_document`` / ``delete_permission_for`` 这类单文档判定没有
+    ``unrestricted`` 形参，一旦某个调用点漏传就会退化成「跨公司」。这里把
+    ``None`` 当作「按用户身份推导」而不是「不限制」：
+
+        admin   → 空集（fail-closed：不得因漏传而回退全平台）
+        普通用户 → {自己租户}
+    """
+    if user is None:
+        return frozenset()
+    if is_platform_admin(user):
+        return frozenset()
+    return frozenset({effective_tenant_id(user)})
+
+
 @dataclass(frozen=True)
 class DocumentScope:
     """
-    一个用户的**文档可见范围**（第一层 + 第二层 + 第三层个人库的合体）.
-
-    这是"谁能看见什么"的唯一入参形态：所有列表 / 检索 / 预览 / 删除入口
-    都先 ``scope_for(user)``，再把 scope 交给下面几个纯函数，不再各自拼
-    owner/tenant/department 三件套（历史实现里正是这种散落的拼装导致
-    "某条路径忘了带 tenant_id"这类越权）。
+    一个用户的**文档可见范围**（第一层 + 第二层 + 个人库的合体）.
 
     字段语义：
-        owner_id       个人库归属人。**恒为本人 id**（含平台管理员）——
-                       为 None 表示"看不到任何个人库"。
-        tenant_id      第一层过滤值；None = 不限制公司（仅平台管理员）。
-        department_id  第二层部门条件；tenant_wide 为 True 时被忽略。
-        tenant_wide    本租户内部门库全通（企业管理员 / 知识库管理员 / 平台管理员）。
-        platform_wide  跨公司（仅平台管理员）。
+        owner_id         个人库归属人。**恒为本人 id**（含平台管理员）——
+                         为 None 表示"看不到任何个人库"。
+        tenant_ids       第一层公司过滤**集合**。``None`` = 不限制（仅
+                         ``unrestricted`` 诊断）；空集 = fail-closed（返回空）；
+                         非空 = ``tenant_id IN (...)``。普通用户 = `{自己公司}`；
+                         平台管理员 = `{自建测试公司}`。
+        owns_tenant_ids  「**可见他人 private 文档**」的租户集合。仅当 actor 是
+                         该租户的**创建者**时非空 —— **只有平台管理员**，值 =
+                         其自建测试公司集合。任何把它写成"角色是 admin 即可"
+                         的写法都视为缺陷（P0-8）。
+        department_id    第二层部门条件；``tenant_wide`` 为 True 时被忽略。
+        tenant_wide      本租户内部门库全通（企业管理员 / 知识库管理员 / 平台管理员）。
     """
 
     owner_id: uuid.UUID | None
-    tenant_id: str | None
-    department_id: str | None
+    tenant_ids: frozenset[str] | None
+    owns_tenant_ids: frozenset[str] = frozenset()
+    department_id: str | None = None
     tenant_wide: bool = False
-    platform_wide: bool = False
 
     @property
     def cross_tenant(self) -> bool:
-        """是否跨公司（决定是否施加第一层 tenant_id 过滤）。"""
-        return self.platform_wide
+        """是否跨多个公司（决定"跨公司"展示与缓存细分）。"""
+        return self.tenant_ids is not None and len(self.tenant_ids) > 1
 
     @property
     def label(self) -> str:
         """中文范围标注（界面「可见范围」文案与此同源）。"""
-        if self.platform_wide:
+        if not self.tenant_ids:
             return PLATFORM_SCOPE_LABEL
-        return self.tenant_id or DEFAULT_TENANT_ID
+        return "、".join(sorted(self.tenant_ids))
+
+    def acl_kwargs(self) -> dict:
+        """统一喂给 list / retrieve / keyword 的 kwargs，杜绝各调用点手拼。"""
+        return {
+            "owner_id": str(self.owner_id) if self.owner_id else None,
+            "tenant_ids": self.tenant_ids,
+            "owns_tenant_ids": self.owns_tenant_ids,
+            "user_department_id": self.department_id,
+            "tenant_wide": self.tenant_wide,
+        }
 
 
-def scope_for(user: User | None) -> DocumentScope:
+def scope_for(
+    user: User | None,
+    *,
+    owned_tenant_ids: frozenset[str] | None = None,
+) -> DocumentScope:
     """
-    构造用户的文档可见范围（**每个请求只调用一次**，然后层层传递）.
+    构造用户的文档可见范围（纯函数）.
 
-        平台管理员 admin    → 跨公司；所有部门库/公司库；个人库仍只有自己的
-        企业/知识库管理员    → 本公司；所有部门库/公司库；个人库只有自己的
-        部门负责人/普通成员  → 本公司；本部门库 + 公司库 + 自己的个人库
+        平台管理员 admin  → tenant_ids = owns_tenant_ids = 自建测试公司集合
+        企业/知识库管理员  → tenant_ids = {本公司}；本公司部门库全通
+        部门负责人/普通成员 → tenant_ids = {本公司}；本部门库 + 公司库 + 自己的个人库
+
+    admin 的自建集合需要查注册表，``scope_for`` 保持纯函数：调用方（``request_scope``）
+    先把 ``owned_tenant_ids`` 解析好传进来。
     """
     if user is None:
         # 未登录：什么都不给（fail-closed）。调用方在鉴权层就已经拦下了。
         return DocumentScope(
-            owner_id=None, tenant_id=None, department_id=None,
+            owner_id=None, tenant_ids=frozenset(),
+            owns_tenant_ids=frozenset(), department_id=None, tenant_wide=False,
         )
-    platform = is_platform_admin(user)
+    if is_platform_admin(user):
+        owned = frozenset(owned_tenant_ids or ())
+        return DocumentScope(
+            owner_id=user.id,
+            tenant_ids=owned,
+            owns_tenant_ids=owned,
+            department_id=None,
+            tenant_wide=True,
+        )
     return DocumentScope(
-        # 个人库永远只属于本人：平台管理员不会因为"跨公司"而获得别人的个人库
         owner_id=user.id,
-        tenant_id=None if platform else effective_tenant_id(user),
-        department_id=None if platform else effective_department_id(user),
-        tenant_wide=platform or user.role in TENANT_WIDE_READER_ROLES,
-        platform_wide=platform,
+        tenant_ids=frozenset({effective_tenant_id(user)}),
+        owns_tenant_ids=frozenset(),
+        department_id=effective_department_id(user),
+        tenant_wide=user.role in TENANT_WIDE_READER_ROLES,
     )
+
+
+async def request_scope(user: User | None) -> DocumentScope:
+    """
+    ``scope_for`` 的 async 版本：**平台管理员**额外查注册表拿自建公司集合.
+
+    这是 admin 的 ``tenant_ids`` / ``owns_tenant_ids`` 的**唯一来源**
+    （= ``tenant_ids_created_by(admin.id)``）。普通用户直接走 ``scope_for``。
+    """
+    if user is None:
+        return scope_for(None)
+    if is_platform_admin(user):
+        from app.services.company_registry import tenant_ids_created_by
+
+        owned = await tenant_ids_created_by(getattr(user, "id", None))
+        return scope_for(user, owned_tenant_ids=owned)
+    return scope_for(user)
+
+
+# ── 第一层：SQL 组装（唯一入口）──────────────────────────────────────────────
+
+
+def tenant_clause(
+    tenant_ids: frozenset[str] | None,
+    *,
+    column: ColumnElement = Document.tenant_id,
+    unrestricted: bool = False,
+) -> ColumnElement:
+    """
+    第一层公司过滤条件（三分支，**绝不写 `if tenant_ids:`** —— frozenset() 是 falsy）.
+
+        tenant_ids is None 且 unrestricted=True  → true()   # 仅诊断脚本「全库」
+        tenant_ids is None 且 unrestricted=False → false()  # 无公司上下文：fail-closed
+        frozenset()（空集）                       → false()  # fail-closed
+        非空 frozenset                           → column.in_(sorted(tenant_ids))
+    """
+    if tenant_ids is None:
+        return true() if unrestricted else false()
+    if not tenant_ids:                     # 空集（注意不是 `is None`）
+        return false()
+    return column.in_(sorted(tenant_ids))
 
 
 def document_acl_clause(
@@ -340,33 +381,30 @@ def document_acl_clause(
     owner_id: uuid.UUID | None,
     department_id: str | None,
     tenant_wide: bool = False,
-    platform_wide: bool = False,
+    owns_tenant_ids: frozenset[str] = frozenset(),
     read_all: bool | None = None,
-):
+) -> ColumnElement:
     """
     组装"该用户在同一租户内还受什么 ACL 约束"的 SQLAlchemy 条件.
 
-    规则（**个人库对任何人都不开放**）：
-        access_level = private（或 NULL 老数据） → 仅 owner_id 本人
+    规则：
+        access_level = private（或 NULL 老数据） → owner_id 本人；
+                                                   ``owns_tenant_ids`` 非空时追加
+                                                   「tenant ∈ owns」（admin 例外）
         access_level = department                → 同 department_id；
-                                                   tenant_wide / platform_wide
-                                                   时放开到任意部门
+                                                   ``tenant_wide`` 时放开到任意部门
         access_level = tenant                    → 租户内全员
 
-    *tenant_wide*（企业管理员 / 知识库管理员 / 平台管理员）只放宽**部门**维度，
-    绝不放宽个人库 —— 这是产品要求"其他人的个人文档看不到"的落点。
+    ``read_all`` 是 ``tenant_wide`` 的旧参数名，保留仅为兼容旧调用点。
 
-    *read_all* 是 ``tenant_wide`` 的旧参数名，保留仅为兼容旧调用点。
-
-    注意：租户过滤（第一层）不在这里 —— 它由调用方按 ``tenant_id`` 施加，
-    只有平台管理员（platform_wide）才跳过。因此本函数永远不会跨公司。
+    注意：租户过滤（第一层）不在这里 —— 见 :func:`document_scope_clause`。
     """
     if read_all is not None:
         tenant_wide = tenant_wide or read_all
 
     conds = [Document.access_level == ACCESS_TENANT]
-    if tenant_wide or platform_wide:
-        # 任意部门库（本租户内，跨公司由调用方的 tenant 条件兜住）
+    if tenant_wide:
+        # 任意部门库（本租户内，跨公司由租户条件兜住）
         conds.append(Document.access_level == ACCESS_DEPARTMENT)
     elif department_id:
         conds.append(
@@ -376,16 +414,76 @@ def document_acl_clause(
             )
         )
     if owner_id is not None:
+        personal_terms = [Document.owner_id == owner_id]
+        if owns_tenant_ids:
+            personal_terms.append(
+                Document.tenant_id.in_(sorted(owns_tenant_ids))
+            )
         conds.append(
             and_(
                 or_(
                     Document.access_level == ACCESS_PRIVATE,
-                    Document.access_level.is_(None),  # 老数据按 private 处理
+                    Document.access_level.is_(None),   # 老数据按 private 处理
                 ),
-                Document.owner_id == owner_id,
+                or_(*personal_terms),
             )
         )
     return or_(*conds)
+
+
+def document_scope_clause(
+    *,
+    owner_id: uuid.UUID | None,
+    department_id: str | None,
+    tenant_ids: frozenset[str] | None,
+    owns_tenant_ids: frozenset[str] = frozenset(),
+    tenant_wide: bool = False,
+    unrestricted: bool = False,
+) -> ColumnElement:
+    """
+    列表 / 检索 / 关键词腿 / 摘要 / DB 兜底校验的**唯一** SQL 组装点.
+
+    可见集 =  ① 公司边界内（tenant ∈ 集合 且 通过 ACL）
+             ∪ ② 自己的个人库（owner == 我，**与租户无关**）
+
+    ② 是 Rev2 的核心修复：把「个人库」从 ① 的合取里**拿出来**做 ``or_``，
+    否则「owner=我、但 tenant 不在集合内」的个人库文档（如 admin 落在
+    ``default`` 的私库）会被第一层直接滤掉。
+    """
+    # ① 公司边界：租户集合 ∧ ACL
+    company_bound = and_(
+        tenant_clause(tenant_ids, unrestricted=unrestricted),
+        document_acl_clause(
+            owner_id=owner_id,
+            department_id=department_id,
+            tenant_wide=tenant_wide,
+            owns_tenant_ids=owns_tenant_ids,
+        ),
+    )
+
+    clauses: list[ColumnElement] = [company_bound]
+
+    # ② 个人库：private / NULL，只认归属人（+ admin 在自建集合内的例外），不进 tenant_clause
+    if owner_id is not None:
+        personal_terms = [Document.owner_id == owner_id]
+        if owns_tenant_ids:
+            personal_terms.append(
+                Document.tenant_id.in_(sorted(owns_tenant_ids))
+            )
+        clauses.append(
+            and_(
+                or_(
+                    Document.access_level == ACCESS_PRIVATE,
+                    Document.access_level.is_(None),
+                ),
+                or_(*personal_terms),
+            )
+        )
+
+    return or_(*clauses) if len(clauses) > 1 else clauses[0]
+
+
+# ── 单文档判定 ───────────────────────────────────────────────────────────────
 
 
 def can_access_document(
@@ -393,51 +491,53 @@ def can_access_document(
     user: User,
     *,
     owner_id: uuid.UUID | None = None,
+    tenant_ids: frozenset[str] | None = None,
+    owns_tenant_ids: frozenset[str] = frozenset(),
 ) -> bool:
     """
-    单文档可见性判定（路由层用：图片回显 / 下载 / 详情 / 原文预览）.
+    单文档可见性判定（图片回显 / 下载 / 详情 / 原文预览 / 发布）.
 
-    顺序与 ``document_acl_clause`` 完全一致，只是判定的是"这一份"：
+    判定顺序（Rev2）：
+        ① 个人库（private / NULL）→ 只认归属人本人；``owns_tenant_ids`` 例外
+           （仅 admin 在其自建测试公司内）——**先于公司边界返回**
+        ② 公司边界（tenant ∈ 集合）——**只作用于非个人库**
+        ③ 层级细粒度（tenant → 全员；department → 同部门 / 宽口径角色）
 
-        1. 个人库（private / NULL）→ 只有归属人本人；**平台管理员也不行**
-        2. 公司库（tenant）        → 同公司全员；平台管理员跨公司可见
-        3. 部门库（department）    → 同部门；知识库管理员/企业管理员/平台管理员全通
-
-    跨公司一律 False（唯一例外是平台管理员的 tenant 级与 department 级）。
+    ``tenant_ids=None`` 视为「按调用者身份推导」（见 ``_default_tenant_ids_for``），
+    绝不因漏传而回退全平台。
     """
     if user is None or doc is None:
         return False
 
     uid = owner_id if owner_id is not None else user.id
     level = normalize_access_level(getattr(doc, "access_level", None))
-    platform = is_platform_admin(user)
 
-    # ── 1. 个人库：仅归属人（管理员没有例外）──────────────────────────────
+    # ── ① 个人库 / NULL：只认归属人（+ 自建集合例外）——与租户无关，最先返回 ──
     if level == ACCESS_PRIVATE:
-        doc_owner = getattr(doc, "owner_id", None)
-        return doc_owner is not None and doc_owner == uid
+        if uid is not None and getattr(doc, "owner_id", None) == uid:
+            return True
+        if owns_tenant_ids and normalize_tenant_id(getattr(doc, "tenant_id", None)) in owns_tenant_ids:
+            return True
+        return False
 
-    # ── 2/3. 部门库与公司库：先过第一层公司边界 ──────────────────────────
-    if not platform:
-        if normalize_tenant_id(getattr(doc, "tenant_id", None)) != effective_tenant_id(user):
-            return False
+    # ── ② 公司边界（只对 department / tenant 层级）──────────────────────────────
+    boundary = tenant_ids if tenant_ids is not None else _default_tenant_ids_for(user)
+    if normalize_tenant_id(getattr(doc, "tenant_id", None)) not in boundary:
+        return False
 
+    # ── ③ 层级细粒度（语义不变）────────────────────────────────────────────────
     if level == ACCESS_TENANT:
         return True
-
     if level == ACCESS_DEPARTMENT:
-        # 本租户内跨部门的宽口径角色（含平台管理员）
-        if platform or user.role in TENANT_WIDE_READER_ROLES:
+        if is_platform_admin(user) or user.role in TENANT_WIDE_READER_ROLES:
             return True
         dept = effective_department_id(user)
         return bool(dept) and dept == (getattr(doc, "department_id", None) or "").strip()
-
     return False
 
 
 # ── 三层知识库：发布能力判定 ──────────────────────────────────────────────────
 
-# 目标层级 → 需要的权限名（有权限＝可直接发布；无权限＝需要走共享申请）
 PUBLISH_PERMISSION_BY_LEVEL: dict[str, str | None] = {
     ACCESS_PRIVATE: None,                      # 收回到个人库：永远是本人操作
     ACCESS_DEPARTMENT: "document.publish.department",
@@ -452,58 +552,66 @@ def publish_requirement(level: str | None) -> str | None:
 
 # ── 删除他人的文档：范围判定 ──────────────────────────────────────────────────
 
-# 可删除**本租户内**任意部门库 / 公司库文档（不含他人个人库）的角色
 TENANT_WIDE_DELETER_ROLES = TENANT_WIDE_READER_ROLES
-# 可删除本部门范围内他人文档的角色（部门负责人）
 DEPARTMENT_WIDE_DELETER_ROLES = frozenset(
     {User.ROLE_DEPT_MANAGER, User.ROLE_MANAGER}
 )
 
+# 个人库无权限删除时的统一文案（管理员也不例外）
+_PRIVATE_DENY = (
+    "个人知识库文档只有归属人本人可以操作，"
+    "其他人（包括管理员）都无法查看或删除"
+)
 
-def delete_permission_for(doc: Document, user: User) -> tuple[bool, str]:
+
+def delete_permission_for(
+    doc: Document,
+    user: User,
+    *,
+    tenant_ids: frozenset[str] | None = None,
+    owns_tenant_ids: frozenset[str] = frozenset(),
+) -> tuple[bool, str]:
     """
     判定 *user* 能否删除 *doc*，返回 ``(allowed, 中文原因)``.
 
-    删除权跟着**文档所在层级**走，而不是"谁上传谁说了算"：
+    删除权跟着**文档所在层级**走：
 
-        个人知识库(private)     仅文档归属人 —— 平台管理员也不例外
-        部门知识库(department)  部门负责人本部门 / 知识库管理员 / 企业管理员
-                                / 平台管理员（跨公司）
-        公司知识库(tenant)      知识库管理员 / 企业管理员（本公司）
-                                / 平台管理员（跨公司）
+        个人知识库(private)     仅文档归属人 —— 平台管理员也**不例外**
+                                （team-lead 裁决 10-A：admin 对自建测试公司内
+                                 他人私库**可读、不可删**）
+        部门知识库(department)  部门负责人本部门 / 知识库管理员 / 企业管理员 /
+                                平台管理员（自建测试公司内）
+        公司知识库(tenant)      知识库管理员 / 企业管理员（本公司）/
+                                平台管理员（自建测试公司内）
 
-    为什么不做"归属人永远能删"：文档一旦发布到部门库/公司库，它已经是
-    **组织资产** —— 同事的问答、报告都在引用它。作者离职或误操作一键删掉，
-    别人只会在某天提问时突然发现依据没了。所以高层的删除权收归上级，
-    归属人若确实要撤，走「申请删除」由上级裁决（与"申请共享"对称）。
-
-    为什么管理员也删不了别人的个人库：写权限跟着**可读性**走。看不见的东西
-    不该能被删 —— 否则"个人库绝对私密"就只剩下一句界面文案。
-
-    跨公司一律按"不存在"返回（不泄漏存在性），调用方据此映射 404。
+    ``private / NULL`` 分支刻意提到**公司边界之前**：否则 admin 连自己
+    ``default`` 租户里的 private 都删不了（回归）；但边界信息仍用于
+    「跨公司一律按不存在返回」（不泄漏存在性）。
     """
     if user is None or doc is None:
         return False, "文档不存在或无权访问"
 
-    platform = is_platform_admin(user)
     level = normalize_access_level(getattr(doc, "access_level", None))
 
-    # ── 公司边界先行：非平台管理员跨公司一律按"不存在"处理（不泄漏存在性，
-    #     个人库也一样 —— 否则"这份 UUID 是别的公司的私人文档"就成了探测信号）
-    if not platform:
-        if normalize_tenant_id(getattr(doc, "tenant_id", None)) != effective_tenant_id(user):
-            return False, "文档不存在或无权访问"
-
-    # ── 个人库：仅归属人（管理员没有例外）────────────────────────────────────
+    # ── ① 个人库：仅归属人（+ 无 owns 例外）——公司边界之前 ──────────────────────
     if level == ACCESS_PRIVATE:
         if getattr(doc, "owner_id", None) is not None and doc.owner_id == user.id:
             return True, ""
-        return (
-            False,
-            "个人知识库文档只有归属人本人可以操作，"
-            "其他人（包括管理员）都无法查看或删除",
-        )
+        # 非归属人：若是跨公司文档，按「不存在」返回（不泄漏存在性）；
+        # 否则给出个人库专属文案（与旧行为一致）。
+        boundary = tenant_ids if tenant_ids is not None else _default_tenant_ids_for(user)
+        if normalize_tenant_id(getattr(doc, "tenant_id", None)) not in boundary:
+            return False, "文档不存在或无权访问"
+        return False, _PRIVATE_DENY
 
+    # ── ② 公司边界（不泄漏存在性）──────────────────────────────────────────────
+    boundary = tenant_ids if tenant_ids is not None else _default_tenant_ids_for(user)
+    if normalize_tenant_id(getattr(doc, "tenant_id", None)) not in boundary:
+        return False, "文档不存在或无权访问"
+
+    platform = is_platform_admin(user)
+
+    # ── ③ 层级删除权 ───────────────────────────────────────────────────────────
     if level == ACCESS_TENANT:
         if platform or user.role in TENANT_WIDE_DELETER_ROLES:
             return True, ""
@@ -534,20 +642,29 @@ def delete_permission_for(doc: Document, user: User) -> tuple[bool, str]:
     )
 
 
-def can_request_delete(doc: Document, user: User) -> bool:
+def can_request_delete(
+    doc: Document,
+    user: User,
+    *,
+    tenant_ids: frozenset[str] | None = None,
+    owns_tenant_ids: frozenset[str] = frozenset(),
+) -> bool:
     """
     能否为该文档提交「申请删除」（自己没有删除权、但看得见它）.
 
-    与 ``delete_permission_for`` 互补：能直接删就不用申请；看不见的也不能申请
-    （否则成了探测接口）。个人库文档只有归属人可见、且归属人可直接删，
-    所以个人库永远不需要"申请删除"；能申请的只有部门库与公司库。
+    与 ``delete_permission_for`` 互补；个人库永远不需要"申请删除"
+    （个人库只有归属人可见、且归属人可直接删）。
     """
     if user is None or doc is None:
         return False
-    allowed, _ = delete_permission_for(doc, user)
+    allowed, _ = delete_permission_for(
+        doc, user, tenant_ids=tenant_ids, owns_tenant_ids=owns_tenant_ids
+    )
     if allowed:
         return False
-    if not can_access_document(doc, user):
+    if not can_access_document(
+        doc, user, tenant_ids=tenant_ids, owns_tenant_ids=owns_tenant_ids
+    ):
         return False
     level = normalize_access_level(getattr(doc, "access_level", None))
     return level in (ACCESS_DEPARTMENT, ACCESS_TENANT)
@@ -556,15 +673,34 @@ def can_request_delete(doc: Document, user: User) -> bool:
 # ── 第三层：缓存键隔离 ────────────────────────────────────────────────────────
 
 
-def permission_context(user: User | None, *, owner_id: uuid.UUID | None = None) -> str:
+def tenant_scope_fingerprint(tenant_ids: frozenset[str] | None) -> str:
+    """
+    租户集合的稳定指纹（缓存键的一部分）.
+
+    ``None``（诊断「全库」）/ 空集（fail-closed）/ 非空集合 **三态互异** ——
+    这正是「同 owner、不同租户集合」必须产生不同缓存键的落点。
+    """
+    if tenant_ids is None:
+        return "all"
+    if not tenant_ids:
+        return "none"
+    joined = ",".join(sorted(tenant_ids))
+    return "s:" + hashlib.sha1(joined.encode("utf-8")).hexdigest()[:12]
+
+
+def permission_context(
+    user: User | None,
+    *,
+    owner_id: uuid.UUID | None = None,
+    tenant_ids: frozenset[str] | None = None,
+    owns_tenant_ids: frozenset[str] | None = None,
+) -> str:
     """
     用户权限上下文的稳定指纹（缓存键的一部分）.
 
-    同租户、同部门、同 role 的两个用户权限视图一致，可以共享缓存；
-    权限上下文任何一项变化（换部门 / 升降 role）指纹立即变化，旧缓存
-    自然失效 —— 不会出现"权限收紧后还能读到旧缓存"的泄漏窗口。
-
-    注意 private 文档按 owner 区分，因此 owner_id 也参与指纹。
+    ``T=`` / ``O=`` 双指纹：租户集合同样参与 —— 「同 owner、异租户集合」必然
+    不同键；换租户集合（新建/删除测试公司）→ 指纹变 → 旧缓存自然失效；而
+    **改名不改 tenant_ids ⇒ 指纹不变 ⇒ 缓存不失效**（正确）。
     """
     if user is None:
         return "anonymous"
@@ -573,19 +709,20 @@ def permission_context(user: User | None, *, owner_id: uuid.UUID | None = None) 
         str(uid),
         user.role or "",
         effective_department_id(user) or "-",
+        "T=" + tenant_scope_fingerprint(tenant_ids),
+        "O=" + tenant_scope_fingerprint(frozenset(owns_tenant_ids or ())),
     ]
-    if is_platform_admin(user):
-        # 平台管理员的可见范围与任何同 role 字符串的账号都不同（跨公司），
-        # 显式打标，避免与"某公司里恰好也叫 admin 的角色"共用缓存。
-        parts.append(PLATFORM_SCOPE_LABEL)
     return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:16]
 
 
-def scoped_cache_key(tenant_id: str | None, perm_context: str, raw_key: str) -> str:
+def scoped_cache_key(
+    tenant_scope: frozenset[str] | None,
+    perm_context: str,
+    raw_key: str,
+) -> str:
     """
-    缓存键 = tenant_id + 权限上下文 + 原始键（第三层隔离的缓存规则）.
+    缓存键 = 租户集合指纹 + 权限上下文 + 原始键（第三层隔离的缓存规则）.
 
-    任何查询类缓存（BM25 语料、检索结果、改写结果…）都必须经过它，
-    杜绝"用户 A 的查询结果缓存被用户 B 命中"。
+    任何查询类缓存（BM25 语料、检索结果、改写结果…）都必须经过它。
     """
-    return f"{normalize_tenant_id(tenant_id)}::{perm_context}::{raw_key}"
+    return f"{tenant_scope_fingerprint(tenant_scope)}::{perm_context}::{raw_key}"

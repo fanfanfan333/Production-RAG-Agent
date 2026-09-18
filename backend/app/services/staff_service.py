@@ -24,10 +24,10 @@
 
 ## 公司隔离
 
-申请的 ``company_id`` 与用户的 ``tenant_id`` 是同一个命名空间（都来自
-``tenancy.company_id_from_name``），因此"审核人只能看本公司申请"直接复用
-第一层租户隔离，不引入第二套公司概念。平台管理员（admin）是唯一的例外：
-它要跨公司设置各公司管理层，所以可见全部公司。
+申请的 ``company_id`` 与用户的 ``tenant_id`` 是同一个命名空间（都来自**公司注册表**
+``companies.tenant_id``，由 ``company_registry`` 解析），因此"审核人只能看本公司申请"
+直接复用第一层租户隔离，不引入第二套公司概念。平台管理员（admin）是唯一的例外：
+它要管理**自己创建**的测试公司，所以可见范围收敛为 ``created_by == 它自己``。
 
 ## 身份状态
 
@@ -57,7 +57,6 @@ from app.services.tenancy import (
     ACCESS_PRIVATE,
     ACCESS_TENANT,
     DEFAULT_TENANT_ID,
-    company_id_from_name,
     company_display_name,
     department_display_name,
     department_id_from_name,
@@ -309,12 +308,23 @@ def _clean(value: str | None, label: str, *, max_len: int = 128) -> str:
 async def create_staff_request(
     user: User,
     *,
-    company_name: str,
+    company_id: str | None = None,
+    company_name: str | None = None,
     department_name: str,
     duty: str,
 ) -> StaffRequest:
     """
     提交企业身份验证申请（首页弹窗 / 个人主页「身份验证」都走这里）.
+
+    公司归属**从注册表解析**（不再用 ``company_id_from_name`` —— 那是名称哈希，
+    与「改名零迁移」冲突）：
+
+        * 给了 ``company_id``（下拉值）→ ``get_company``；未登记 → 400
+        * 只给了 ``company_name``（旧入口）→ ``find_by_name``（按当前 ``name_key``
+          解析，因此**改名后新名可解析、旧名失效**）；未登记 → 400
+
+    未登记一律 400「请先由管理员注册该公司」：公司是**一等实体**，必须先在
+    注册表存在，用户才能提交归属申请。
 
     同一时刻只允许一份待审申请：重复提交只会让审核队列出现多份一样的记录，
     申请人也拿不到更多信息。想改填内容就先撤回再提交。
@@ -325,11 +335,27 @@ async def create_staff_request(
             status_code=409,
         )
 
-    company = _clean(company_name, "公司名称")
     department = _clean(department_name, "公司部门")
     job_duty = _clean(duty, "部门职责")
 
-    company_id = company_id_from_name(company)
+    from app.services.company_registry import (
+        MSG_NOT_REGISTERED,
+        find_by_name,
+        get_company,
+    )
+
+    company = None
+    if company_id and company_id.strip():
+        company = await get_company(company_id.strip())
+    elif company_name and company_name.strip():
+        company = await find_by_name(company_name.strip())
+    if company is None:
+        # 公司未登记（含"旧名已被改名"）：按设计明确引导管理员先注册
+        raise StaffError(MSG_NOT_REGISTERED, status_code=400)
+
+    resolved_company_id = company.tenant_id
+    resolved_company_name = company.display_name
+
     department_id = department_id_from_name(department)
     if department_id is None:
         raise StaffError("公司部门不合法，请填写可识别的部门名称")
@@ -353,8 +379,8 @@ async def create_staff_request(
             applicant_username=user.username,
             applicant_display_name=user.display_name,
             applicant_company_id=effective_tenant_id(user),
-            company_name=company,
-            company_id=company_id,
+            company_name=resolved_company_name,
+            company_id=resolved_company_id,
             department_name=department,
             department_id=department_id,
             duty=job_duty,
@@ -371,12 +397,13 @@ async def create_staff_request(
         resource_type="user",
         resource_id=str(user.id),
         detail=(
-            f"company={company}({company_id}); department={department}; duty={job_duty}"
+            f"company={resolved_company_name}({resolved_company_id}); "
+            f"department={department}; duty={job_duty}"
         ),
     )
     logger.info(
         "Staff request created: user=%s company=%s department=%s",
-        user.username, company, department,
+        user.username, resolved_company_name, department,
     )
     return request
 
@@ -624,12 +651,26 @@ async def review_staff_request(
             raise StaffError("部门名称不合法")
         final_duty = (duty or snapshot["duty"]).strip() or snapshot["duty"]
 
+        # 批准后的归属以**注册表最新展示名**为准：申请快照可能停留在改名之前，
+        # 落库时若照抄旧名，成员面板会出现一个已经不存在的公司名。
+        from app.services.company_registry import get_company as _get_company
+
+        company = await _get_company(snapshot["company_id"])
+        resolved_company_id = (
+            company.tenant_id if company is not None
+            else normalize_tenant_id(snapshot["company_id"])
+        )
+        resolved_company_name = (
+            company.display_name if company is not None
+            else snapshot["company_name"]
+        )
+
         async with get_db_session() as session:
             applicant = await session.get(User, request.applicant_id)
             if applicant is None:
                 raise StaffError("申请人账号已不存在，无法批准", status_code=410)
-            applicant.tenant_id = normalize_tenant_id(snapshot["company_id"])
-            applicant.company_name = snapshot["company_name"]
+            applicant.tenant_id = resolved_company_id
+            applicant.company_name = resolved_company_name
             applicant.department_id = final_department_id
             applicant.department_name = final_department_name
             applicant.job_title = final_duty
@@ -639,8 +680,8 @@ async def review_staff_request(
         granted = target_role
         profile = {
             "user_id": str(applicant.id),
-            "company_name": snapshot["company_name"],
-            "company_id": normalize_tenant_id(snapshot["company_id"]),
+            "company_name": resolved_company_name,
+            "company_id": resolved_company_id,
             "department_name": final_department_name,
             "department_id": final_department_id,
             "duty": final_duty,
@@ -788,45 +829,71 @@ def _member_payload(user: User, latest_status: str | None) -> dict:
 
 async def list_companies(actor: User) -> list[dict]:
     """
-    公司清单（管理后台的左侧过滤）
+    公司清单（管理后台的左侧过滤 + 成员面板公司下拉）
 
-    平台管理员看到全部公司及成员数；其余管理员只看到自己公司 —— 跨公司
-    信息（哪怕只是"存在这家公司"）也不应泄漏。
+    平台管理员：只看到**自己创建**的公司（``created_by == actor.id``，注册表为准）
+    —— 跨公司信息（哪怕只是"存在这家公司"）也不应泄漏；其自建公司 ``is_test=True``。
+    其他管理员：只看到自己所属公司。
 
     平台管理员本人**不计入任何公司**：它是「全平台」身份，不属于某家公司。
-    历史实现里 admin 的 ``tenant_id`` 是 "default"，于是成员面板上会凭空多出
-    一家叫 "default" 的公司（里面只有 admin 一个人）—— 这里把它排除掉。
     """
     if not is_administer(actor):
         raise StaffError("你没有管理成员身份的权限", status_code=403)
 
+    from app.services.company_registry import (
+        list_registered_companies,
+        tenant_ids_created_by,
+    )
+
+    if actor.is_admin:
+        allowed_ids = await tenant_ids_created_by(actor.id)
+    else:
+        allowed_ids = frozenset({effective_tenant_id(actor)})
+
+    if not allowed_ids:
+        return []
+
     async with get_db_session() as session:
-        stmt = (
+        count_stmt = (
             select(User.tenant_id, func.count())
             .where(User.role != User.ROLE_ADMIN)
+            .where(User.tenant_id.in_(sorted(allowed_ids)))
             .group_by(User.tenant_id)
         )
-        if not actor.is_admin:
-            stmt = stmt.where(User.tenant_id == effective_tenant_id(actor))
-        rows = (await session.execute(stmt)).all()
-        names = {}
-        name_rows = await session.execute(
+        rows = (await session.execute(count_stmt)).all()
+        counts = {normalize_tenant_id(tid): int(count) for tid, count in rows}
+        # 未登记到注册表的历史租户：退回 users.company_name 作展示名
+        fallback_rows = await session.execute(
             select(User.tenant_id, func.min(User.company_name))
             .where(User.role != User.ROLE_ADMIN)
+            .where(User.tenant_id.in_(sorted(allowed_ids)))
             .group_by(User.tenant_id)
         )
-        names = {tid: cname for tid, cname in name_rows.all()}
+        fallback_names = {
+            normalize_tenant_id(tid): cname for tid, cname in fallback_rows.all()
+        }
 
-    return sorted(
-        (
+    registry = {c.tenant_id: c for c in await list_registered_companies()}
+
+    items: list[dict] = []
+    for tid in sorted(allowed_ids):
+        company = registry.get(tid)
+        if company is not None:
+            company_name = company.display_name
+            is_test = bool(company.is_test)
+        else:
+            company_name = fallback_names.get(tid) or normalize_tenant_id(tid)
+            is_test = False
+        items.append(
             {
-                "company_id": normalize_tenant_id(tid),
-                "company_name": names.get(tid) or normalize_tenant_id(tid),
-                "member_count": int(count),
+                "company_id": tid,
+                "company_name": company_name,
+                "is_test": is_test,
+                "member_count": counts.get(tid, 0),
             }
-            for tid, count in rows
-        ),
-        key=lambda item: (-item["member_count"], item["company_id"]),
+        )
+    return sorted(
+        items, key=lambda item: (-item["member_count"], item["company_id"])
     )
 
 

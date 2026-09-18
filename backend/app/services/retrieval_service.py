@@ -25,9 +25,10 @@ from app.services.metadata import MetadataFilter, matches_payload
 from app.services.pg_keyword_search import keyword_search
 from app.services.tenancy import (
     DEFAULT_TENANT_ID,
-    document_acl_clause,
+    document_scope_clause,
     normalize_tenant_id,
     scoped_cache_key,
+    tenant_scope_fingerprint,
 )
 from app.utils.logging import get_logger
 from app.utils.timing import timed_stage
@@ -407,24 +408,40 @@ async def _scroll_corpus(
     collection_name: str,
     collection_id: str | None,
     max_points: int,
-    tenant_id: str | None = None,
+    tenant_ids: frozenset[str] | None = None,
 ) -> list[RetrievedChunk]:
     """
     Scroll the whole Qdrant collection (payload only, no vectors).
 
-    *tenant_id* 是**检索前置过滤**（第一层隔离）：BM25 语料在向量库侧
-    就按租户裁剪，跨租户 chunk 连语料都进不来，而不是事后剔除。
+    *tenant_ids* 是**检索前置过滤**（第一层隔离）：BM25 语料在向量库侧
+    就按租户集合裁剪，跨租户 chunk 连语料都进不来，而不是事后剔除。
+
+    ``tenant_ids`` 语义与 ``tenant_clause`` 三分支一致：空集 → fail-closed
+    返回空语料；``None``（诊断）→ 不加租户条件；非空 → ``MatchAny``。
     """
     from qdrant_client.http import models as qmodels
 
+    if tenant_ids is not None and not tenant_ids:
+        # fail-closed：空集没有任何租户，语料为空（绝不退化成"不限制"）
+        return []
+
     must = []
-    if tenant_id:
-        must.append(
-            qmodels.FieldCondition(
-                key="tenant_id",
-                match=qmodels.MatchValue(value=normalize_tenant_id(tenant_id)),
+    if tenant_ids:
+        values = sorted(tenant_ids)
+        if len(values) == 1:
+            must.append(
+                qmodels.FieldCondition(
+                    key="tenant_id",
+                    match=qmodels.MatchValue(value=normalize_tenant_id(values[0])),
+                )
             )
-        )
+        else:
+            must.append(
+                qmodels.FieldCondition(
+                    key="tenant_id",
+                    match=qmodels.MatchAny(any=[normalize_tenant_id(v) for v in values]),
+                )
+            )
     if collection_id:
         must.append(
             qmodels.FieldCondition(
@@ -486,7 +503,7 @@ async def _bm25_candidates(
     collection_id: str | None,
     owner_id: str | None,
     client,
-    tenant_id: str | None = None,
+    tenant_ids: frozenset[str] | None = None,
     perm_context: str = "anonymous",
 ) -> list[RetrievedChunk]:
     """
@@ -503,7 +520,7 @@ async def _bm25_candidates(
     """
     settings = get_settings()
     cache_key = scoped_cache_key(
-        tenant_id,
+        tenant_ids,
         perm_context,
         f"bm25::{collection_id or '__all__'}::{owner_id or '__admin__'}",
     )
@@ -518,7 +535,7 @@ async def _bm25_candidates(
             collection_name,
             collection_id,
             settings.HYBRID_MAX_CORPUS_POINTS,
-            tenant_id=tenant_id,
+            tenant_ids=tenant_ids,
         )
         # 截断**必须告警**。旧实现静默截断到 10000 条 —— 1000 份文档时关键词腿
         # 只看得到前 5% 的语料，其余永远召不回来，而且没有任何日志。用户得到
@@ -556,11 +573,11 @@ async def _pg_keyword_candidates(
     query: str,
     fetch_n: int,
     collection_id: str | None,
-    tenant_id: str | None,
+    tenant_ids: frozenset[str] | None,
     owner_id: str | None,
     user_department_id: str | None,
     tenant_wide: bool,
-    platform_wide: bool,
+    owns_tenant_ids: frozenset[str],
     unrestricted: bool,
     metadata_filter: MetadataFilter | None = None,
 ) -> list[tuple[str, int, str]]:
@@ -588,11 +605,11 @@ async def _pg_keyword_candidates(
                 session,
                 query=query,
                 limit=max(fetch_n, 1),
-                tenant_id=tenant_id,
+                tenant_ids=tenant_ids,
                 owner_id=owner_id,
                 user_department_id=user_department_id,
                 tenant_wide=tenant_wide,
-                platform_wide=platform_wide,
+                owns_tenant_ids=owns_tenant_ids,
                 collection_id=collection_id,
                 unrestricted=unrestricted,
                 metadata_filter=metadata_filter,
@@ -627,60 +644,80 @@ def _visibility_conditions(
     owner_id: str | None,
     department_id: str | None,
     tenant_wide: bool,
-    platform_wide: bool,
+    tenant_ids: frozenset[str] | None,
+    owns_tenant_ids: frozenset[str],
 ) -> list:
     """
-    把 PG 侧 ``document_acl_clause`` 的语义**下推到向量层**（ANN 之前）.
+    把 PG 侧 ``document_scope_clause`` 的语义**下推到向量层**（ANN 之前）.
 
     为什么必须下推：向量腿原先只过滤 ``tenant_id``，于是**同一公司内别人的个人库
     向量也会被召回**，占满候选名额后再在 PG 层被 ACL 丢掉。正确性没问题，但候选池
     被稀释 —— 文档一多（比如每人私库里几百份），一个用户查询的 20 个候选可能全部
-    来自别人的私库，自己一份都进不来，表现为「库里明明有却查不到」。这是千份文档
-    规模下真实会咬人的问题，和元数据前置过滤是同一类：**必须缩小搜索空间，而不是
-    事后打捞**。
+    来自别人的私库，自己一份都进不来，表现为「库里明明有却查不到」。
 
-    为什么用 ``must_not`` + 嵌套 ``Filter``，而不是 ``must=[user_id==me]``：
-    这是刻意的 **fail-open**。Qdrant 的 ``FieldCondition`` 在字段缺失时**不匹配**，
-    所以「迁移前写入、payload 里没有 access_level / user_id 的老向量」不会被任何一条
-    排除条件命中 → 原样保留 → 仍由 PG 的 ``document_acl_clause`` 做最终判定。
-    若改成前置白名单（``must``），老向量会被直接误杀（漏检）—— 那是更糟的失败方向：
-    少召回用户自己的文档，用户立刻能感知；多召回几条随后被 ACL 丢掉，用户无感。
+    为什么用 ``must_not`` + 嵌套 ``Filter``，而不是前置白名单：这是刻意的
+    **fail-open**。Qdrant 的 ``FieldCondition`` 在字段缺失时**不匹配**，所以
+    「迁移前写入、payload 里没有 access_level / user_id 的老向量」不会被任何一条
+    排除条件命中 → 原样保留 → 仍由 PG 的 ``document_scope_clause`` 做最终判定。
+
+    **Rev2 形态（Deny-list，与 PG 的 ``or_(公司边界, 自己个人库)`` 逐条同构）**：
+
+        Deny-1 个人库：排除「private 且 user_id ≠ 我 且 tenant ∉ 自建集合」
+                      —— 命中「我本人」或「我自建的测试公司」即**不排除**。
+        Deny-2 公司边界：非个人库（department / tenant）必须 tenant ∈ 集合；
+                      空集 fail-closed 排除全部非个人库；None 不加边界（诊断）。
+        Deny-3 部门库：同部门（``tenant_wide`` 放开）—— 语义不变。
 
     ⚠️ 字段名必须与 ``vector_service`` 落库时一致：Qdrant payload 里的所有者字段叫
-    **``user_id``**（上传者），**不是 ``owner_id``**（后者是 PG ``documents`` 表的列名）。
-    写错名字不会报错 —— 排除条件永远不匹配 → 所有 private 向量被整体排除 →
-    用户连自己的文档都搜不到。这就是 fail-closed 的隐式陷阱：**过度过滤是静默的**。
+    **``user_id``**（上传者），**不是 ``owner_id``**。写错名字不会报错 —— 排除条件
+    永远不匹配 → 所有 private 向量被整体排除 → 用户连自己的文档都搜不到。
     改动本函数后必须跑 ``_audit_916/probe_acl_prefilter_916.py`` 的 A/B 对照。
-
-    返回的是可直接塞进 ``Filter.must_not`` 的 ``Condition`` 列表（可能为空）。
     """
-    if platform_wide:
-        # 平台管理员没有公司边界。个人库仍受限（见下面 cond 1），部门库放开。
-        department_id = None
-
     from qdrant_client.http import models as qmodels
 
     def _value(key: str, value):
-        return qmodels.FieldCondition(
-            key=key, match=qmodels.MatchValue(value=value),
-        )
+        return qmodels.FieldCondition(key=key, match=qmodels.MatchValue(value=value))
 
-    conds = []
+    def _any(key: str, values):
+        vals = [str(v) for v in values]
+        # 单值用 MatchValue、多值用 MatchAny：单值走 MatchValue 更利于选索引。
+        if len(vals) == 1:
+            return qmodels.FieldCondition(key=key, match=qmodels.MatchValue(value=vals[0]))
+        return qmodels.FieldCondition(key=key, match=qmodels.MatchAny(any=vals))
 
-    # 1. 个人库：仅 owner 本人（tenant_wide / 平台管理员也不例外）。
-    #    排除「声明为 private 且 user_id 不是我」的向量；owner_id 缺失时排除全部
-    #    private（与 PG 侧 owner_id=None → private 一律不放行一致）。
-    #    注意 key 是 "user_id"（Qdrant payload 的上传者字段），不是 "owner_id"。
-    conds.append(
-        qmodels.Filter(
-            must=[_value("access_level", "private")],
-            must_not=([_value("user_id", str(owner_id))]
-                      if owner_id else None),
+    conds: list = []
+
+    # ── Deny-1 个人库：private 与租户无关（除非「我本人」或「我自建公司」）──────
+    if owner_id:
+        allow = [_value("user_id", str(owner_id))]
+        if owns_tenant_ids:
+            allow.append(_any("tenant_id", sorted(owns_tenant_ids)))
+        conds.append(
+            qmodels.Filter(must=[_value("access_level", "private")], must_not=allow)
         )
+    else:
+        # 无 owner：排除全部 private
+        conds.append(qmodels.Filter(must=[_value("access_level", "private")]))
+
+    # ── Deny-2 公司边界：非个人库文档必须 tenant ∈ 集合 ────────────────────────
+    non_personal = qmodels.Filter(
+        should=[
+            _value("access_level", "department"),
+            _value("access_level", "tenant"),
+        ]
     )
+    if tenant_ids is None:
+        pass                                             # 诊断：不加租户边界
+    elif not tenant_ids:                                 # 空集 → fail-closed
+        conds.append(non_personal)
+    else:
+        conds.append(
+            qmodels.Filter(must=[non_personal],
+                           must_not=[_any("tenant_id", sorted(tenant_ids))])
+        )
 
-    # 2. 部门库：同部门可见；tenant_wide / 平台管理员放开到任意部门。
-    if not (tenant_wide or platform_wide):
+    # ── Deny-3 部门库：同部门（tenant_wide 放开）——语义不变 ────────────────────
+    if not tenant_wide:
         conds.append(
             qmodels.Filter(
                 must=[_value("access_level", "department")],
@@ -688,8 +725,6 @@ def _visibility_conditions(
                           if department_id else None),
             )
         )
-
-    # 3. 公司库（access_level=tenant）：不做任何排除。
     return conds
 
 
@@ -1125,10 +1160,10 @@ async def retrieve_chunks(
     extra_queries: list[str] | None = None,
     extra_vector_queries: list[str] | None = None,
     enable_hierarchical: bool | None = None,
-    tenant_id: str | None = None,
+    tenant_ids: frozenset[str] | None = None,
     user_department_id: str | None = None,
     tenant_wide: bool = False,
-    platform_wide: bool = False,
+    owns_tenant_ids: frozenset[str] = frozenset(),
     unrestricted: bool = False,
     metadata_filter: MetadataFilter | None = None,
 ) -> list[RetrievedChunk]:
@@ -1150,18 +1185,20 @@ async def retrieve_chunks(
       文档分布天然相似，拿它当打分基准会把一批"像答案但不对题"的候选抬上来，
       与它"只负责把召回拉宽"的定位矛盾。
 
-    权限入参（由 ``tenancy.scope_for(user)`` 组装，两者必须成套出现）：
+    权限入参（由 ``tenancy.request_scope(user).acl_kwargs()`` 组装，成套出现）：
 
         owner_id          个人库归属人 —— **恒为本人 id**。None = 看不到任何个人库。
-        tenant_id         第一层公司过滤；None = 跨公司（配合 platform_wide）。
+        tenant_ids        第一层公司过滤**集合**。None = 不限制（仅 unrestricted
+                          诊断）；空集 = fail-closed（返回空）；非空 = IN (...)。
         user_department_id 第二层部门条件。
-        tenant_wide       本租户内部门库全通（企业管理员 / 知识库管理员）。
-        platform_wide     跨公司（平台管理员）：跳过 tenant 过滤，但仍受 ACL 约束。
+        tenant_wide       本租户内部门库全通（企业管理员 / 知识库管理员 / admin）。
+        owns_tenant_ids   「可见他人 private」的租户集合（仅 admin = 自建测试公司）。
         unrestricted      **仅供后端诊断脚本 / 系统内部调用**：完全不做权限过滤。
                           任何用户请求路径都不允许传它。
 
-    注意：个人库（private）在 **所有** 组合下都只有归属人可见；
-    ``tenant_wide`` 只放宽部门维度，``platform_wide`` 只放宽公司维度。
+    注意：``private / NULL`` 层级只按 ``owner_id == 我`` 判定、**不参与租户过滤**；
+    ``department / tenant`` 层级才受 ``tenant_ids`` 约束。``tenant_wide`` 只放宽
+    部门维度，``owns_tenant_ids`` 只放开 private（P0-8 唯一例外）。
 
     Args:
         query:            Natural-language question from the user.
@@ -1188,13 +1225,18 @@ async def retrieve_chunks(
     client = get_qdrant_client()
     coll = collection_name or settings.QDRANT_COLLECTION
 
-    if not unrestricted and not (owner_id or tenant_id or tenant_wide or platform_wide):
+    if not unrestricted and not (
+        owner_id is not None
+        or tenant_ids is not None          # 空集也算"给了范围"（fail-closed）
+        or tenant_wide
+        or bool(owns_tenant_ids)
+    ):
         # fail-closed：调用方没有给出任何权限上下文时**不检索**，而不是"默认全开"。
         # 历史实现里"什么都不传 = admin 全览"，任何一处漏传权限参数都会静默越权。
         logger.error(
             "retrieve_chunks called without any permission scope — refused (fail-closed). "
-            "Pass owner_id/tenant_id from tenancy.scope_for(), or unrestricted=True for "
-            "diagnostic scripts only."
+            "Pass owner_id/tenant_ids from tenancy.request_scope(), or unrestricted=True "
+            "for diagnostic scripts only."
         )
         return []
 
@@ -1210,34 +1252,19 @@ async def retrieve_chunks(
     )
 
     # 检索前置过滤（框架图：Permission Filter 在 Vector/BM25 之前）──────────
-    # tenant_id 是第一层硬隔离：ANN 查询本身就带租户条件，跨租户向量根本
-    # 不会被召回 —— 而不是召回后再剔除（rerank 之后过滤会泄漏候选名额，
-    # 也让 BM25 语料被外租户文档稀释）。collection_id 是业务知识库范围。
-    #
-    # 平台管理员（platform_wide）没有公司边界，这里是全库召回：ACL 仍在
-    # PostgreSQL 层强制（private 只有自己的会活下来，见下面 valid_docs），
-    # 代价只是候选池略被稀释 —— 正确性不受影响，且不依赖向量载荷的时效性
-    # （老向量可能还没写 access_level 载荷，前置过滤会误杀）。
+    # Rev2：**从 must 中移除单值 tenant_id**。租户边界改由 _visibility_conditions
+    # 的 Deny-2 承接 —— 否则「自己 private 但在别的租户」的向量会被 must 一起滤掉
+    # （= admin 看不到自己 default 私库的向量侧镜像）。collection_id 仍是业务知识库范围。
     search_filter = None
-    if tenant_id or collection_id:
+    if collection_id:
         from qdrant_client.http import models as qmodels
 
-        must = []
-        if tenant_id:
-            must.append(
-                qmodels.FieldCondition(
-                    key="tenant_id",
-                    match=qmodels.MatchValue(value=tenant_id),
-                )
+        search_filter = qmodels.Filter(must=[
+            qmodels.FieldCondition(
+                key="collection_id",
+                match=qmodels.MatchValue(value=collection_id),
             )
-        if collection_id:
-            must.append(
-                qmodels.FieldCondition(
-                    key="collection_id",
-                    match=qmodels.MatchValue(value=collection_id),
-                )
-            )
-        search_filter = qmodels.Filter(must=must)
+        ])
 
     # 元数据前置过滤：与租户过滤**同一位置**（ANN 之前，见 _metadata_conditions
     # 的说明）。放在这里而不是"融合后剔除"是千份文档准确率的关键差别。
@@ -1268,7 +1295,8 @@ async def retrieve_chunks(
             owner_id=owner_id,
             department_id=user_department_id,
             tenant_wide=tenant_wide,
-            platform_wide=platform_wide,
+            tenant_ids=tenant_ids,
+            owns_tenant_ids=owns_tenant_ids,
         )
         if acl_conds:
             from qdrant_client.http import models as qmodels
@@ -1280,8 +1308,10 @@ async def retrieve_chunks(
                     list(search_filter.must_not or []) + list(acl_conds)
                 )
             logger.info(
-                "acl pre-filter active: owner=%s department_scope=%s",
-                bool(owner_id), not (tenant_wide or platform_wide),
+                "acl pre-filter active: owner=%s department_scope=%s tenants=%s owns=%s",
+                bool(owner_id), not tenant_wide,
+                tenant_scope_fingerprint(tenant_ids),
+                tenant_scope_fingerprint(owns_tenant_ids),
             )
 
     # Wider vector candidate pool so RRF fusion has material to work with
@@ -1363,39 +1393,21 @@ async def retrieve_chunks(
                 # 仅供诊断脚本：不做任何权限过滤（与升级前的"admin 全览"等价）
                 pass
             else:
-                # 第一层（DB 侧兜底）：文档归属公司必须匹配。
+                # 三层隔离的唯一 SQL 组装点：公司边界 ∪ 自己个人库。
                 # 向量层已做前置过滤，这里是纵深防御 —— Qdrant 里可能残留
-                # 迁移前没有 tenant_id payload 的旧向量。
-                # 平台管理员（platform_wide）没有公司边界，跳过这一层。
+                # 迁移前没有 tenant_id / access_level payload 的旧向量。
                 #
-                # ⚠️ 这里**不能**再写 `from app.services.tenancy import
-                # normalize_tenant_id`：函数内部的 import 会让整个函数把该名字
-                # 当作**局部变量**，从而遮蔽模块级导入。一旦这条分支没被走到
-                # （例如 unrestricted=True 的诊断路径，或 platform_wide=True），
-                # 函数末尾的 Permission Check 就会在
-                # `normalize_tenant_id(c.tenant_id)` 上抛 UnboundLocalError ——
-                # 报错位置离根因隔了几百行，且只在特定权限组合下复现。
-                # 模块顶部已经导入，直接用即可。
-                if tenant_id and not platform_wide:
-                    q = q.where(
-                        Document.tenant_id == normalize_tenant_id(tenant_id)
+                # ⚠️ 不再在这里手拼 tenant/ACL：`document_scope_clause` 已把
+                # 「private 与租户无关」的口径封装好，手拼必然与列表/关键词腿分叉。
+                q = q.where(
+                    document_scope_clause(
+                        owner_id=uuid.UUID(owner_id) if owner_id else None,
+                        department_id=user_department_id,
+                        tenant_ids=tenant_ids,
+                        owns_tenant_ids=owns_tenant_ids,
+                        tenant_wide=tenant_wide,
                     )
-                elif not platform_wide and owner_id and not tenant_id:
-                    # 历史调用只给了 owner（没有公司上下文）：退化为"仅本人"，
-                    # 绝不因为缺少 tenant_id 而把外公司的公司库文档放进来。
-                    q = q.where(Document.owner_id == uuid.UUID(owner_id))
-                    tenant_wide = False
-                # 第二层 Document ACL：公司库全员 / 部门库同部门（或宽口径角色）/
-                # **个人库仅本人（管理员也不行）**。
-                if platform_wide or tenant_id or owner_id:
-                    q = q.where(
-                        document_acl_clause(
-                            owner_id=uuid.UUID(owner_id) if owner_id else None,
-                            department_id=user_department_id,
-                            tenant_wide=tenant_wide,
-                            platform_wide=platform_wide,
-                        )
-                    )
+                )
             res = await session.execute(q)
             valid_docs = {str(r[0]) for r in res}
 
@@ -1469,7 +1481,9 @@ async def retrieve_chunks(
     # 即不同键；绝不与非本人/非本部门/非同权限视图共享语料缓存。
     perm_ctx = (
         f"{owner_id or '__none__'}:{user_department_id or '-'}"
-        f":{'TW' if tenant_wide else '-'}{'PW' if platform_wide else '-'}"
+        f":{'TW' if tenant_wide else '-'}"
+        f":{tenant_scope_fingerprint(tenant_ids)}"
+        f":{tenant_scope_fingerprint(owns_tenant_ids)}"
     )
     backend = str(getattr(settings, "HYBRID_KEYWORD_BACKEND", "postgres") or "postgres").strip().lower()
     keyword_rank_lists: list[list[tuple[str, int]]] = []
@@ -1488,11 +1502,11 @@ async def retrieve_chunks(
                 query=q,
                 fetch_n=candidate_pool,          # 与向量腿同深
                 collection_id=collection_id,
-                tenant_id=tenant_id,
+                tenant_ids=tenant_ids,
                 owner_id=owner_id,
                 user_department_id=user_department_id,
                 tenant_wide=tenant_wide,
-                platform_wide=platform_wide,
+                owns_tenant_ids=owns_tenant_ids,
                 unrestricted=unrestricted,
                 metadata_filter=metadata_filter,
             )
@@ -1565,7 +1579,7 @@ async def retrieve_chunks(
                     collection_id=collection_id,
                     owner_id=owner_id,
                     client=client,
-                    tenant_id=tenant_id,
+                    tenant_ids=tenant_ids,
                     perm_context=perm_ctx,
                 )
                 rows: list[tuple[str, int]] = []
@@ -1795,14 +1809,18 @@ async def retrieve_chunks(
 
     # ── Permission Check（框架图：Rerank 之后、进 Context 之前的最终闸）──────
     # 前面的 ANN 前置过滤 + PG valid_docs 已经保证了租户/ACL 可见性，这里是
-    # 纯函数的最后兜底：任何环节出 bug 漏进来的跨租户 chunk 都在出参前拦下。
-    if tenant_id:
+    # 纯函数的最后兜底：任何环节出 bug 漏进来的、DB 侧不可见的 chunk 都在出参前拦下。
+    #
+    # ⚠️ 这里**不能**简单按「tenant ∈ tenant_ids」过滤：`private` 层级与租户无关
+    # （admin 自己落在 default 的私库必须保留，否则就是 Rev2 修复的那个回归）。
+    # 改用 PG 侧权威可见集合 `valid_docs`（由 `document_scope_clause` 算出）。
+    if valid_docs:
         before = len(chunks)
-        chunks = [c for c in chunks if normalize_tenant_id(c.tenant_id) == tenant_id]
+        chunks = [c for c in chunks if c.document_id in valid_docs]
         if len(chunks) != before:
             logger.error(
-                "Permission Check dropped %d cross-tenant chunk(s) — 前置过滤存在漏洞，请排查",
-                before - len(chunks),
+                "Permission Check dropped %d chunk(s) outside the DB-visible set — "
+                "前置过滤存在漏洞，请排查", before - len(chunks),
             )
 
     logger.info(
@@ -1819,6 +1837,6 @@ async def retrieve_chunks(
         top_k,
         use_hier,
         _summarize_metadata_filter(metadata_filter),
-        tenant_id or "-",
+        tenant_scope_fingerprint(tenant_ids),
     )
     return chunks

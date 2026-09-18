@@ -66,18 +66,70 @@ def _opt_dict(value) -> dict:
     return dict(value) if isinstance(value, dict) else {}
 
 
+async def count_by_tenant(
+    *,
+    owner_id: uuid.UUID | None = None,
+    tenant_ids: frozenset[str] | None = None,
+    owns_tenant_ids: frozenset[str] = frozenset(),
+    department_id: str | None = None,
+    tenant_wide: bool = False,
+) -> dict[str, int]:
+    """
+    按公司分组统计**当前用户可见**的文档数（``/companies/accessible`` 的 ``doc_count``）.
+
+    与 :func:`list_documents` **共用同一个** ``document_scope_clause`` 入口 ——
+    这是「筛选项里的计数 == 选中该公司的列表结果数」的结构性保证，杜绝
+    「筛选项显示 3 家但点进去空」。
+
+    参数：
+
+        owner_id:        个人库归属人（恒为本人 id）。
+        tenant_ids:      待统计的公司集合（``None``/空集 → 返回空字典，不泄漏全平台）。
+        owns_tenant_ids: admin 自建测试公司集合（可见其中他人私库）。
+        department_id:   第二层部门条件。
+        tenant_wide:     本租户内部门库全通。
+
+    Returns:
+        ``{tenant_id: count}``（仅含 ``tenant_ids`` 里的公司；无文档的公司不出现在键中，
+        调用方按 0 兜底）。
+    """
+    if tenant_ids is None or not tenant_ids:
+        return {}
+
+    from app.services.tenancy import document_scope_clause
+
+    async with get_db_session() as session:
+        stmt = (
+            select(Document.tenant_id, func.count())
+            .where(Document.tenant_id.in_(sorted(tenant_ids)))
+            .where(
+                document_scope_clause(
+                    owner_id=owner_id,
+                    department_id=department_id,
+                    tenant_ids=tenant_ids,
+                    owns_tenant_ids=owns_tenant_ids,
+                    tenant_wide=tenant_wide,
+                )
+            )
+            .group_by(Document.tenant_id)
+        )
+        rows = (await session.execute(stmt)).all()
+    return {str(t): int(c) for t, c in rows}
+
+
 async def list_documents(
     page: int = 1,
     limit: int = 20,
     status: DocumentStatus | None = None,
     owner_id: uuid.UUID | None = None,
     collection_id: uuid.UUID | None = None,
-    tenant_id: str | None = None,
+    tenant_ids: frozenset[str] | None = None,
     user_department_id: str | None = None,
-    read_all: bool = False,
+    tenant_wide: bool = False,
+    owns_tenant_ids: frozenset[str] = frozenset(),
+    company_id: str | None = None,
     viewer: User | None = None,
     access_level: str | None = None,
-    platform_wide: bool = False,
 ) -> DocumentListResponse:
     """
     Return a paginated list of Document rows, optionally filtered by status,
@@ -90,12 +142,13 @@ async def list_documents(
         owner_id:  个人库归属人 —— **恒为本人 id**（含平台管理员）。
                    None = 不返回任何个人库文档。
         collection_id: Restrict to one KB collection (None = all documents).
-        tenant_id: 第一层公司过滤。None 只在 platform_wide（平台管理员）时出现。
-        read_all: 调用者是否可读本租户全部**部门库/公司库**（企业/知识库管理员 /
-                  平台管理员）—— 只放宽部门维度，**他人个人库始终不可见**。
-        platform_wide: 跨公司（平台管理员）：跳过公司过滤，但仍过 ACL。
-        viewer: 传入用户后可逐条算出 is_owner / can_delete / 发布能力，
-                前端据此决定按钮显隐（与后端校验同源，不会出现点了才 403）。
+        tenant_ids: 第一层公司过滤**集合**（None = 不限制诊断；空集 = fail-closed）。
+        tenant_wide: 本租户内部门库全通（企业/知识库管理员 / 平台管理员）。
+        owns_tenant_ids: admin 的自建测试公司集合（可见其中他人私库）。
+        company_id: 只列出归属该公司的文档（文档页公司筛选）。**不**放宽可见
+                   范围 —— 它只在前面的 scope 条件之上再收窄；取值不在可见
+                   范围内时结果自然为空（fail-safe）。
+        viewer: 传入用户后可逐条算出 is_owner / can_delete / 发布能力。
         access_level: 只列出某一层（个人/部门/公司）的文档。
     """
     offset = (page - 1) * limit
@@ -109,26 +162,21 @@ async def list_documents(
             base_q = base_q.where(Document.status == status)
             count_q = count_q.where(Document.status == status)
 
-        # ── 三层隔离：第一层公司 + 第二层 Document ACL（与检索同规则）──────
-        from app.services.tenancy import document_acl_clause, normalize_tenant_id
+        # ── 三层隔离：唯一 SQL 组装点（公司边界 ∪ 自己个人库，与检索同规则）────
+        from app.services.tenancy import document_scope_clause
 
-        if tenant_id is not None and not platform_wide:
-            base_q = base_q.where(Document.tenant_id == normalize_tenant_id(tenant_id))
-            count_q = count_q.where(Document.tenant_id == normalize_tenant_id(tenant_id))
-        elif platform_wide:
-            pass  # 平台管理员：没有公司边界
-        elif owner_id is not None:
-            # 历史调用只给了 owner（没有公司上下文）：退化为"仅本人"，
-            # 不因为缺少 tenant_id 而把外公司的公司库文档放进来。
-            base_q = base_q.where(Document.owner_id == owner_id)
-            count_q = count_q.where(Document.owner_id == owner_id)
-
-        if platform_wide or tenant_id is not None or owner_id is not None:
-            acl = document_acl_clause(
+        if (
+            owner_id is not None
+            or tenant_ids is not None
+            or tenant_wide
+            or owns_tenant_ids
+        ):
+            acl = document_scope_clause(
                 owner_id=owner_id,
                 department_id=user_department_id,
-                tenant_wide=read_all,
-                platform_wide=platform_wide,
+                tenant_ids=tenant_ids,
+                owns_tenant_ids=owns_tenant_ids,
+                tenant_wide=tenant_wide,
             )
             base_q = base_q.where(acl)
             count_q = count_q.where(acl)
@@ -136,6 +184,11 @@ async def list_documents(
         if collection_id is not None:
             base_q = base_q.where(Document.collection_id == collection_id)
             count_q = count_q.where(Document.collection_id == collection_id)
+        if company_id:
+            # 文档页公司筛选：只保留归属该公司的文档（在可见范围之上再收窄，
+            # 因此取值来自 /companies/accessible 之外的集合只会得到空列表）。
+            base_q = base_q.where(Document.tenant_id == company_id)
+            count_q = count_q.where(Document.tenant_id == company_id)
         if access_level:
             from app.services.tenancy import normalize_access_level
 
@@ -188,7 +241,11 @@ async def list_documents(
 
         level = normalize_access_level(row.access_level)
         capability = (
-            publish_capability(viewer, row)
+            publish_capability(
+                viewer, row,
+                tenant_ids=tenant_ids,
+                owns_tenant_ids=owns_tenant_ids,
+            )
             if viewer is not None
             else {
                 "is_owner": False,
@@ -266,8 +323,9 @@ async def list_documents(
 async def delete_document(
     document_id: uuid.UUID,
     owner_id: uuid.UUID | None = None,
-    tenant_id: str | None = None,
     *,
+    tenant_ids: frozenset[str] | None = None,
+    owns_tenant_ids: frozenset[str] = frozenset(),
     actor: User | None = None,
 ) -> DocumentDeleteResponse:
     """
@@ -279,10 +337,12 @@ async def delete_document(
     Args:
         document_id: UUID of the document to delete.
         owner_id:    Legacy owner scoping — only used when *actor* is absent.
-        tenant_id:   第一层兜底，跨公司一律 404（平台管理员不受此限）。
+        tenant_ids:  第一层公司集合；``delete_permission_for`` 据此判定"跨公司
+                     一律按不存在返回"（不泄漏存在性）。``None`` = 按身份推导。
+        owns_tenant_ids: admin 的自建测试公司集合（可读他人私库，但**不可删**）。
         actor:       删除操作者。传入后按**能力矩阵**判定
                      （本人 / 部门负责人本部门 / 知识库管理员与企业管理员全公司 /
-                     平台管理员跨公司），而不是简单地"必须是我上传的"。
+                     平台管理员在自建测试公司内），而不是简单地"必须是我上传的"。
                      无权限时抛 PermissionDenied（含中文原因）。
                      **他人个人库文档谁也删不了** —— 个人库是归属人专属。
 
@@ -290,8 +350,8 @@ async def delete_document(
         DocumentDeleteResponse on success.
 
     Raises:
-        KeyError: 文档不存在（或跨租户不可见）。
-        PermissionDenied: 角色能力不足以删除该层级 / 该归属的文档。
+        KeyError: 文档不存在。
+        PermissionDenied: 角色能力不足以删除该层级 / 该归属的文档（跨公司时为 404）。
     """
     # ── 1. Fetch document metadata ────────────────────────────────────────────
     # 修复（问题2）：以前这里用 `owner_id = 当前用户` 过滤，于是"列表里看得见、
@@ -299,21 +359,14 @@ async def delete_document(
     # 前端弹出 "Document '...' not found."。用户看到的现象是"文档明明在列表里，
     # 删除却说找不到"。
     #
-    # 现在的顺序是：先按**租户**取回文档（跨公司仍然 404，不泄漏存在性），
-    # 再用能力矩阵判定"这个角色能不能删这一层文档"：
-    #   本人 / 知识库管理员 / 企业管理员 / 平台管理员 → 可删
-    #   部门负责人 → 可删本部门范围内他人文档
-    #   普通员工   → 只能删自己的，否则 403 + 中文原因
+    # Rev2：公司边界不再写在这条 SQL 里（`tenant_id =` 单值判定已废弃），改由
+    # `delete_permission_for` 统一判定 —— 跨公司返回「不存在」（不泄漏存在性），
+    # 个人库私库分支先于公司边界返回（admin 自建集合内他人私库可读、**不可删**）。
     async with get_db_session() as session:
         query = select(Document).where(Document.id == document_id)
         if actor is None and owner_id is not None:
             # 兼容旧调用方（无身份上下文时退化为"仅本人"）
             query = query.where(Document.owner_id == owner_id)
-        if tenant_id is not None:
-            # 第一层兜底：跨租户文档即便猜到 UUID 也 404（无存在性泄漏）
-            from app.services.tenancy import normalize_tenant_id
-
-            query = query.where(Document.tenant_id == normalize_tenant_id(tenant_id))
         doc: Document | None = (await session.execute(query)).scalar_one_or_none()
 
     if doc is None:
@@ -322,7 +375,12 @@ async def delete_document(
     if actor is not None:
         from app.services.tenancy import delete_permission_for
 
-        allowed, reason = delete_permission_for(doc, actor)
+        allowed, reason = delete_permission_for(
+            doc,
+            actor,
+            tenant_ids=tenant_ids,
+            owns_tenant_ids=owns_tenant_ids,
+        )
         if not allowed:
             # 跨公司时 reason 就是"文档不存在"（不泄漏），按 404 处理
             raise PermissionDenied(reason, not_found="不存在" in reason)
@@ -381,10 +439,11 @@ async def delete_document(
 async def get_document_chunks(
     document_id: uuid.UUID,
     owner_id: uuid.UUID | None = None,
-    tenant_id: str | None = None,
+    *,
+    tenant_ids: frozenset[str] | None = None,
+    owns_tenant_ids: frozenset[str] = frozenset(),
     user_department_id: str | None = None,
-    read_all: bool = False,
-    platform_wide: bool = False,
+    tenant_wide: bool = False,
 ) -> dict:
     """
     Fetch the full ordered chunk list of one document for原文预览.
@@ -395,10 +454,11 @@ async def get_document_chunks(
     Args:
         document_id: UUID of the document.
         owner_id:    个人库归属人（恒为本人 id）；None = 看不到任何个人库。
-        read_all:    企业/知识库管理员可跨部门预览本公司的部门库与公司库文档。
+        tenant_ids:  第一层公司集合（与检索/列表同规则）；None = 按身份推导。
+        owns_tenant_ids: admin 自建测试公司集合（可见其中他人私库）。
+        tenant_wide: 企业/知识库管理员可跨部门预览本公司的部门库与公司库文档。
                      **他人个人库文档对他们同样不可预览**（审核共享申请时只
                      看申请单上的文件名/申请人/目标层级，不展示正文）。
-        platform_wide: 平台管理员跨公司。
 
     Returns:
         {"document_id", "filename", "page_count", "total", "chunks": [...]}
@@ -407,21 +467,22 @@ async def get_document_chunks(
     # ── 1. Metadata (404 without existence leak) ──────────────────────────────
     async with get_db_session() as session:
         query = select(Document).where(Document.id == document_id)
-        from app.services.tenancy import document_acl_clause, normalize_tenant_id
+        from app.services.tenancy import document_scope_clause
 
-        if tenant_id is not None and not platform_wide:
-            # 三层隔离：第一层公司 + 第二层 ACL（与检索/列表同规则）
-            query = query.where(Document.tenant_id == normalize_tenant_id(tenant_id))
-        elif not platform_wide and owner_id is not None:
-            # 无公司上下文的历史调用：退化为"仅本人"
-            query = query.where(Document.owner_id == owner_id)
-        if platform_wide or tenant_id is not None or owner_id is not None:
+        if (
+            owner_id is not None
+            or tenant_ids is not None
+            or tenant_wide
+            or owns_tenant_ids
+        ):
+            # 三层隔离：公司边界 ∪ 自己的个人库（唯一 SQL 组装点，与检索/列表同规则）
             query = query.where(
-                document_acl_clause(
+                document_scope_clause(
                     owner_id=owner_id,
                     department_id=user_department_id,
-                    tenant_wide=read_all,
-                    platform_wide=platform_wide,
+                    tenant_ids=tenant_ids,
+                    owns_tenant_ids=owns_tenant_ids,
+                    tenant_wide=tenant_wide,
                 )
             )
         doc: Document | None = (await session.execute(query)).scalar_one_or_none()

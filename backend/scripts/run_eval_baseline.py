@@ -109,7 +109,7 @@ async def check_negatives(golden: dict, username: str) -> list[dict]:
     from app.db.postgres import get_db_session
     from app.db.user_models import User
     from app.services.retrieval_service import retrieve_chunks
-    from app.services.tenancy import scope_for
+    from app.services.tenancy import request_scope
 
     settings = get_settings()
     async with get_db_session() as session:
@@ -119,7 +119,7 @@ async def check_negatives(golden: dict, username: str) -> list[dict]:
     if user is None:
         return [{"query": nc["query"], "error": f"user {username!r} not found",
                  "refused": False} for nc in golden["negative_cases"]]
-    scope = scope_for(user)
+    scope = await request_scope(user)
 
     out: list[dict] = []
     for case in golden["negative_cases"]:
@@ -127,10 +127,10 @@ async def check_negatives(golden: dict, username: str) -> list[dict]:
             chunks = await retrieve_chunks(
                 case["query"], top_k=10,
                 owner_id=str(scope.owner_id) if scope.owner_id else None,
-                tenant_id=scope.tenant_id,
+                tenant_ids=scope.tenant_ids,
                 user_department_id=scope.department_id,
                 tenant_wide=scope.tenant_wide,
-                platform_wide=scope.platform_wide,
+                owns_tenant_ids=scope.owns_tenant_ids,
             )
             top = max((c.score for c in chunks), default=0.0)
             top_doc = chunks[0].document_id if chunks else None
@@ -175,7 +175,7 @@ async def measure_band_headroom(
     from app.db.user_models import User
     from app.services.evaluation import gold_score_profile, item_from_chunk
     from app.services.retrieval_service import retrieve_chunks
-    from app.services.tenancy import scope_for
+    from app.services.tenancy import request_scope
 
     settings = get_settings()
     async with get_db_session() as session:
@@ -184,7 +184,7 @@ async def measure_band_headroom(
         ).scalars().first()
     if user is None:
         return {"error": f"user {username!r} not found"}
-    scope = scope_for(user)
+    scope = await request_scope(user)
 
     # 只测「金标 ≥ 2 条」的用例：单金标用例 gold/head ≡ 1.0，无论如何都有上界
     # 1.0 —— 放进来看起来"余量充足"，其实是恒真命题，会掩盖真实风险。
@@ -196,10 +196,10 @@ async def measure_band_headroom(
         return await retrieve_chunks(
             query, top_k=top_k,
             owner_id=str(scope.owner_id) if scope.owner_id else None,
-            tenant_id=scope.tenant_id,
+            tenant_ids=scope.tenant_ids,
             user_department_id=scope.department_id,
             tenant_wide=scope.tenant_wide,
-            platform_wide=scope.platform_wide,
+            owns_tenant_ids=scope.owns_tenant_ids,
         )
 
     per_case: list[dict] = []

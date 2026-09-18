@@ -151,14 +151,18 @@ class MasterState(TypedDict):
     top_k: int
     owner_id: str | None
     collection_id: str | None
-    # Multi-Tenant 三层隔离：tenant_id 第一层（检索前置过滤），
+    # Multi-Tenant 三层隔离：tenant_ids 第一层（检索前置过滤的公司集合），
     # department_id 第二层（Document ACL），user_id 第三层（会话/消息归属）。
-    # tenant_id=None 只表示"无公司边界 = 平台管理员"，此时仍受 ACL 约束：
-    # tenant_wide 放宽部门维度，platform_wide 跨公司，个人库则永远只看自己的。
-    tenant_id: str | None
+    # tenant_ids=None 只表示"按身份推导（fail-closed）"，绝不回退全平台。
+    # tenant_wide 放宽部门维度，owns_tenant_ids 表达 admin 自建测试公司集合
+    # （可读其中他人私库，但不可删），个人库则永远只看自己的。
+    tenant_ids: frozenset[str] | None
     department_id: str | None
     tenant_wide: bool
-    platform_wide: bool
+    owns_tenant_ids: frozenset[str]
+    # 第三层（会话/消息归属）用的**单一**租户键：普通用户 = 其所属公司；
+    # 平台管理员 = None（无归属公司）。它**不参与**文档可见性过滤。
+    conversation_tenant_id: str | None
     user_id: str | None
     # 强制模式（前端显式指定时跳过路由）
     forced_mode: str | None
@@ -371,13 +375,13 @@ async def _retrieve_node(state: MasterState) -> dict:
         collection_id=state.get("collection_id"),
         extra_queries=safe_variants,
         extra_vector_queries=[safe_hyde] if safe_hyde else None,
-        # 三层隔离：第一层公司前置过滤 + 第二层部门 ACL（框架图 Permission
-        # Filter 在检索之前，而非 rerank 之后）。tenant_id=None（平台管理员）
+        # 三层隔离：第一层公司集合前置过滤 + 第二层部门 ACL（框架图 Permission
+        # Filter 在检索之前，而非 rerank 之后）。tenant_ids=None（按身份推导）
         # 只跳过公司维度，ACL 仍然生效 —— 别人的个人库永远检索不到。
-        tenant_id=state.get("tenant_id"),
+        tenant_ids=state.get("tenant_ids"),
         user_department_id=state.get("department_id"),
         tenant_wide=bool(state.get("tenant_wide")),
-        platform_wide=bool(state.get("platform_wide")),
+        owns_tenant_ids=state.get("owns_tenant_ids") or frozenset(),
     )
 
     sources = [
@@ -753,10 +757,10 @@ async def _summary_digests_node(state: MasterState) -> dict:
     """
     acl_kwargs = {
         "owner_id": state.get("owner_id"),
-        "tenant_id": state.get("tenant_id"),
+        "tenant_ids": state.get("tenant_ids"),
+        "owns_tenant_ids": state.get("owns_tenant_ids") or frozenset(),
         "user_department_id": state.get("department_id"),
         "tenant_wide": bool(state.get("tenant_wide")),
-        "platform_wide": bool(state.get("platform_wide")),
     }
 
     try:
@@ -888,10 +892,10 @@ async def _summarize_node(state: MasterState) -> dict:
 async def _collect_digests_node(state: MasterState) -> dict:
     digests = await collect_document_digests(
         owner_id=state.get("owner_id"),
-        tenant_id=state.get("tenant_id"),
+        tenant_ids=state.get("tenant_ids"),
+        owns_tenant_ids=state.get("owns_tenant_ids") or frozenset(),
         user_department_id=state.get("department_id"),
         tenant_wide=bool(state.get("tenant_wide")),
-        platform_wide=bool(state.get("platform_wide")),
     )
     return {"digests": digest_sources(digests)}
 
@@ -1124,13 +1128,14 @@ def _build_turn_meta(state: MasterState) -> dict:
 async def _save_history_node(state: MasterState) -> dict:
     # 第三层隔离：消息带上真实用户与租户（conversation_id + tenant_id +
     # user_id 的隔离键），跨用户/跨租户无法续读到这段记忆。
+    # 这里的 tenant_id 是**会话租户**（第三层），与文档可见性的 tenant_ids 无关。
     user_id = state.get("user_id")
     await save_turn(
         conversation_id=uuid.UUID(state["conversation_id"]),
         user_message=state["query"],
         assistant_message=state["answer"],
         user_id=uuid.UUID(user_id) if user_id else None,
-        tenant_id=state.get("tenant_id"),
+        tenant_id=state.get("conversation_tenant_id"),
         # 依据快照随回答一起落库，历史会话才能还原当时的引用来源
         assistant_meta=_build_turn_meta(state),
     )
@@ -1349,10 +1354,11 @@ async def stream_master(
     forced_mode: str | None = None,
     user_id: str | None = None,
     username: str | None = None,
-    tenant_id: str | None = None,
+    tenant_ids: frozenset[str] | None = None,
     department_id: str | None = None,
     tenant_wide: bool = False,
-    platform_wide: bool = False,
+    owns_tenant_ids: frozenset[str] = frozenset(),
+    conversation_tenant_id: str | None = None,
 ) -> AsyncGenerator[dict, None]:
     """
     执行 master graph 并产出 SSE 事件字典.
@@ -1393,10 +1399,11 @@ async def stream_master(
         "top_k": top_k,
         "owner_id": owner_id,
         "collection_id": collection_id,
-        "tenant_id": tenant_id,
+        "tenant_ids": tenant_ids,
         "department_id": department_id,
         "tenant_wide": tenant_wide,
-        "platform_wide": platform_wide,
+        "owns_tenant_ids": owns_tenant_ids,
+        "conversation_tenant_id": conversation_tenant_id,
         "user_id": user_id,
         "forced_mode": forced_mode,
         "intent": "",

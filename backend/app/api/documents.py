@@ -70,6 +70,13 @@ async def upload_documents(
             "department=同部门 / tenant=全租户共享。"
         ),
     ),
+    company_id: str | None = Form(
+        None,
+        description=(
+            "文档归属的公司 tenant_id（平台管理员**必填**，且限其自建测试公司；"
+            "其余角色忽略，恒归属本公司）。"
+        ),
+    ),
     user: User = Depends(require_permission("document.write")),
 ) -> UploadResponse:
     settings = get_settings()
@@ -135,12 +142,47 @@ async def upload_documents(
         ACCESS_TENANT,
         DEFAULT_DOCUMENT_ACCESS_LEVEL,
         access_scope_name,
+        is_platform_admin,
         normalize_access_level,
         publish_requirement,
     )
 
+    is_admin = is_platform_admin(user)
+
+    # ── 决策 6：平台管理员上传**必须**指定归属的测试公司 ─────────────────────
+    # admin 的 effective_tenant_id 是 "default"（它不属于任何公司），若沿用会把
+    # 文档落进一个它自己都看不到的租户。因此 admin 必须显式选一个**自建测试公司**，
+    # 文档 tenant_id = 该公司 id。非 admin 一律归属本公司（company_id 被忽略）。
+    upload_tenant_id = effective_tenant_id(user)
+    if is_admin:
+        from app.services.company_registry import tenant_ids_created_by
+
+        owned = await tenant_ids_created_by(user.id)
+        if not owned:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="暂无测试公司，请先创建公司",
+            )
+        chosen = (company_id or "").strip()
+        if not chosen:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="请选择归属的测试公司",
+            )
+        if chosen not in owned:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="只能上传到你**自己创建**的测试公司",
+            )
+        upload_tenant_id = chosen
+
     if access_level is None or not str(access_level).strip():
-        target_level = normalize_access_level(DEFAULT_DOCUMENT_ACCESS_LEVEL)
+        # admin 默认落「公司库」（测试公司内成员才检索得到素材）；其余角色沿用
+        # 系统默认（个人库）。两者都只在上传者未显式指定层级时生效。
+        default_level = (
+            ACCESS_TENANT if is_admin else DEFAULT_DOCUMENT_ACCESS_LEVEL
+        )
+        target_level = normalize_access_level(default_level)
     else:
         raw_level = str(access_level).strip().lower()
         if raw_level not in {"private", "department", "tenant"}:
@@ -187,8 +229,10 @@ async def upload_documents(
             content,
             owner_id=user.id,
             collection_id=collection_id,
-            # 三层隔离：文档归属上传者的租户；层级由权限矩阵裁决后的 target_level 决定
-            tenant_id=effective_tenant_id(user),
+            # 三层隔离：非 admin 恒归属本公司；admin 归属其选定的自建测试公司
+            # （决策 6，见上方 upload_tenant_id）；层级由权限矩阵裁决后的
+            # target_level 决定。
+            tenant_id=upload_tenant_id,
             department_id=upload_department_id,
             access_level=target_level,
         )

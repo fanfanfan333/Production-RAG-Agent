@@ -18,6 +18,7 @@ from app.api.admin_users import router as admin_users_router
 from app.api.auth import router as auth_router
 from app.api.badcases import router as badcases_router
 from app.api.collections import router as collections_router
+from app.api.companies import router as companies_router
 from app.api.conversations import router as conversations_router
 from app.api.document_management import router as document_management_router
 from app.api.documents import router as documents_router
@@ -40,6 +41,7 @@ from app.db import eval_models  # noqa: F401 — registers eval_runs table (评�
 from app.db import user_models  # noqa: F401 — registers users/collections/audit_logs
 from app.db import share_models  # noqa: F401 — registers share_requests (三层知识库)
 from app.db import staff_models  # noqa: F401 — registers staff_requests (企业身份验证)
+from app.db import company_models  # noqa: F401 — registers companies (公司注册表)
 from app.db.postgres import dispose_engine, get_engine
 from app.db.postgres import Base
 from app.db.qdrant import close_qdrant_client
@@ -217,6 +219,7 @@ def create_app() -> FastAPI:
     app.include_router(admin_users_router)       # RBAC — platform user/role administration
     app.include_router(share_requests_router)    # 三层知识库 — 申请共享 / 查看申请 / 审核
     app.include_router(staff_router)             # 企业身份 — 身份验证申请 / 层级审核 / 成员管理
+    app.include_router(companies_router)         # 公司注册表 — /companies 清单 / 创建 / 改名 / 可访问
 
     return app
 

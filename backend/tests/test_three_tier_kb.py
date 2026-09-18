@@ -232,8 +232,15 @@ def test_delete_permission_matrix():
     check("跨公司：不暴露存在性（按'不存在'表述）", "不存在" in reason)
 
     platform_admin = _user(User.ROLE_ADMIN, tenant_id="company_c")
+    # Rev2：admin 的删除范围同样收敛为**自建测试公司集合**（按 created_by 锁定）。
+    ok, _ = delete_permission_for(
+        company_doc, platform_admin,
+        tenant_ids=frozenset({"company_a"}),
+        owns_tenant_ids=frozenset({"company_a"}),
+    )
+    check("平台管理员：在**自建测试公司集合**内可删部门/公司库文档", ok)
     ok, _ = delete_permission_for(company_doc, platform_admin)
-    check("平台管理员：跨公司可删部门/公司库文档", ok)
+    check("平台管理员：对**非自建**公司不可删（收敛，不再跨全平台）", not ok)
     ok, reason = delete_permission_for(personal, platform_admin)
     check("平台管理员：**不能**删他人个人库文档（全平台 ≠ 看穿个人库）", not ok)
     check("平台管理员：拒绝原因说明个人库只属于归属人",
@@ -309,8 +316,16 @@ def test_visibility_and_read_all():
     check("公司库：知识库管理员可见", can_access_document(company_doc, kb_admin))
     check("部门库：跨部门的知识库管理员可见（本公司内宽口径）",
           can_access_document(dept_doc, kb_admin))
-    check("公司库：平台管理员跨公司可见",
-          can_access_document(other_company_doc, platform_admin))
+    # Rev2：平台管理员的可见范围收敛为**自建测试公司集合**（按 created_by 锁定），
+    # 不再"跨全平台"。
+    check("公司库：平台管理员对**非自建**公司不可见（Rev2 收敛）",
+          not can_access_document(other_company_doc, platform_admin))
+    check("公司库：平台管理员在**自建测试公司集合**内可见",
+          can_access_document(
+              other_company_doc, platform_admin,
+              tenant_ids=frozenset({"company_b"}),
+              owns_tenant_ids=frozenset({"company_b"}),
+          ))
     check("公司库：普通员工看不到其他公司",
           not can_access_document(other_company_doc, peer))
     check("read_all 角色集合 = 企业管理员 + 知识库管理员（**不含 admin**）",
@@ -334,23 +349,72 @@ def test_scope_for_matches_acl():
     platform_admin = _user(User.ROLE_ADMIN, tenant_id="default")
 
     s_emp = scope_for(employee)
-    check("普通员工：锁本公司 + 本部门 + 自己的个人库",
-          s_emp.tenant_id == "company_a" and s_emp.department_id == "tech"
-          and not s_emp.tenant_wide and not s_emp.platform_wide)
+    check("普通员工：锁本公司集合 + 本部门 + 自己的个人库",
+          s_emp.tenant_ids == frozenset({"company_a"})
+          and s_emp.department_id == "tech"
+          and not s_emp.tenant_wide and not s_emp.owns_tenant_ids)
     s_kb = scope_for(kb_admin)
-    check("知识库管理员：锁本公司 + 部门全通",
-          s_kb.tenant_id == "company_a" and s_kb.tenant_wide
-          and not s_kb.platform_wide)
+    check("知识库管理员：锁本公司集合 + 部门全通",
+          s_kb.tenant_ids == frozenset({"company_a"}) and s_kb.tenant_wide
+          and not s_kb.owns_tenant_ids)
+    # Rev2：未传自建集合时，admin 的公司集合为空（fail-closed，不回退全平台）
     s_admin = scope_for(platform_admin)
-    check("平台管理员：无公司边界（跨公司）",
-          s_admin.tenant_id is None and s_admin.platform_wide
-          and s_admin.cross_tenant)
+    check("平台管理员：无自建公司时公司集合为空（fail-closed）",
+          s_admin.tenant_ids == frozenset()
+          and s_admin.owns_tenant_ids == frozenset())
+    # 传入自建测试公司集合后：tenant_ids = owns_tenant_ids = 该集合
+    owned = frozenset({"c8111de986583", "cfb08c53677c4"})
+    s_admin_owned = scope_for(platform_admin, owned_tenant_ids=owned)
+    check("平台管理员：公司集合 = 自建测试公司集合",
+          s_admin_owned.tenant_ids == owned
+          and s_admin_owned.owns_tenant_ids == owned
+          and s_admin_owned.cross_tenant)
     check("平台管理员的个人库归属仍是自己（不会变成'看所有人个人库'）",
-          s_admin.owner_id == platform_admin.id)
+          s_admin.owner_id == platform_admin.id
+          and s_admin_owned.owner_id == platform_admin.id)
     check("平台管理员展示身份 = 全平台",
           company_display_name(platform_admin) == PLATFORM_SCOPE_LABEL)
     check("普通用户展示身份仍是自己的公司",
           company_display_name(employee) == "company_a")
+
+
+def test_admin_default_private_doc_still_visible():
+    """
+    Rev2 正确性锚点（P0 回归守卫）：admin 落在 ``default`` 租户的**自己的个人库**
+    文档必须恒可见 —— ``private`` 只按 ``owner_id == 我`` 判定、**不参与租户过滤**。
+
+    这正是"把个人库从公司边界的合取里拿出来做 or_"修掉的那处静默回归。
+    """
+    from app.services.tenancy import document_scope_clause
+    from sqlalchemy.dialects import postgresql
+
+    platform_admin = _user(User.ROLE_ADMIN, tenant_id="default",
+                          uid=uuid.uuid4())
+    default_private = _StubDoc(owner_id=platform_admin.id, tenant_id="default",
+                               access_level=ACCESS_PRIVATE)
+
+    # 单文档判定：admin 无自建公司（集合为空）→ 自己的 default 私库仍可见
+    check("admin 的 default 私库：can_access_document 为真",
+          can_access_document(default_private, platform_admin,
+                              tenant_ids=frozenset(),
+                              owns_tenant_ids=frozenset()))
+    # 他人私库（同为空集合）→ 不可见
+    check("admin 对他人 default 私库仍不可见",
+          not can_access_document(
+              _StubDoc(owner_id=uuid.uuid4(), tenant_id="default",
+                       access_level=ACCESS_PRIVATE),
+              platform_admin,
+              tenant_ids=frozenset(), owns_tenant_ids=frozenset()))
+    # list/search 的唯一 SQL 入口：空公司集合下 personal 分支必须仍在（private 出现）
+    compiled = str(
+        document_scope_clause(
+            owner_id=platform_admin.id, department_id=None,
+            tenant_ids=frozenset(), owns_tenant_ids=frozenset(), tenant_wide=True,
+        ).compile(dialect=postgresql.dialect(),
+                  compile_kwargs={"literal_binds": True})
+    )
+    check("空公司集合下 scope clause 仍保留 personal(private) 分支",
+          "private" in compiled)
 
 
 def test_acl_clause_never_opens_private():
@@ -370,15 +434,13 @@ def test_acl_clause_never_opens_private():
             )
         )
 
-    wide = compiled(owner_id=None, department_id=None, tenant_wide=True,
-                    platform_wide=True)
-    check("宽口径（部门全通 + 跨公司）不含 private 分支",
+    wide = compiled(owner_id=None, department_id=None, tenant_wide=True)
+    check("宽口径（部门全通）不含 private 分支",
           "private" not in wide)
     check("宽口径含部门库与公司库",
           "department" in wide and "tenant" in wide)
 
-    mine = compiled(owner_id=uuid.uuid4(), department_id=None, tenant_wide=True,
-                    platform_wide=True)
+    mine = compiled(owner_id=uuid.uuid4(), department_id=None, tenant_wide=True)
     check("带上自己的 owner_id 后才出现 private 分支", "private" in mine)
 
     check("旧参数名 read_all 仍然等价于 tenant_wide",
@@ -717,6 +779,7 @@ if __name__ == "__main__":
         test_delete_permission_matrix,
         test_visibility_and_read_all,
         test_scope_for_matches_acl,
+        test_admin_default_private_doc_still_visible,
         test_acl_clause_never_opens_private,
         test_request_capability_is_per_level,
         test_direct_publish_cannot_downgrade,

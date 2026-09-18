@@ -70,10 +70,10 @@ async def list_accessible_documents(
     *,
     limit: int | None = None,
     owner_id: str | None = None,
-    tenant_id: str | None = None,
+    tenant_ids: frozenset[str] | None = None,
+    owns_tenant_ids: frozenset[str] = frozenset(),
     user_department_id: str | None = None,
     tenant_wide: bool = False,
-    platform_wide: bool = False,
     document_ids: list[str] | None = None,
 ) -> list[tuple]:
     """
@@ -83,8 +83,11 @@ async def list_accessible_documents(
     单独抽出来的理由：文档总结需要"用户点名了哪份文档"的完整候选清单，
     但那一步只要 id + 文件名 —— 为此跑一遍 Qdrant 采样（collect_document_digests）
     是纯浪费。抽成轻量函数后，候选解析与摘要采样各取所需、共用同一套 ACL。
+
+    Rev2：可见集 = 公司边界（tenant ∈ 集合 ∧ ACL）∪ 自己的个人库（与检索同规则）。
+    ``tenant_ids=None`` 只表示「按身份推导」，绝不回退全平台。
     """
-    from app.services.tenancy import document_acl_clause, normalize_tenant_id
+    from app.services.tenancy import document_scope_clause
 
     query = (
         select(
@@ -105,18 +108,14 @@ async def list_accessible_documents(
     elif limit:
         query = query.limit(limit)
 
-    if tenant_id and not platform_wide:
-        query = query.where(Document.tenant_id == normalize_tenant_id(tenant_id))
-    elif not platform_wide and owner_id:
-        # 无公司上下文的历史调用：退化为"仅本人"，不跨公司放量
-        query = query.where(Document.owner_id == uuid.UUID(owner_id))
-    if platform_wide or tenant_id or owner_id:
+    if owner_id is not None or tenant_ids is not None or tenant_wide or owns_tenant_ids:
         query = query.where(
-            document_acl_clause(
+            document_scope_clause(
                 owner_id=uuid.UUID(owner_id) if owner_id else None,
                 department_id=user_department_id,
+                tenant_ids=tenant_ids,
+                owns_tenant_ids=owns_tenant_ids,
                 tenant_wide=tenant_wide,
-                platform_wide=platform_wide,
             )
         )
 
@@ -130,10 +129,10 @@ async def collect_document_digests(
     chunks_per_doc: int | None = None,
     digest_chars: int | None = None,
     owner_id: str | None = None,
-    tenant_id: str | None = None,
+    tenant_ids: frozenset[str] | None = None,
+    owns_tenant_ids: frozenset[str] = frozenset(),
     user_department_id: str | None = None,
     tenant_wide: bool = False,
-    platform_wide: bool = False,
     document_ids: list[str] | None = None,
 ) -> list[DocumentDigest]:
     """
@@ -144,11 +143,11 @@ async def collect_document_digests(
         chunks_per_doc:  Chunks sampled per document for its digest.
         digest_chars:    Max characters of digest text per document.
         owner_id:        个人库归属人（恒为本人 id）；None = 不含任何个人库。
-        tenant_id:       第一层隔离 —— 摘要采样只覆盖本公司文档；
-                         None 仅当 platform_wide（平台管理员）时为真。
+        tenant_ids:      第一层公司集合 —— 摘要采样只覆盖集合内文档；
+                         None = 按身份推导（fail-closed，不回退全平台）。
+        owns_tenant_ids: admin 自建测试公司集合（可见其中他人私库）。
         user_department_id: 第二层 Document ACL 的部门条件。
         tenant_wide:     企业/知识库管理员 —— 本公司的部门库全通。
-        platform_wide:   平台管理员 —— 跨公司（个人库仍然只有自己的）。
         document_ids:    只采样这些文档（用户点名总结某几份时用）；
                          None = 全库（受 max_documents 与 ACL 约束）。
 
@@ -165,10 +164,10 @@ async def collect_document_digests(
     rows = await list_accessible_documents(
         limit=max_documents,
         owner_id=owner_id,
-        tenant_id=tenant_id,
+        tenant_ids=tenant_ids,
+        owns_tenant_ids=owns_tenant_ids,
         user_department_id=user_department_id,
         tenant_wide=tenant_wide,
-        platform_wide=platform_wide,
         document_ids=document_ids,
     )
 

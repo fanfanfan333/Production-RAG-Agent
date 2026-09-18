@@ -266,11 +266,11 @@ async def keyword_search(
     *,
     query: str,
     limit: int,
-    tenant_id: str | None,
+    tenant_ids: frozenset[str] | None,
     owner_id: str | None,
     user_department_id: str | None,
     tenant_wide: bool = False,
-    platform_wide: bool = False,
+    owns_tenant_ids: frozenset[str] = frozenset(),
     collection_id: str | None = None,
     unrestricted: bool = False,
     metadata_filter=None,
@@ -294,12 +294,15 @@ async def keyword_search(
     全部过滤在 SQL 侧完成（索引 + join），不把候选拉进进程再筛。
     """
     from app.db.models import Document, DocumentChunkTerm, DocumentStatus
-    from app.services.tenancy import document_acl_clause, normalize_tenant_id
+    from app.services.tenancy import document_scope_clause
 
     tsquery = build_tsquery(query)
     if not is_query_usable(tsquery) or limit <= 0:
         return []
-    if not unrestricted and not (owner_id or tenant_id or tenant_wide or platform_wide):
+    if not unrestricted and not (
+        owner_id is not None or tenant_ids is not None
+        or tenant_wide or bool(owns_tenant_ids)
+    ):
         # 与 retrieve_chunks 的 fail-closed 一致：没有权限上下文就不检索
         logger.error("keyword_search called without permission scope — refused (fail-closed)")
         return []
@@ -333,29 +336,22 @@ async def keyword_search(
         stmt = stmt.where(DocumentChunkTerm.collection_id == collection_id)
 
     if not unrestricted:
-        if tenant_id and not platform_wide:
-            stmt = stmt.where(Document.tenant_id == normalize_tenant_id(tenant_id))
-        elif not platform_wide and owner_id and not tenant_id:
-            # 只有 owner 没有公司上下文：退化为"仅本人"（与向量腿同一条保守规则）
-            try:
-                stmt = stmt.where(Document.owner_id == uuid.UUID(owner_id))
-            except (TypeError, ValueError):
-                return []
-            tenant_wide = False
-
-        if platform_wide or tenant_id or owner_id:
-            try:
-                owner_uuid = uuid.UUID(owner_id) if owner_id else None
-            except (TypeError, ValueError):
-                owner_uuid = None
-            stmt = stmt.where(
-                document_acl_clause(
-                    owner_id=owner_uuid,
-                    department_id=user_department_id,
-                    tenant_wide=tenant_wide,
-                    platform_wide=platform_wide,
-                )
+        # 三层隔离的唯一 SQL 组装点：公司边界 ∪ 自己个人库（private 与租户无关）。
+        # 与向量腿用**同一个** `document_scope_clause` —— 两条腿可见集合不一致时，
+        # RRF 融合出的结果会包含某一条腿看不到的文档。
+        try:
+            owner_uuid = uuid.UUID(owner_id) if owner_id else None
+        except (TypeError, ValueError):
+            owner_uuid = None
+        stmt = stmt.where(
+            document_scope_clause(
+                owner_id=owner_uuid,
+                department_id=user_department_id,
+                tenant_ids=tenant_ids,
+                owns_tenant_ids=owns_tenant_ids,
+                tenant_wide=tenant_wide,
             )
+        )
 
     stmt = _apply_metadata_filter(stmt, metadata_filter, DocumentChunkTerm)
 

@@ -63,7 +63,12 @@ RoleName = Literal["kb_admin", "dept_manager", "employee", "viewer"]
 class CreateStaffRequest(BaseModel):
     """「身份验证」弹窗的三行输入。"""
 
-    company_name: str = Field(..., max_length=128, description="公司名称")
+    company_id: str | None = Field(
+        None, description="已注册公司的标识（下拉值，优先）"
+    )
+    company_name: str | None = Field(
+        None, max_length=128, description="兼容旧入口：按名解析（须已注册）"
+    )
     department_name: str = Field(..., max_length=128, description="公司部门")
     duty: str = Field(..., max_length=128, description="部门职责")
 
@@ -153,6 +158,7 @@ async def create_request_endpoint(
     try:
         request = await create_staff_request(
             user,
+            company_id=body.company_id,
             company_name=body.company_name,
             department_name=body.department_name,
             duty=body.duty,
