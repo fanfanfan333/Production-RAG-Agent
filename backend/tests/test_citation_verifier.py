@@ -251,13 +251,25 @@ def test_range_citation_keeps_surviving_indices():
 
 def test_degenerate_range_citation_is_preserved():
     """
-    回归：退化区间 `[Source N-M]`（N > M）解析不出任何下标，必须原样保留.
+    不变量守卫：退化区间 `[Source N-M]`（N > M）解析不出任何下标，必须原样保留.
 
-    缺陷：`list(range(n, end + 1))` 在 n > M 时为空序列 → `keep == []` →
-    命中 `if not keep: return ""` 把整条抹掉。于是文本里只要别处存在任意坏
-    下标（bad_indices 非空、外层净化才会进），一条**本身不含任何坏下标**的
-    畸形引用 `[Source 3-1]` 就会被顺带删除 —— 这是错杀，违反本模块
-    "宁可漏判，不可错杀" 的立身之本。修复：下标集合为空时不动它。
+    改动前的实现是 `if any(i in bad_indices for i in range(n, end + 1))`：`any()`
+    落在空序列（`range(3, 2) == []`）上**恒为 False**，于是走到
+    `return match.group(0)` 原样保留 —— 即它是**靠 `any()` 的偶然空集语义**满足
+    这个不变量，并非有意为之。
+
+    第一次 keep-based 重构（`indices = list(range(n, end + 1))` → `keep = [...]`）
+    把它破坏了：空序列会一路走到 `if not keep: return ""`，把这条**本身不含任何
+    坏下标**的畸形引用整条错杀（中间态实测 `HAS_DEGEN_RANGE=False`）。本用例正是
+    为堵这个漏而加：只要别处存在坏下标（bad_indices 非空、外层净化才会进），
+    `[Source 3-1]` 就不得被顺带删除，否则违反本模块“宁可漏判，不可错杀”的立身之本。
+
+    修复：下标集合为空时不动它（`if not indices: return match.group(0)`），且**必须
+    写在 `if not keep: return ""` 之前** —— 顺序是这条守卫的命门，写反即失效。
+
+    定位说明：因基线本就（偶然）保留退化区间，本用例在修复前后**均通过**，故它
+    **不构成对修复前实现的判别式用例**，只是“重构后必须保持旧行为”的防线。真正
+    判别本次修复的是 test_range_citation_keeps_surviving_indices（区间部分坏 → 只删坏下标）。
     """
     sources = _sources(
         "合同争议提交北京仲裁委员会仲裁。",
