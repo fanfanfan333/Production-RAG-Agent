@@ -93,6 +93,40 @@ function normalizeLatency(raw: QualityStatsRaw["latency_ms"]): {
   };
 }
 
+/** 重置结果：scope 说明清的是哪一层，deleted 是实际删除的行数（session 窗口为 0）。 */
+export interface QualityResetResult {
+  ok: boolean;
+  window: QualityWindow;
+  scope: "in_process" | "database";
+  deleted: number;
+  resetAt: string;
+}
+
+/**
+ * 重置质量统计（不可逆，界面必须二次确认）.
+ *
+ * 语义刻意与面板当前窗口对齐：session 只清进程内计数器（不动数据库）；
+ * 24h/7d/30d/all 删除 quality_events 中该窗口内的行。
+ */
+export async function resetQualityStats(
+  window: QualityWindow
+): Promise<QualityResetResult> {
+  const raw = await apiFetch<{
+    ok: boolean;
+    window: QualityWindow;
+    scope: "in_process" | "database";
+    deleted: number;
+    reset_at: string;
+  }>(`/quality/reset?window=${window}`, { method: "POST" });
+  return {
+    ok: raw.ok,
+    window: raw.window,
+    scope: raw.scope,
+    deleted: raw.deleted ?? 0,
+    resetAt: raw.reset_at ?? "",
+  };
+}
+
 export async function getQualityStats(
   window: QualityWindow
 ): Promise<QualityStats> {

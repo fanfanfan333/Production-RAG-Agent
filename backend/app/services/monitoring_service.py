@@ -469,6 +469,38 @@ async def quality_stats(window_seconds: float | None) -> dict:
     }
 
 
+async def reset_quality_events(window_seconds: float | None) -> int:
+    """
+    清空 quality_events（按时间窗），用于"重置统计、从头重新计数".
+
+    Args:
+        window_seconds: 时间窗秒数；None = 清空全部历史。
+
+    Returns:
+        实际删除的行数。
+
+    注意：这是**不可逆**的删除，且 quality_events 表本身不带 tenant_id
+    （与 /quality/stats、/badcases 一样是全局审计口径），因此调用方必须用
+    audit.write 权限收口，并在界面上二次确认。
+    """
+    from sqlalchemy import delete
+
+    from app.db.postgres import get_db_session
+    from app.db.quality_models import QualityEvent
+
+    stmt = delete(QualityEvent)
+    if window_seconds is not None:
+        cutoff = datetime.now(tz=timezone.utc).timestamp() - window_seconds
+        stmt = stmt.where(
+            QualityEvent.created_at
+            >= datetime.fromtimestamp(cutoff, tz=timezone.utc)
+        )
+
+    async with get_db_session() as session:
+        result = await session.execute(stmt)
+        return int(result.rowcount or 0)
+
+
 __all__ = [
     "BadCaseSignal",
     "QualityEventSignal",
@@ -485,4 +517,5 @@ __all__ = [
     "record_query",
     "record_refusal",
     "reset_metrics",
+    "reset_quality_events",
 ]

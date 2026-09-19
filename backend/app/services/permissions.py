@@ -99,6 +99,12 @@ _KB_ADMIN_PERMISSIONS = _DEPT_MANAGER_PERMISSIONS | frozenset(
         "document.read.all",
         "share.review.company",
         "staff.admin",
+        # audit.write —— 重置质量统计（清 quality_events / 进程内计数器）。
+        # 刻意**不放**在部门负责人层：quality_events 不带 tenant_id，重置是
+        # 一次全局且不可逆的删除；让部门负责人（只能看指标的角色）握有抹掉
+        # 全公司历史指标的权力属于过度授权。可见性归 audit.read，重置归
+        # audit.write，二者分层的意义正在于此。
+        "audit.write",
     }
 )
 

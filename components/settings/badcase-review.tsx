@@ -1,13 +1,14 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Activity, Loader2, RefreshCw } from "lucide-react";
+import { Activity, Loader2, RefreshCw, RotateCcw } from "lucide-react";
 import {
   getBadCaseStats,
   type BadCaseStatsResponse,
 } from "@/lib/api/badcases";
 import {
   getQualityStats,
+  resetQualityStats,
   type QualityStats,
   type QualityWindow,
 } from "@/lib/api/quality";
@@ -19,6 +20,13 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
 
@@ -91,6 +99,9 @@ export function BadCaseReview() {
   const [window, setWindow] = useState<QualityWindow>("24h");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const [resetting, setResetting] = useState(false);
 
   const load = useCallback(async (w: QualityWindow) => {
     setLoading(true);
@@ -112,6 +123,35 @@ export function BadCaseReview() {
   useEffect(() => {
     void load(window);
   }, [load, window]);
+
+  const windowLabel =
+    WINDOWS.find((w) => w.key === window)?.label ?? window;
+
+  /** 重置当前窗口的统计：清掉已累计的分子/分母，之后重新开始计数。 */
+  const doReset = useCallback(async () => {
+    setResetting(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const res = await resetQualityStats(window);
+      setConfirmOpen(false);
+      setNotice(
+        res.scope === "in_process"
+          ? `已重置「${windowLabel}」的进程内计数（数据库历史未受影响）`
+          : `已重置「${windowLabel}」的统计，清除 ${res.deleted} 条质量事件`
+      );
+      await load(window);
+      // 4 秒后自动收起提示，不打断阅读
+      setTimeout(() => setNotice(null), 4000);
+    } catch (err) {
+      setConfirmOpen(false);
+      setError(
+        err instanceof Error ? `重置失败：${err.message}` : "重置失败"
+      );
+    } finally {
+      setResetting(false);
+    }
+  }, [load, window, windowLabel]);
 
   const ratios = quality?.ratios;
   const samples = quality?.samples;
@@ -170,19 +210,34 @@ export function BadCaseReview() {
               : "历史聚合指标（持久化存储，重启不丢）"}
           </CardDescription>
         </div>
-        <Button
-          size="sm"
-          variant="outline"
-          onClick={() => void load(window)}
-          disabled={loading}
-        >
-          {loading ? (
-            <Loader2 className="size-3.5 animate-spin" />
-          ) : (
-            <RefreshCw className="size-3.5" />
-          )}
-          刷新
-        </Button>
+        <div className="flex shrink-0 items-center gap-2">
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => void load(window)}
+            disabled={loading}
+          >
+            {loading ? (
+              <Loader2 className="size-3.5 animate-spin" />
+            ) : (
+              <RefreshCw className="size-3.5" />
+            )}
+            刷新
+          </Button>
+          <Button
+            size="sm"
+            variant="destructive"
+            onClick={() => setConfirmOpen(true)}
+            disabled={loading || resetting}
+          >
+            {resetting ? (
+              <Loader2 className="size-3.5 animate-spin" />
+            ) : (
+              <RotateCcw className="size-3.5" />
+            )}
+            重置
+          </Button>
+        </div>
       </CardHeader>
       <CardContent className="space-y-4">
         {/* 时间窗切换：历史窗口重启不丢数据，是"指标全是 —"的修复 */}
@@ -207,6 +262,11 @@ export function BadCaseReview() {
         {error && (
           <div className="rounded-xl border border-destructive/20 bg-destructive/5 px-4 py-3 text-sm text-destructive">
             {error}
+          </div>
+        )}
+        {notice && (
+          <div className="rounded-xl border border-emerald-500/25 bg-emerald-500/5 px-4 py-3 text-sm text-emerald-700 dark:text-emerald-400">
+            {notice}
           </div>
         )}
         {loading && !quality ? (
@@ -277,6 +337,52 @@ export function BadCaseReview() {
           </>
         )}
       </CardContent>
+
+      {/* 重置是**不可逆**的删除，必须二次确认 */}
+      <Dialog open={confirmOpen} onOpenChange={setConfirmOpen}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>重置「{windowLabel}」的质量统计？</DialogTitle>
+            <DialogDescription>
+              {window === "session" ? (
+                <>
+                  将清空<b className="text-foreground">进程内计数器</b>
+                  （本次运行的实时指标）。数据库中的历史质量事件不受影响。
+                </>
+              ) : (
+                <>
+                  将删除该窗口内的
+                  <b className="text-foreground">
+                    {" "}
+                    {quality?.totalQueries ?? 0} 条
+                  </b>{" "}
+                  质量事件记录，<b className="text-destructive">删除后不可恢复</b>
+                  。之后这些比率会重新从零开始累计。
+                </>
+              )}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="flex justify-end gap-2">
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => setConfirmOpen(false)}
+              disabled={resetting}
+            >
+              取消
+            </Button>
+            <Button
+              size="sm"
+              variant="destructive"
+              onClick={() => void doReset()}
+              disabled={resetting}
+            >
+              {resetting && <Loader2 className="size-3.5 animate-spin" />}
+              确认重置
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
     </Card>
   );
 }

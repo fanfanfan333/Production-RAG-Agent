@@ -1,7 +1,8 @@
 """
 RAG 质量监控 API（设置页「RAG 质量监控」面板的数据源）.
 
-    GET /quality/stats?window=session|24h|7d|30d|all
+    GET  /quality/stats?window=session|24h|7d|30d|all
+    POST /quality/reset?window=session|24h|7d|30d|all   （重置，不可逆）
 
 与 /badcases/stats 的分工
 ────────────────────────
@@ -17,12 +18,18 @@ RAG 质量监控 API（设置页「RAG 质量监控」面板的数据源）.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query
 
 from app.db.user_models import User
-from app.services.monitoring_service import metrics_snapshot, quality_stats
+from app.services.monitoring_service import (
+    metrics_snapshot,
+    quality_stats,
+    reset_metrics,
+    reset_quality_events,
+)
 from app.services.permissions import require_permission
 from app.utils.logging import get_logger
 
@@ -89,6 +96,49 @@ async def get_quality_stats(
 
     stats = await quality_stats(_WINDOWS[window])
     return {"window": window, "source": "database", **stats}
+
+
+@router.post(
+    "/quality/reset",
+    summary="重置质量统计（按时间窗，不可逆）",
+    description=(
+        "把**当前面板所选窗口**的统计清零，便于改配置/修 Bug 后重新计数。"
+        "window=session 只清进程内计数器（不动数据库）；"
+        "24h/7d/30d/all 删除 quality_events 中该窗口内的行（不可逆）。"
+        "返回的 scope/deleted 供界面提示「清了哪一层、清了多少条」。"
+    ),
+)
+async def reset_quality_stats(
+    user: Annotated[User, Depends(require_permission("audit.write"))],
+    window: str = Query(default="24h", pattern="^(session|24h|7d|30d|all)$"),
+) -> dict:
+    reset_at = datetime.now(tz=timezone.utc).isoformat()
+
+    if window == "session":
+        reset_metrics()  # 进程内计数器清零；数据库历史不受影响
+        logger.info("Quality stats reset (in-process) by user=%s", user.username)
+        return {
+            "ok": True,
+            "window": window,
+            "scope": "in_process",
+            "deleted": 0,
+            "reset_at": reset_at,
+        }
+
+    deleted = await reset_quality_events(_WINDOWS[window])
+    logger.warning(
+        "Quality stats reset (database) by user=%s window=%s deleted=%d",
+        user.username,
+        window,
+        deleted,
+    )
+    return {
+        "ok": True,
+        "window": window,
+        "scope": "database",
+        "deleted": deleted,
+        "reset_at": reset_at,
+    }
 
 
 __all__ = ["router"]
