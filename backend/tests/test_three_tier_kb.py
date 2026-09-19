@@ -390,16 +390,17 @@ def test_scope_for_matches_acl():
     check("知识库管理员：锁本公司集合 + 部门全通",
           s_kb.tenant_ids == frozenset({"company_a"}) and s_kb.tenant_wide
           and not s_kb.owns_tenant_ids)
-    # Rev2：未传自建集合时，admin 的公司集合为空（fail-closed，不回退全平台）
+    # Rev3：未传自建集合时，admin 的公司集合 = {所属租户}（与其他账号同口径，
+    # 不回退全平台；owns 仍为空）
     s_admin = scope_for(platform_admin)
-    check("平台管理员：无自建公司时公司集合为空（fail-closed）",
-          s_admin.tenant_ids == frozenset()
+    check("平台管理员：无自建公司时公司集合 = {所属租户}，owns 为空",
+          s_admin.tenant_ids == frozenset({"default"})
           and s_admin.owns_tenant_ids == frozenset())
-    # 传入自建测试公司集合后：tenant_ids = owns_tenant_ids = 该集合
+    # 传入自建测试公司集合后：tenant_ids = {所属租户} ∪ 自建集合；owns = 自建集合
     owned = frozenset({"c8111de986583", "cfb08c53677c4"})
     s_admin_owned = scope_for(platform_admin, owned_tenant_ids=owned)
-    check("平台管理员：公司集合 = 自建测试公司集合",
-          s_admin_owned.tenant_ids == owned
+    check("平台管理员：公司集合 = 所属租户 ∪ 自建测试公司集合",
+          s_admin_owned.tenant_ids == (frozenset({"default"}) | owned)
           and s_admin_owned.owns_tenant_ids == owned
           and s_admin_owned.cross_tenant)
     check("平台管理员的个人库归属仍是自己（不会变成'看所有人个人库'）",

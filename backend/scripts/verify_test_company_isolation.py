@@ -82,11 +82,12 @@ async def _run() -> int:
     from app.db.models import Document
     from app.db.postgres import get_db_session
     from app.db.user_models import User
-    from app.services.company_registry import test_tenant_ids
+    from app.services.company_registry import tenant_ids_created_by, test_tenant_ids
     from app.services.tenancy import (
         ACCESS_TENANT,
         can_access_document,
         delete_permission_for,
+        effective_tenant_id,
         request_scope,
     )
     from app.services.retrieval_service import retrieve_chunks
@@ -118,13 +119,15 @@ async def _run() -> int:
     )
 
     # ── scope 分流（非 admin 路径一行未动）──────────────────────────────────────
-    print("── scope 分流（request_scope 保持原样）──")
+    print("── scope 分流（admin = 所属租户 ∪ 自建集合；其余保持原样）──")
     sc_admin = await request_scope(admin)
     sc_a = await request_scope(a_user)
     sc_tm = await request_scope(test_member)
+    owned = await tenant_ids_created_by(admin.id)
+    home = frozenset({effective_tenant_id(admin)})
     check(
-        sc_admin.tenant_ids == tset and sc_admin.owns_tenant_ids == tset,
-        "admin scope 不变（可见测试公司，用于管理）",
+        sc_admin.tenant_ids == (home | owned) and sc_admin.owns_tenant_ids == owned,
+        "admin scope = 所属租户(default) ∪ 自建集合（列表/管理可见测试公司）",
         f"tenants={sorted(sc_admin.tenant_ids or ())}",
     )
     check(

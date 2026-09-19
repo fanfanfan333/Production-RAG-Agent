@@ -14,9 +14,11 @@ Multi-tenant isolation primitives（三层隔离的单一实现点）.
         层级才受租户集合约束。因此「自己上传、落在任意租户（含 ``default``）
         的个人库文档」永远可见。
 
-        **平台管理员（admin）不再是「全库」**：它的可见范围收敛为
-        「自己创建的测试公司集合」（``owns_tenant_ids``，按 ``created_by ==
-        当前 admin id`` 锁定）。无自建公司时 fail-closed 返回空，绝不回退全平台。
+        **平台管理员（admin）不再是「全库」**：它和其他账号一样能看到
+        「所属租户（``effective_tenant_id``）」，再额外加上「自己创建的测试
+        公司集合」（``owns_tenant_ids``，按 ``created_by == 当前 admin id``
+        锁定）—— 即 ``tenant_ids = {所属租户} ∪ {自建测试公司}``。
+        绝不回退全平台。
 
     第二层 Document ACL
         文档在租户内再按 ``access_level`` 细分可见性：
@@ -261,7 +263,7 @@ class DocumentScope:
         tenant_ids       第一层公司过滤**集合**。``None`` = 不限制（仅
                          ``unrestricted`` 诊断）；空集 = fail-closed（返回空）；
                          非空 = ``tenant_id IN (...)``。普通用户 = `{自己公司}`；
-                         平台管理员 = `{自建测试公司}`。
+                         平台管理员 = `{所属租户} ∪ {自建测试公司}`。
         owns_tenant_ids  「**可见他人 private 文档**」的租户集合。仅当 actor 是
                          该租户的**创建者**时非空 —— **只有平台管理员**，值 =
                          其自建测试公司集合。任何把它写成"角色是 admin 即可"
@@ -307,7 +309,8 @@ def scope_for(
     """
     构造用户的文档可见范围（纯函数）.
 
-        平台管理员 admin  → tenant_ids = owns_tenant_ids = 自建测试公司集合
+        平台管理员 admin  → tenant_ids = {所属租户} ∪ 自建测试公司集合；
+                            owns_tenant_ids = 自建测试公司集合
         企业/知识库管理员  → tenant_ids = {本公司}；本公司部门库全通
         部门负责人/普通成员 → tenant_ids = {本公司}；本部门库 + 公司库 + 自己的个人库
 
@@ -321,12 +324,15 @@ def scope_for(
             owns_tenant_ids=frozenset(), department_id=None, tenant_wide=False,
         )
     if is_platform_admin(user):
+        # admin 与其他账号同口径：先有所属租户（home），再叠加自建测试公司集合。
+        # owns_tenant_ids 只表达「可见他人私库」的自建集合，不含 home。
         owned = frozenset(owned_tenant_ids or ())
+        home = frozenset({effective_tenant_id(user)})
         return DocumentScope(
             owner_id=user.id,
-            tenant_ids=owned,
+            tenant_ids=home | owned,
             owns_tenant_ids=owned,
-            department_id=None,
+            department_id=effective_department_id(user),
             tenant_wide=True,
         )
     return DocumentScope(

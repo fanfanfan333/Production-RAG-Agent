@@ -150,9 +150,9 @@ async def upload_documents(
     is_admin = is_platform_admin(user)
 
     # ── 决策 6：平台管理员上传**必须**指定归属的测试公司 ─────────────────────
-    # admin 的 effective_tenant_id 是 "default"（它不属于任何公司），若沿用会把
-    # 文档落进一个它自己都看不到的租户。因此 admin 必须显式选一个**自建测试公司**，
-    # 文档 tenant_id = 该公司 id。非 admin 一律归属本公司（company_id 被忽略）。
+    # admin 的 effective_tenant_id 是 "default"（历史占位租户，不属于任何注册公司）。
+    # 产品口径：admin 上传的文档必须显式归属一个**自建测试公司**（tenant_id = 该
+    # 公司 id），便于「测试公司」统一管理；非 admin 一律归属本公司（company_id 被忽略）。
     upload_tenant_id = effective_tenant_id(user)
     if is_admin:
         from app.services.company_registry import tenant_ids_created_by

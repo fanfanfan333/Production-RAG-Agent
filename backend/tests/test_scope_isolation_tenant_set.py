@@ -144,25 +144,55 @@ def test_empty_tenant_set_still_keeps_own_private():
 
 # ── P0-6：admin 收敛 + fail-closed ───────────────────────────────────────────
 
-def test_admin_empty_tenant_set_is_fail_closed():
+def test_admin_without_owned_companies_sees_only_home_tenant():
+    """无自建公司：tenant_ids = {所属租户}（与其他账号同口径），owns 为空、绝不回退全平台。"""
     if not _IMPORT_OK:
         return
     admin = _User(role=User.ROLE_ADMIN, tenant_id="default", is_admin=True)
     scope = scope_for(admin)  # 未传自建集合
-    assert scope.tenant_ids == frozenset()
+    assert scope.tenant_ids == frozenset({"default"})
     assert scope.owns_tenant_ids == frozenset()
     assert scope.owner_id == admin.id, "admin 的个人库归属仍是自己"
+    assert scope.department_id is None, "admin 无部门归属"
+    assert scope.tenant_wide
 
 
-def test_admin_owns_set_equals_tenant_set():
+def test_admin_scope_is_home_union_owned():
+    """tenant_ids == {所属租户} ∪ owned；owns_tenant_ids == owned（不含所属租户）。"""
     if not _IMPORT_OK:
         return
     admin = _User(role=User.ROLE_ADMIN, tenant_id="default", is_admin=True)
     owned = frozenset({"c8111de986583", "cfb08c53677c4"})
     scope = scope_for(admin, owned_tenant_ids=owned)
-    assert scope.tenant_ids == owned
+    assert scope.tenant_ids == frozenset({"default"}) | owned
     assert scope.owns_tenant_ids == owned
     assert scope.cross_tenant
+
+
+def test_admin_content_scope_excludes_test_companies_keeps_home(monkeypatch):
+    """
+    content_scope 语义：剔除测试公司后 admin 只剩 {所属租户}（个人库另按 owner 保留）.
+    """
+    if not _IMPORT_OK:
+        return
+    import asyncio
+
+    from app.services import company_registry
+    from app.services.tenancy import exclude_test_tenants
+
+    owned = frozenset({"c8111de986583", "cfb08c53677c4"})
+    admin = _User(role=User.ROLE_ADMIN, tenant_id="default", is_admin=True)
+    scope = scope_for(admin, owned_tenant_ids=owned)
+
+    async def _fake_test_ids():
+        return owned  # 两家自建公司都是测试公司（与生产 DB 事实一致）
+
+    monkeypatch.setattr(company_registry, "test_tenant_ids", _fake_test_ids)
+    new_tenants, new_owns = asyncio.run(
+        exclude_test_tenants(scope.tenant_ids, scope.owns_tenant_ids)
+    )
+    assert new_tenants == frozenset({"default"})
+    assert new_owns == frozenset()
 
 
 # ── P0-8：私库只认归属人（owns 只在自建公司内放开读，不放开删）─────────────────

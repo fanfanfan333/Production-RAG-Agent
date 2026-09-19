@@ -156,7 +156,8 @@ async def company_display_names(
 
 async def tenant_ids_created_by(admin_id: uuid.UUID | None) -> frozenset[str]:
     """
-    某平台管理员**自建**公司集合（= 它的 ``owns_tenant_ids`` / ``tenant_ids``）.
+    某平台管理员**自建**公司集合（= 它的 ``owns_tenant_ids``；其 ``tenant_ids``
+    = 所属租户 ∪ 本集合，见 ``tenancy.scope_for``）.
 
     按 ``created_by == admin_id`` **按 id 锁定** —— 不是「任意 admin 的公司」，
     否则多管理员时 A 的测试公司会对 B 泄漏。

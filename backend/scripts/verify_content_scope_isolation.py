@@ -77,12 +77,12 @@ async def _run() -> int:
     from app.db.models import Document, DocumentStatus
     from app.db.postgres import get_db_session
     from app.db.user_models import User
-    from app.services.company_registry import test_tenant_ids
+    from app.services.company_registry import tenant_ids_created_by, test_tenant_ids
     from app.services.relation_service import (
         collect_document_digests,
         list_accessible_documents,
     )
-    from app.services.tenancy import content_scope, request_scope
+    from app.services.tenancy import content_scope, effective_tenant_id, request_scope
 
     # ── 载入数据快照 ───────────────────────────────────────────────────────────
     async with get_db_session() as session:
@@ -137,15 +137,17 @@ async def _run() -> int:
     req_tm = await request_scope(test_member)
     cnt_tm = await content_scope(test_member)
 
+    home = frozenset({effective_tenant_id(admin)})
+    owned = await tenant_ids_created_by(admin.id)
     check(
-        req_admin.tenant_ids == tset and req_admin.owns_tenant_ids == tset,
-        "request_scope(admin) 不变 —— 管理/列表仍见测试公司",
+        req_admin.tenant_ids == (home | owned) and req_admin.owns_tenant_ids == owned,
+        "request_scope(admin) = 所属租户 ∪ 自建集合 —— 管理/列表仍见测试公司",
         f"tenants={sorted(req_admin.tenant_ids or ())}",
     )
     check(
-        cnt_admin.tenant_ids == frozenset()
-        and cnt_admin.owns_tenant_ids == frozenset(),
-        "content_scope(admin) 剔除测试公司 → tenant_ids / owns 均空集",
+        cnt_admin.tenant_ids == ((home | owned) - tset)
+        and cnt_admin.owns_tenant_ids == (owned - tset),
+        "content_scope(admin) 剔除测试公司 → tenant_ids 剩 {所属租户}、owns 空集",
         f"tenants={sorted(cnt_admin.tenant_ids or ())} owns={sorted(cnt_admin.owns_tenant_ids or ())}",
     )
     check(

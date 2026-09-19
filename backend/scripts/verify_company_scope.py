@@ -65,6 +65,7 @@ async def _run() -> int:
     from app.services.tenancy import (
         ACCESS_PRIVATE,
         document_scope_clause,
+        effective_tenant_id,
         scope_for,
     )
 
@@ -131,8 +132,13 @@ async def _run() -> int:
         "admin 自建集合不含 A/B 公司（非其创建）",
         f"{sorted(owned)}",
     )
+    home = frozenset({effective_tenant_id(admin)})
     scope = scope_for(admin, owned_tenant_ids=owned)
-    check(scope.tenant_ids == owned and scope.owns_tenant_ids == owned, "scope tenant_ids == owns_tenant_ids")
+    check(
+        scope.tenant_ids == (home | owned) and scope.owns_tenant_ids == owned,
+        "scope tenant_ids == 所属租户 ∪ 自建集合；owns == 自建集合",
+        f"tenants={sorted(scope.tenant_ids or ())}",
+    )
 
     async with get_db_session() as session:
         visible_rows = (
@@ -156,8 +162,9 @@ async def _run() -> int:
 
     # 强化断言（QA 补齐）：原 #4 只断言「包含两家 + 不含 A/B」，且 foreign 检查只覆盖
     # OTHER_COMPANIES —— 一家非 A/B、又非 admin 自建的第三家公司若泄漏可见仍会通过。
-    # 这里把口径钉在**可从 DB 计算**的集合：admin 自建公司 = companies.created_by == admin.id，
-    # 并断言任何可见文档的 tenant_id 都落在该集合内（admin 本人私库除外）。
+    # 这里把口径钉在**可从 DB 计算**的集合：admin 可见公司 = {所属租户} ∪
+    # {companies.created_by == admin.id}，并断言任何可见文档的 tenant_id 都落在
+    # 该集合内（admin 本人私库除外）。
     async with get_db_session() as session:
         db_created = set(
             (
@@ -173,12 +180,13 @@ async def _run() -> int:
         "owned == companies(created_by==admin.id)（DB 计算，防注册表漂移）",
         f"owned={sorted(owned)} db={sorted(db_created)}",
     )
+    allowed_tenants = db_created | {effective_tenant_id(admin)}
     stray = [
-        r for r in visible_rows if r.owner_id != admin.id and r.tenant_id not in db_created
+        r for r in visible_rows if r.owner_id != admin.id and r.tenant_id not in allowed_tenants
     ]
     check(
         not stray,
-        "可见文档 tenant_id 全部 ∈ admin 自建公司集合（DB 计算）",
+        "可见文档 tenant_id 全部 ∈ 所属租户 ∪ admin 自建公司集合（DB 计算）",
         f"越权 {len(stray)} 份: {[(r.tenant_id, str(r.id)) for r in stray]}",
     )
 
@@ -199,14 +207,15 @@ async def _run() -> int:
     check(not leaked, "A/B 公司成员的 private 文档对 admin 不可见")
 
     # P0-7 计数同源：count_by_tenant == list_documents(company_id=...) 逐家一致
+    # （含所属租户 default —— admin 的公司筛选也应对它计数同源）
     counts = await count_by_tenant(
         owner_id=scope.owner_id,
-        tenant_ids=owned,
+        tenant_ids=scope.tenant_ids,
         owns_tenant_ids=scope.owns_tenant_ids,
         department_id=scope.department_id,
         tenant_wide=scope.tenant_wide,
     )
-    for tid in sorted(owned):
+    for tid in sorted(scope.tenant_ids):
         page = await list_documents(
             page=1, limit=1,
             owner_id=scope.owner_id,
@@ -222,9 +231,14 @@ async def _run() -> int:
             f"count={counts.get(tid, 0)} list={page.total}",
         )
 
-    # P0-6 边界：无自建公司时 fail-closed（编译期断言，不动数据）
+    # P0-6 边界：无自建公司时收敛为「仅所属租户」（编译期断言，不动数据）——
+    # 不回退全平台，也不再漏掉 admin 自己租户的公司库/部门库。
     empty_scope = scope_for(admin, owned_tenant_ids=frozenset())
-    check(empty_scope.tenant_ids == frozenset(), "无自建公司 → tenant_ids 为空集（fail-closed）")
+    check(
+        empty_scope.tenant_ids == home and empty_scope.owns_tenant_ids == frozenset(),
+        "无自建公司 → tenant_ids 仅所属租户（不回退全平台）；owns 为空",
+        f"tenants={sorted(empty_scope.tenant_ids or ())}",
+    )
 
     # ── P0-1 三层标注数据（服务端：能取到即干净字符串，取不到即 None）──────────
     print("── P0-1 三层标注数据（GET /documents 的 tenant_name / department_name）──")
