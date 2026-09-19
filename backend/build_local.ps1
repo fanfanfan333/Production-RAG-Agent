@@ -91,8 +91,10 @@ foreach ($f in $keyFiles) {
     try { $disk = (Get-FileHash -Algorithm MD5 $diskPath).Hash.ToLower() } catch { $disk = "" }
     $cont = (docker compose -f docker-compose.yml exec -T $Service md5sum "/app/$f" 2>$null)
     if ($cont) { $contHash = ($cont -split "\s+")[0].Trim().ToLower() }
-    if ($disk -ne $contHash) {
-        $mismatch += "$f disk=$disk cont=$contHash"
+    # fail-closed：任一侧取不到（空串）即判为不一致。否则 $disk="" 且 $contHash=""
+    # 时 `"" -ne ""` 为假 → 落进 else 打印 "ok"，把「根本没校验成功」当成通过。
+    if (-not $disk -or -not $contHash -or $disk -ne $contHash) {
+        $mismatch += "$f disk='$disk' cont='$contHash'"
     } else {
         Write-Host "  ok  $f"
     }
