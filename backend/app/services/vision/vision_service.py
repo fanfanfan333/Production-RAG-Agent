@@ -173,6 +173,16 @@ class VisionService:
     ) -> str | None:
         settings = get_settings()
         b64 = base64.b64encode(image_bytes).decode("ascii")
+        # 与 ChatOllama 各构造点同源：OLLAMA_NUM_GPU 是全局开关，这里直连
+        # /api/generate（不经 langchain），所以必须自己带 num_gpu，否则漏掉
+        # 这一处就等于"开关设了却仍走 GPU"。None 时不传，交回 Ollama 默认。
+        options: dict[str, object] = {
+            "temperature": 0.2,
+            # 多模态解码开销大，给足上下文但不做无谓放大
+            "num_ctx": settings.chat_num_ctx,
+        }
+        if settings.OLLAMA_NUM_GPU is not None:
+            options["num_gpu"] = settings.OLLAMA_NUM_GPU
         try:
             resp = httpx.post(
                 f"{settings.OLLAMA_BASE_URL.rstrip('/')}/api/generate",
@@ -181,8 +191,7 @@ class VisionService:
                     "prompt": prompt,
                     "images": [b64],
                     "stream": False,
-                    # 多模态解码开销大，给足上下文但不做无谓放大
-                    "options": {"temperature": 0.2, "num_ctx": settings.chat_num_ctx},
+                    "options": options,
                 },
                 timeout=timeout,
             )

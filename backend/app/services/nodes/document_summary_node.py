@@ -464,4 +464,5 @@ def build_summary_llm(reasoning: bool | None = None):
         streaming=True,
         reasoning=reasoning,
         num_ctx=settings.chat_num_ctx,
+        num_gpu=settings.OLLAMA_NUM_GPU,
     )

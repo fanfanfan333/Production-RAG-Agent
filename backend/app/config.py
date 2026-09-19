@@ -34,6 +34,17 @@ class Settings(BaseSettings):
     OLLAMA_NUM_GPU: int | None = None                 # GPU offload 层数。None=不干预（全 GPU）；
                                                      # 小显存机器（如 6GB 卡装 qwen3:8b）设 0 强制
                                                      # CPU 推理，或设部分层数（如 20）混合 offload。
+                                                     #
+                                                     # ⚠️ 这个开关**必须逐个 ChatOllama 构造点显式传
+                                                     # num_gpu=settings.OLLAMA_NUM_GPU 才生效** ——
+                                                     # langchain_ollama 不读同名环境变量，漏传即回退
+                                                     # 到"全 GPU"。本项目 7 个构造点曾只有 2 处接了，
+                                                     # 于是"设了 OLLAMA_NUM_GPU=0 却仍然崩"（崩的正是
+                                                     # 没接线的文档总结链路）。**新增 LLM 构造处务必
+                                                     # 一并传**，改完可用下面这行自检：
+                                                     #   grep -rn "ChatOllama(" app | wc -l
+                                                     #   grep -rn "num_gpu=settings.OLLAMA_NUM_GPU" app | wc -l
+                                                     # 两数必须相等。
 
     # ── Document relation analysis (POST /query mode="doc_relations") ──────────
     RELATION_MAX_DOCUMENTS: int = 12          # max documents included in one analysis

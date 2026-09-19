@@ -165,6 +165,7 @@ async def route_query(
             reasoning=False,
             num_predict=64,
             num_ctx=settings.chat_num_ctx,
+            num_gpu=settings.OLLAMA_NUM_GPU,
         )
 
         # 带最近一轮历史，帮助判断"再总结一遍"这类省略式追问

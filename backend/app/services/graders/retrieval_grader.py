@@ -140,6 +140,7 @@ async def grade_retrieval(
             reasoning=False,
             num_predict=256,          # 需输出一个 verdicts 数组，比路由长
             num_ctx=settings.chat_num_ctx,
+            num_gpu=settings.OLLAMA_NUM_GPU,
         )
 
         # 每条证据截断，避免长文档把 prompt 撑爆（判定相关性看开头足够）。

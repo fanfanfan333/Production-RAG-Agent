@@ -377,6 +377,7 @@ async def _rewrite_query_impl(
             # 表现为"配置全开着、日志里却一条 rewrite 产物都没有"。
             reasoning=False,
             num_predict=768,          # rewritten+variants+subqueries+hyde，比原先长
+            num_gpu=settings.OLLAMA_NUM_GPU,
             # num_ctx 必须与生成节点一致：Ollama 会因 num_ctx 变化重载模型，
             # 本机实测每次重载 ≈11s。改小并不省内存（峰值由生成节点决定），
             # 只会让"辅助节点 ↔ 生成节点"来回交替时反复白等。见 config.chat_num_ctx。

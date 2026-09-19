@@ -217,6 +217,7 @@ def _build_llm(settings) -> ChatOllama:
         #      "辅助节点(4096) ↔ 生成节点"必然交替，等于每轮白付 20 秒左右。
         # 统一入口见 config.Settings.chat_num_ctx。
         num_ctx=settings.chat_num_ctx,
+        num_gpu=settings.OLLAMA_NUM_GPU,
     )
 
 
