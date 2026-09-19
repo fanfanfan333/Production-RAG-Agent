@@ -3,9 +3,24 @@
 # ─────────────────────────────────────────────────────────────────────────────
 FROM python:3.12-slim AS builder
 
+# ── 镜像源（构建期可覆盖 + 多镜像自动回退）──────────────────────────────────
+# 实测教训：上游镜像会**整体或间歇性**故障 —— 清华 TUNA 全站 502（apt 与 PyPI
+# 同时挂）；换成阿里云后又出现同一 URL「前一次 200、后一次 502 Bad Gateway」的
+# 抖动。单镜像 + 无重试的写法会让构建随机失败；更糟的是同目录的
+# `docker compose up -d` 仍会用**旧镜像**成功拉起容器 —— 形成"看起来烤好了、
+# 其实跑的还是旧代码"的假象（只有容器内外 md5 比对才能揭穿）。
+# 因此：按「首选镜像 + 内置回退列表」逐个尝试，取第一个 apt-get update 成功的。
+# ⚠️ 回退列表刻意写成 RUN 里的**字面量**，而不是塞进 ARG 默认值 —— 实测
+# `ARG APT_MIRRORS=a b c` 只取第一个词（构建日志里展开成 `for m in a`），
+# 多镜像回退会静默失效（有防护的假象）。带空格的 ARG 默认值必须加引号。
+# 单个镜像名仍可覆盖，且没有引号坑：
+#   docker compose build --build-arg APT_MIRROR=mirrors.cloud.tencent.com
+ARG APT_MIRROR=mirrors.aliyun.com
+ARG PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+    PIP_INDEX_URL=${PIP_INDEX_URL}
 
 WORKDIR /build
 
@@ -21,8 +36,15 @@ WORKDIR /build
 RUN echo 'precedence ::ffff:0:0/96  100' >> /etc/gai.conf
 
 # Install build tools required by some packages (e.g. asyncpg, pymupdf, paddleocr)
-RUN sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list.d/debian.sources \
- && apt-get update && apt-get install -y --no-install-recommends \
+# 逐个镜像试到 apt-get update 成功为止；全部失败则让 install 显式失败（不静默降级）。
+RUN set -eu; \
+    for m in ${APT_MIRROR} mirrors.cloud.tencent.com mirrors.huaweicloud.com; do \
+      sed -i "s|deb.debian.org|${m}|g" /etc/apt/sources.list.d/debian.sources; \
+      if apt-get -o Acquire::Retries=3 update; then echo "APT_MIRROR_OK=${m}"; break; fi; \
+      echo "APT_MIRROR_FAILED=${m}"; \
+      sed -i "s|${m}|deb.debian.org|g" /etc/apt/sources.list.d/debian.sources; \
+    done; \
+    apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
     gcc \
     libpq-dev \
     tesseract-ocr \
@@ -30,8 +52,10 @@ RUN sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.li
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
+# 上游 PyPI 镜像同样会抖动（TUNA 直接连接被重置）：加 --retries 让 pip 自己重试，
+# 而不是一次抖动就废掉十几分钟的依赖安装层。
 RUN pip install --upgrade pip \
- && pip install --no-cache-dir --prefix=/install -r requirements.txt
+ && pip install --no-cache-dir --retries 5 --timeout 60 --prefix=/install -r requirements.txt
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -53,9 +77,17 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 # 而且是静默的（日志之外没有任何信号）。装上简体中文语言包，兜底就真的兜得住。
 #
 # 先落 gai.conf（同 builder 阶段，理由见上）：apt 同样会卡在不可达的 IPv6 上。
+# APT_MIRROR 在 runtime 阶段需重新声明（ARG 是 stage 作用域），回退逻辑同 builder。
+ARG APT_MIRROR=mirrors.aliyun.com
 RUN echo 'precedence ::ffff:0:0/96  100' >> /etc/gai.conf \
- && sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list.d/debian.sources \
- && apt-get update && apt-get install -y --no-install-recommends \
+ && set -eu; \
+    for m in ${APT_MIRROR} mirrors.cloud.tencent.com mirrors.huaweicloud.com; do \
+      sed -i "s|deb.debian.org|${m}|g" /etc/apt/sources.list.d/debian.sources; \
+      if apt-get -o Acquire::Retries=3 update; then echo "APT_MIRROR_OK=${m}"; break; fi; \
+      echo "APT_MIRROR_FAILED=${m}"; \
+      sed -i "s|${m}|deb.debian.org|g" /etc/apt/sources.list.d/debian.sources; \
+    done; \
+    apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
     tesseract-ocr \
     tesseract-ocr-chi-sim \
     libgl1 \
