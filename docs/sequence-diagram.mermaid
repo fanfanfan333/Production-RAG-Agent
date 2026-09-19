@@ -1,0 +1,138 @@
+%% =====================================================================
+%% 序列图 1：admin 打开文档列表 + 发起检索
+%%   重点：同一个 DocumentScope 一路传到 PostgreSQL / Qdrant / BM25，
+%%        列表与检索共用同一份范围对象（杜绝 P0-7 破口）
+%% =====================================================================
+sequenceDiagram
+    autonumber
+    actor Admin as 平台管理员
+    participant API as documents/query API
+    participant Reg as CompanyRegistryService
+    participant Ten as tenancy
+    participant DocSvc as document_query_service
+    participant Ret as retrieval_service
+    participant PG as PostgreSQL
+    participant QD as Qdrant
+
+    Admin->>API: GET /documents?company_id=...
+    API->>Ten: await request_scope(admin)
+    Ten->>Reg: tenant_ids_created_by(admin.id)
+    Reg->>PG: SELECT tenant_id FROM companies WHERE created_by=admin
+    PG-->>Reg: {测试公司1, 测试公司2}
+    Reg-->>Ten: frozenset{...}
+    Ten-->>API: DocumentScope(tenant_ids={T1,T2}, owns_tenant_ids={T1,T2}, tenant_wide=True)
+    API->>DocSvc: list_documents(**scope.acl_kwargs(), company_id?)
+    DocSvc->>PG: query = document_scope_clause = OR( tenant_clause({T1,T2}) ∧ document_acl_clause(owns={T1,T2},tenant_wide=True), personal(owner=admin ∧ level∈{private,NULL}) )
+    PG-->>DocSvc: rows（含 T1/T2 全层级 + admin 自己在任意租户(含 default) 的私库）【Rev2 修复点】
+    DocSvc->>Reg: company_display_names({T1,T2})
+    Reg-->>DocSvc: {T1:测试公司1, T2:测试公司2}
+    DocSvc-->>API: documents[] + tenant_name/department_name（标签数据）
+    API-->>Admin: 列表（部门标 “测试公司1 · 营销部门”）
+
+    Admin->>API: POST /query（提问）
+    API->>Ten: await request_scope(admin)  %% 同一份范围对象
+    Ten-->>API: DocumentScope(同上)
+    API->>Ret: retrieve_chunks(query, **scope.acl_kwargs())
+    Ret->>QD: ANN search filter = must(tenant_id IN {T1,T2}) + must_not(_visibility_conditions)
+    Note over Ret,QD: _visibility_conditions: private 仅 user_id=me 或 tenant∈owns_tenant_ids
+    QD-->>Ret: 向量候选
+    Ret->>PG: valid_docs = AND(tenant_clause({T1,T2}), document_scope_clause(...))
+    PG-->>Ret: 校验通过的文档集合
+    Ret->>PG: keyword_search(tenant_ids={T1,T2}, owns_tenant_ids={T1,T2})
+    Note over Ret,PG: BM25 SQL 与向量腿同一条 document_scope_clause
+    PG-->>Ret: BM25 候选 (document_id, chunk_index, point_id, rank)
+    Ret->>QD: retrieve(point_ids) 回取 payload
+    QD-->>Ret: payload
+    Ret-->>API: RetrievedChunk[]（列表可见集合 == 检索可命中集合）
+    API-->>Admin: SSE 流式回答
+
+%% =====================================================================
+%% 序列图 2：admin 创建公司 → 用户身份验证 → admin 同意 → 用户进入公司
+%% =====================================================================
+sequenceDiagram
+    autonumber
+    actor A as 平台管理员
+    actor U as 新用户
+    participant CApi as companies API
+    participant Reg as CompanyRegistryService
+    participant SApi as staff API
+    participant SSvc as staff_service
+    participant Ten as tenancy
+    participant PG as PostgreSQL
+
+    A->>CApi: POST /companies {display_name:"测试公司1"}
+    CApi->>Reg: create_company(admin, name)
+    Reg->>Reg: name_key = normalize(name)（NFKC+去空白+casefold）
+    Reg->>PG: INSERT companies(tenant_id=generate(), display_name, name_key, created_by=admin, is_test=true)
+    Note over Reg,PG: UNIQUE(name_key) 冲突 → 409 “公司已存在”
+    PG-->>Reg: row
+    Reg-->>CApi: Company
+    CApi-->>A: {company_id, company_name}（下拉即刻可见）
+
+    U->>CApi: GET /companies  %% 身份验证弹窗下拉候选
+    CApi->>Reg: list_registered_companies()
+    Reg-->>CApi: [{company_id, company_name}]
+    CApi-->>U: 公司下拉
+
+    U->>SApi: POST /staff/requests {company_id, department_name, duty}
+    SApi->>SSvc: create_staff_request(user, company_id=...)
+    SSvc->>Reg: get_company(company_id)
+    alt 未注册 / 旧名
+        Reg-->>SSvc: None
+        SSvc-->>SApi: StaffError(400) “请先由管理员注册该公司”
+        SApi-->>U: 拒绝
+    else 命中
+        Reg-->>SSvc: Company(tenant_id, display_name)
+        SSvc->>PG: INSERT staff_requests(company_id, company_name=registry.display_name, ...)
+        SSvc-->>SApi: StaffRequest(pending)
+        SApi-->>U: 申请已提交，等待审核（pending 期间不可见知识库）
+    end
+
+    A->>SApi: GET /staff/requests/inbox
+    SApi->>SSvc: list_inbox(admin)
+    SSvc->>Reg: tenant_ids_created_by(admin.id)
+    Reg-->>SSvc: {T1,T2}
+    SSvc->>PG: SELECT staff_requests WHERE company_id IN {T1,T2}
+    PG-->>SSvc: 本公司队列（其他公司申请不出现）
+    SSvc-->>A: 待审列表
+
+    A->>SApi: POST /staff/requests/{id}/review {approve:true, role:"employee"}
+    SApi->>SSvc: review_staff_request(admin, id, approve)
+    SSvc->>Reg: get_company(request.company_id)  %% 以注册表为准
+    Reg-->>SSvc: Company(display_name 取最新，改名也不会写回旧名)
+    SSvc->>PG: UPDATE users SET tenant_id, company_name=registry.display_name, department_id, role
+    SSvc->>PG: UPDATE staff_requests SET status=approved ...
+    SSvc-->>SApi: (request, profile)
+    SApi-->>A: 已批准
+
+    U->>Ten: request_scope(U)
+    Ten->>PG: 无 DB（普通用户不走注册表）
+    Ten-->>U: DocumentScope(tenant_ids={T1}, owns_tenant_ids=∅, department_id=…)
+    Note over U: U 进入公司；admin 的检索/列表范围因 T1∈自建集合而包含 U 的部门/公司文档，<br/>但 U 的个人库仍仅 U 可见（owns_tenant_ids 不含 U）
+
+%% =====================================================================
+%% 序列图 3：公司改名（P0-4 / P2-2）—— tenant_id 不变，零迁移
+%% =====================================================================
+sequenceDiagram
+    autonumber
+    actor A as 平台管理员
+    participant CApi as companies API
+    participant Reg as CompanyRegistryService
+    participant PG as PostgreSQL
+
+    A->>CApi: PATCH /companies/{tenant_id} {display_name:"测试公司2"}
+    CApi->>Reg: rename_company(admin, tenant_id, new_name)
+    Reg->>Reg: assert_admin_owns(admin, tenant_id)  %% 非自建 → 403
+    Reg->>Reg: new_key = normalize(new_name)
+    Reg->>PG: SELECT 1 FROM companies WHERE name_key=new_key AND tenant_id<>:id
+    alt 重名
+        PG-->>Reg: 命中
+        Reg-->>CApi: 409 “公司已存在”
+    else 可用
+        Reg->>PG: UPDATE companies SET display_name, name_key, updated_at  WHERE tenant_id=:id
+        Reg->>PG: UPDATE users SET company_name=new_name WHERE tenant_id=:id  %% 展示副本同步
+        Note over Reg,PG: documents.tenant_id / Qdrant payload 均不改动
+        Reg->>PG: INSERT audit_logs(action="company.rename", detail="旧名→新名; by …")
+        Reg-->>CApi: Company(新名)
+        CApi-->>A: 改名成功（成员数/文档数不变）
+    end

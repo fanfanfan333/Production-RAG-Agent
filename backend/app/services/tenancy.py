@@ -40,12 +40,15 @@ from __future__ import annotations
 import hashlib
 import re
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from sqlalchemy import and_, ColumnElement, false, or_, true
 
 from app.db.models import Document
 from app.db.user_models import User
+from app.utils.logging import get_logger
+
+logger = get_logger(__name__)
 
 # ── 租户与 ACL 常量 ──────────────────────────────────────────────────────────
 
@@ -350,6 +353,77 @@ async def request_scope(user: User | None) -> DocumentScope:
         owned = await tenant_ids_created_by(getattr(user, "id", None))
         return scope_for(user, owned_tenant_ids=owned)
     return scope_for(user)
+
+
+# ── 内容消费范围：测试公司隔离（唯一实现点）────────────────────────────────────
+
+async def exclude_test_tenants(
+    tenant_ids: frozenset[str] | None,
+    owns_tenant_ids: frozenset[str],
+) -> tuple[frozenset[str] | None, frozenset[str]]:
+    """
+    「内容消费排除测试公司」的**唯一**规则实现（供 ``content_scope`` 与
+    ``retrieval_service`` 共用，禁止两处各写一遍）.
+
+    规则（用户口径）：**测试公司文档只有平台管理员在列表/管理中能看到，但任何
+    人都检索不到、也不进任何内容消费（摘要 / 文档关联 / 对话内文档列表）**。
+
+    触发条件 = 调用者是平台管理员 —— 用 ``owns_tenant_ids`` 非空判定：本系统的
+    租户模型里，只有平台管理员才可能拥有非空 ``owns_tenant_ids``（= 其自建测试
+    公司集合，见 ``scope_for``），非 admin（含测试公司自己的成员）恒为空集。
+    因此**测试公司成员不会被排除**（其 ``tenant_ids`` = {本公司} 予以保留），
+    满足「测试账号照旧可用」。
+
+    剔除后 admin 的 ``tenant_ids`` 变空集 —— 不影响其**个人库**（个人库分支只看
+    ``owner_id == 我``、与租户无关）。
+
+    **Fail-closed（安全底线）**：注册表查询失败时**绝不原样放行** —— 否则一次 DB
+    抖动就能让 admin 检索/摘要到测试公司文档。此情形下对 admin 丢弃**全部公司
+    租户**（``tenant_ids`` / ``owns_tenant_ids`` 均置空），只保留其个人库；
+    非 admin 因 ``owns_tenant_ids`` 恒为空、根本不会走到这里，故不受影响。
+    失败记 ``logger.exception`` 便于观测。
+    """
+    if not owns_tenant_ids:
+        return tenant_ids, owns_tenant_ids
+    try:
+        from app.services.company_registry import test_tenant_ids
+
+        test_ids = await test_tenant_ids()
+    except Exception:      # noqa: BLE001 — 注册表不可用不应让请求整体失败
+        # fail-closed：无法判定哪些是测试公司时，宁可对 admin 收窄到"仅个人库"，
+        # 也不放行未排除的公司范围（安全 > 可用；集中一处、只影响 admin 身份）。
+        logger.exception(
+            "exclude_test_tenants: failed to resolve test tenant ids — failing "
+            "closed (clearing admin company scope to empty)"
+        )
+        return frozenset(), frozenset()
+    if not test_ids:
+        return tenant_ids, owns_tenant_ids
+    new_tenants = tenant_ids - test_ids if tenant_ids is not None else None
+    return new_tenants, owns_tenant_ids - test_ids
+
+
+async def content_scope(user: User | None) -> DocumentScope:
+    """
+    **内容消费**路径的文档可见范围（检索 / 摘要 / 文档关联 / 对话内文档列表）.
+
+    = :func:`request_scope` 之后再按 :func:`exclude_test_tenants` 剔除测试公司
+    （仅平台管理员生效）。**唯一实现点** —— 所有内容消费的 scope 都从这里派生，
+    杜绝「每个调用点各排除一次」的散落实现。
+
+    与 :func:`request_scope` 的分工：
+
+        content_scope(user)  → 检索 / 摘要 / 关联 / 对话内列表（内容外泄面）
+        request_scope(user)  → 管理 / 列表端点（``GET /documents`` 等）：
+                               admin **必须仍能看到**测试公司文档以管理它们
+    """
+    scope = await request_scope(user)
+    new_tenants, new_owns = await exclude_test_tenants(
+        scope.tenant_ids, scope.owns_tenant_ids
+    )
+    if new_tenants is scope.tenant_ids and new_owns is scope.owns_tenant_ids:
+        return scope
+    return replace(scope, tenant_ids=new_tenants, owns_tenant_ids=new_owns)
 
 
 # ── 第一层：SQL 组装（唯一入口）──────────────────────────────────────────────

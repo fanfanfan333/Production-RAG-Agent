@@ -6,6 +6,8 @@ import {
   FileText,
   Loader2,
   MessagesSquare,
+  Pencil,
+  Plus,
   Search,
   ShieldAlert,
   Trash2,
@@ -13,6 +15,7 @@ import {
   Users,
 } from "lucide-react";
 import { toast } from "sonner";
+import { createCompany, renameCompany } from "@/lib/api/companies";
 import {
   deleteStaffMember,
   getStaffCompanies,
@@ -78,6 +81,9 @@ export function MemberPanel() {
   const [error, setError] = useState<string | null>(null);
   const [editing, setEditing] = useState<StaffMember | null>(null);
   const [deleting, setDeleting] = useState<StaffMember | null>(null);
+  // 公司注册表操作（仅平台管理员）：创建公司 / 改名
+  const [creatingCompany, setCreatingCompany] = useState(false);
+  const [renamingCompany, setRenamingCompany] = useState<CompanyOption | null>(null);
 
   const load = useCallback(async () => {
     setError(null);
@@ -145,6 +151,62 @@ export function MemberPanel() {
             删除会带走其个人知识库与历史对话，已发布到部门/公司知识库的文档保留
           </CardDescription>
         </div>
+
+        {/* 公司注册表（仅平台管理员）：先建公司，身份验证与文档归属才能选到它 */}
+        {isPlatformAdmin && (
+          <div className="rounded-lg border border-border/60 bg-muted/20 px-3.5 py-3">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <p className="text-[13px] font-medium">公司管理</p>
+                <p className="mt-0.5 text-[11px] text-muted-foreground">
+                  先创建公司，新用户提交身份验证时才能选到它；改名只改展示名，
+                  <strong className="font-medium">成员与文档不受影响</strong>
+                </p>
+              </div>
+              <Button
+                variant="outline"
+                size="sm"
+                className="gap-1.5"
+                onClick={() => setCreatingCompany(true)}
+              >
+                <Plus className="size-3.5" />
+                创建公司
+              </Button>
+            </div>
+
+            {companies.length === 0 ? (
+              <p className="mt-2.5 text-[12px] text-muted-foreground">
+                暂无公司，请先创建公司
+              </p>
+            ) : (
+              <ul className="mt-2 divide-y divide-border/60">
+                {companies.map((c) => (
+                  <li
+                    key={c.companyId}
+                    className="flex items-center justify-between gap-3 py-1.5"
+                  >
+                    <span className="min-w-0 text-[13px]">
+                      <span className="truncate font-medium">{c.companyName}</span>
+                      <span className="ml-2 text-[11px] text-muted-foreground">
+                        成员 {c.memberCount}
+                      </span>
+                    </span>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="gap-1.5 text-muted-foreground hover:text-foreground"
+                      title="仅修改展示名，成员与文档不受影响"
+                      onClick={() => setRenamingCompany(c)}
+                    >
+                      <Pencil className="size-3.5" />
+                      改名
+                    </Button>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        )}
 
         <div className="flex flex-wrap items-center gap-2">
           <div className="relative min-w-[180px] flex-1">
@@ -311,7 +373,142 @@ export function MemberPanel() {
           await load();
         }}
       />
+
+      <CompanyFormDialog
+        mode="create"
+        open={creatingCompany}
+        onClose={() => setCreatingCompany(false)}
+        onDone={async () => {
+          setCreatingCompany(false);
+          await load();
+        }}
+      />
+
+      <CompanyFormDialog
+        mode="rename"
+        open={renamingCompany !== null}
+        company={renamingCompany}
+        onClose={() => setRenamingCompany(null)}
+        onDone={async () => {
+          setRenamingCompany(null);
+          await load();
+        }}
+      />
     </Card>
+  );
+}
+
+/**
+ * 公司注册表的表单弹窗（创建 / 改名共用）.
+ *
+ * 复用现有 Dialog + Input，不引入新组件文件与依赖。错误一律展示后端文案
+ * （重名时后端返回 409「公司已存在」，改名重名同样 409），前端不自己编消息。
+ */
+function CompanyFormDialog({
+  mode,
+  open,
+  company,
+  onClose,
+  onDone,
+}: {
+  mode: "create" | "rename";
+  open: boolean;
+  company?: CompanyOption | null;
+  onClose: () => void;
+  onDone: () => Promise<void> | void;
+}) {
+  const [name, setName] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+
+  useEffect(() => {
+    if (!open) return;
+    setName(mode === "rename" ? (company?.companyName ?? "") : "");
+    setError(null);
+  }, [open, mode, company?.companyName]);
+
+  if (!open) return null;
+
+  const submit = async () => {
+    const value = name.trim();
+    setError(null);
+    if (!value) {
+      setError("请填写公司名称");
+      return;
+    }
+    setSubmitting(true);
+    try {
+      if (mode === "create") {
+        const created = await createCompany(value);
+        toast.success(`已创建公司「${created.companyName}」`);
+      } else if (company) {
+        const updated = await renameCompany(company.companyId, value);
+        toast.success(
+          `已改名为「${updated.companyName}」，成员与文档不受影响`
+        );
+      }
+      await onDone();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "操作失败，请稍后再试");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <Dialog open onOpenChange={(next) => !next && !submitting && onClose()}>
+      <DialogContent className="max-w-md">
+        <DialogHeader>
+          <DialogTitle>{mode === "create" ? "创建公司" : "公司改名"}</DialogTitle>
+          <DialogDescription>
+            {mode === "create"
+              ? "创建后该公司可作为身份验证的可选目标，并进入你的测试公司可见范围"
+              : `旧名：${company?.companyName ?? "—"}　仅修改展示名，成员与文档不受影响`}
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className="space-y-4">
+          <div className="space-y-1.5">
+            <label
+              htmlFor="company-name"
+              className="text-[12px] font-medium text-muted-foreground"
+            >
+              公司名称
+            </label>
+            <Input
+              id="company-name"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="如：测试公司1"
+              maxLength={128}
+              disabled={submitting}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") submit();
+              }}
+            />
+            <p className="text-[11px] text-muted-foreground">
+              公司名唯一（忽略大小写与空格）；改名不会迁移成员、文档与向量数据
+            </p>
+          </div>
+
+          {error && (
+            <p className="flex items-start gap-2 rounded-lg border border-destructive/20 bg-destructive/5 px-3 py-2 text-[12px] text-destructive">
+              <AlertCircle className="mt-0.5 size-3.5 shrink-0" />
+              {error}
+            </p>
+          )}
+
+          <Button
+            className="w-full gap-2"
+            onClick={submit}
+            disabled={submitting}
+          >
+            {submitting && <Loader2 className="size-4 animate-spin" />}
+            {mode === "create" ? "确定创建" : "确定改名"}
+          </Button>
+        </div>
+      </DialogContent>
+    </Dialog>
   );
 }
 

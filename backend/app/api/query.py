@@ -149,11 +149,14 @@ async def _generate_sse(
     and, when *collection_id* is set, to one knowledge-base collection.
     """
     # ── 1+2. Conversation setup (owner + tenant scoped) ───────────────────────
-    from app.services.tenancy import home_tenant_id, request_scope
+    from app.services.tenancy import content_scope, home_tenant_id
 
-    # 可见范围一处组装：平台管理员 = 自建测试公司集合（含其中他人私库，但
-    # 看不到别公司文档）；其他人 = 本公司内 个人 + 本部门 + 公司库。
-    scope = await request_scope(user)
+    # 对话是**内容消费**路径：检索 / 摘要 / 文档关联 / 对话内文档列表都必须
+    # 用 content_scope —— 它在 request_scope 基础上额外剔除测试公司（仅平台
+    # 管理员生效）。测试账号（其 owns_tenant_ids 恒为空）不受影响，照旧可见
+    # 本公司全部内容；管理/列表端点（GET /documents）仍用 request_scope，
+    # 以便 admin 继续"看到"测试公司文档进行管理。
+    scope = await content_scope(user)
     # 个人库归属**恒为本人**（含平台管理员）：owner_id 不再是"None = admin 全览"，
     # 因此这里必须是 user.id，否则管理员会连自己的个人库都检索不到。
     owner = scope.owner_id

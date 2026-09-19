@@ -42,6 +42,10 @@ export interface Document {
   accessLabel?: string;
   tenantId?: string;
   departmentId?: string | null;
+  /** 公司展示名（后端 tenant_name，公司注册表权威源；取不到为 null）。 */
+  tenantName?: string | null;
+  /** 部门展示名（后端 department_name；取不到为 null）。 */
+  departmentName?: string | null;
   /** 归属人用户名（共享文档会显示"由 XXX 上传"）。 */
   ownerUsername?: string | null;
 
@@ -230,6 +234,15 @@ export interface CitationVerdict {
    * 无内容交集）——前端此时保持原样展示整段，不做任何高亮。
    */
   evidence?: EvidenceSpan[];
+  /**
+   * 被引来源是否含**可比对的证据文本**（能否真的拿它跟句子做内容词比对）。
+   *
+   * `false` = 来源拿不到任何 token/片段（不透明来源、纯图片既无 OCR 也无视觉
+   * 分析），此时 `supported=false` 只是"无从判断"，**不得**据此把句子标成
+   * "无依据" —— 否则中文句、图片块(vision)、表格块来源的句子会被误标。
+   * 前端只对 `evidence_available !== false` 的条目做"无依据句"标注。
+   */
+  evidence_available?: boolean;
 }
 
 /**

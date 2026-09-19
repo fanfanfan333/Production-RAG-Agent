@@ -234,6 +234,27 @@ async def list_documents(
 
     pages = max(1, math.ceil(total / limit))
 
+    # ── 三层标注展示名（一次性批量取，杜绝循环里逐条查库 = N+1）──────────────
+    # 公司展示名：走 companies 注册表（唯一权威源），按本页 distinct tenant_id 取。
+    # 部门展示名：按本页 distinct (tenant_id, department_id) 聚合 users.department_name，
+    #             **不依赖 owner**（owner 解绑为 NULL 时同样能取到）。
+    tenant_name_map: dict[str, str] = {}
+    dept_name_map: dict[tuple[str, str], str] = {}
+    if rows:
+        from app.services.knowledge_tier_service import department_display_names
+        from app.services.company_registry import company_display_names
+
+        tenant_name_map = await company_display_names(
+            frozenset({str(r.tenant_id) for r in rows if r.tenant_id})
+        )
+        dept_name_map = await department_display_names(
+            {
+                (str(r.tenant_id), str(r.department_id))
+                for r in rows
+                if r.tenant_id and r.department_id
+            }
+        )
+
     summaries: list[DocumentSummary] = []
     for row in rows:
         from app.services.knowledge_tier_service import publish_capability
@@ -277,6 +298,15 @@ async def list_documents(
                 access_label=access_label(level),
                 tenant_id=row.tenant_id or "default",
                 department_id=row.department_id,
+                # 展示名（原始字段，取不到即 None）—— 拼接放前端，后端不产出 "None"
+                tenant_name=(
+                    tenant_name_map.get(str(row.tenant_id)) if row.tenant_id else None
+                ),
+                department_name=(
+                    dept_name_map.get((str(row.tenant_id), str(row.department_id)))
+                    if row.tenant_id and row.department_id
+                    else None
+                ),
                 owner_id=row.owner_id,
                 owner_username=owner_names.get(row.owner_id) if row.owner_id else None,
                 is_owner=bool(capability.get("is_owner")),

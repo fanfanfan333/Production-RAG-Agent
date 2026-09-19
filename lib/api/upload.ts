@@ -18,6 +18,11 @@ export async function uploadDocuments(
     collectionId?: string | null;
     /** 三层知识库：文档直接落在哪一层（不传则由后端按默认层级决定）。 */
     accessLevel?: AccessLevel;
+    /**
+     * 文档归属的公司（平台管理员**必填**）：取值来自 `/companies/accessible`，
+     * 必须是其自建测试公司；非 admin 该字段被后端忽略（恒归属本公司）。
+     */
+    companyId?: string | null;
     onProgress?: (progress: UploadProgress) => void;
     signal?: AbortSignal;
   }
@@ -30,6 +35,10 @@ export async function uploadDocuments(
   // 目标层级由后端按权限矩阵复核：无权限的层级会被 403 拦下并提示改用申请。
   if (options?.accessLevel) {
     formData.append("access_level", options.accessLevel);
+  }
+  // admin 的归属公司由后端复核（须 ∈ 其自建测试公司），越界一律 403。
+  if (options?.companyId) {
+    formData.append("company_id", options.companyId);
   }
 
   return new Promise((resolve, reject) => {

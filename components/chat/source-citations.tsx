@@ -740,6 +740,47 @@ function SourceRow({
   );
 }
 
+/**
+ * 无依据句的**显式标注**（#17 用户裁定：不静默，UI 明确标出）.
+ *
+ * 引用校验发现"找不到来源支持"的句子时，后端会移除该句的引用标记、并在答案
+ * 末尾追加一行脚注 —— 但那只是一笔带过，用户看不出**具体哪句**没依据（静默）。
+ * 这里把这些句子在界面上一句句标出来，且**不改动答案正文**（纯旁注）。
+ *
+ * 排除 `evidence_available === false` 的条目：来源拿不到 token/片段时
+ * "未支持"只是无从判断，标出来会把中文句、图片块(vision)、表格块来源的
+ * 句子误标 —— 宁可少标，不可错标（与后端 evidence_available 同源）。
+ */
+function UnsupportedSentences({ verdicts }: { verdicts: CitationVerdict[] }) {
+  const seen = new Set<string>();
+  const sentences = verdicts
+    .filter((v) => !v.supported && v.evidence_available !== false)
+    .map((v) => (v.sentence ?? "").trim())
+    .filter((s) => {
+      if (!s || seen.has(s)) return false;
+      seen.add(s);
+      return true;
+    });
+  if (!sentences.length) return null;
+  return (
+    <div className="mb-2 rounded-lg border border-amber-300/60 bg-amber-50/70 px-2.5 py-2 text-[11px] leading-relaxed text-amber-800 dark:border-amber-700/40 dark:bg-amber-950/30 dark:text-amber-200">
+      <span className="flex items-start gap-1 font-medium">
+        <ShieldAlert className="mt-px size-3.5 shrink-0" />
+        <span>
+          以下 {sentences.length} 句未找到来源支持（其引用标记已移除，请以原文为准）
+        </span>
+      </span>
+      <ul className="mt-1 list-disc space-y-0.5 pl-4">
+        {sentences.map((s, i) => (
+          <li key={i} className="opacity-90">
+            {s}
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
 export function SourceCitations({
   sources,
   citationCheck,
@@ -797,6 +838,9 @@ export function SourceCitations({
           </span>
         </p>
       )}
+      {/* 无依据句显式标注（#17）：不静默 —— 无论引用列表是否展开都标出，
+          且只做旁注、不改动答案正文。 */}
+      <UnsupportedSentences verdicts={check?.verdicts ?? []} />
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}

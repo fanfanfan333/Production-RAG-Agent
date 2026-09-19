@@ -88,3 +88,7 @@ shallow.txt
 git_author.txt
 git_commit*.txt
 *_probe.txt
+
+# 会话临时输出 / 一次性侦察产物（不入库）
+.scratch/
+backend/_recon.txt

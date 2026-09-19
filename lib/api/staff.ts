@@ -130,7 +130,10 @@ export async function fetchGrantableRoles(): Promise<GrantableRole[]> {
 // ── 身份验证申请 ──────────────────────────────────────────────────────────────
 
 export async function createStaffRequest(params: {
-  companyName: string;
+  /** 已注册公司的标识（下拉值，优先；绑定以标识为准，不依赖名称匹配）。 */
+  companyId?: string;
+  /** 兼容旧入口：按名解析（须已注册；改名后旧名会被后端拒绝）。 */
+  companyName?: string;
   departmentName: string;
   duty: string;
 }): Promise<{ request: StaffRequestItem; message: string }> {
@@ -140,7 +143,8 @@ export async function createStaffRequest(params: {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        company_name: params.companyName,
+        company_id: params.companyId ?? null,
+        company_name: params.companyName ?? null,
         department_name: params.departmentName,
         duty: params.duty,
       }),

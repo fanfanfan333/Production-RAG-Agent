@@ -1,10 +1,14 @@
 "use client";
 
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { motion } from "framer-motion";
 import { Building2, FileUp, Loader2, Lock, Users } from "lucide-react";
 import { toast } from "sonner";
 import { uploadDocuments } from "@/lib/api/upload";
+import {
+  fetchAccessibleCompanies,
+  type AccessibleCompany,
+} from "@/lib/api/companies";
 import { useApp } from "@/lib/context/app-context";
 import { useAuth } from "@/lib/context/auth-context";
 import type { AccessLevel } from "@/lib/types";
@@ -17,6 +21,7 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
+import { Select, SelectItem } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
 
 interface UploadCardProps {
@@ -85,7 +90,7 @@ function friendlyUploadError(msg: string): string {
 
 export function UploadCard({ disabled, onUploadComplete }: UploadCardProps) {
   const { activeCollectionId, refresh } = useApp();
-  const { can } = useAuth();
+  const { can, user } = useAuth();
   const inputRef = useRef<HTMLInputElement>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [uploading, setUploading] = useState(false);
@@ -93,14 +98,59 @@ export function UploadCard({ disabled, onUploadComplete }: UploadCardProps) {
   // 默认存入个人知识库（与后端默认层级一致：上传即私有，共享须显式操作）
   const [uploadLevel, setUploadLevel] = useState<AccessLevel>("private");
 
+  // ── 平台管理员：上传必须显式选择归属的测试公司（PRD P1-3）──────────────────
+  // admin 不属于任何公司（effective_tenant_id 是 default），若不选公司，文档会落进
+  // 一个它自己都看不到的租户。后端同样强制校验（未选 400 / 越界 403），这里只提前
+  // 把"必须先选公司"显性化，避免用户点了上传才收到错误。
+  const isPlatformAdmin =
+    user?.role === "admin" || Boolean(user?.permissions?.includes("*"));
+  const [companies, setCompanies] = useState<AccessibleCompany[]>([]);
+  const [companyId, setCompanyId] = useState("");
+
+  useEffect(() => {
+    if (!isPlatformAdmin) return;
+    let cancelled = false;
+    fetchAccessibleCompanies()
+      .then((list) => {
+        if (cancelled) return;
+        setCompanies(list);
+        // 只剩一家（或多选后公司被删）时自动选中唯一候选，少一次点击
+        setCompanyId((current) =>
+          current && list.some((c) => c.companyId === current)
+            ? current
+            : list.length === 1
+              ? list[0].companyId
+              : ""
+        );
+      })
+      .catch(() => {
+        /* 候选拉取失败不阻塞页面，提交时后端仍会复核 */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [isPlatformAdmin]);
+
+  const noCompanySelected = isPlatformAdmin && !companyId;
+
   // POST /upload 现在只做「受理」——校验、判重、落一条 PENDING 行，通常几百毫秒
   // 就返回；解析 / 逐图 OCR / 向量化在服务端后台跑。所以这里不再有"处理中"的
   // 阻塞态和计时器：用户提交完就能离开页面，进度由文档列表轮询 current_stage
   // 显示（"正在解析内容与图片" / "正在生成向量 42%"）。
-  const isDisabled = disabled || uploading;
+  // admin 未选归属公司时同样禁用（否则文件会落进它看不到的 default 租户）。
+  const isDisabled = disabled || uploading || noCompanySelected;
 
   const handleFiles = useCallback(
     async (files: FileList | File[]) => {
+      // 兜底：拖拽事件绕过禁用态时也要拦住（后端也会 400，但先给出可读提示）
+      if (isPlatformAdmin && !companyId) {
+        toast.error(
+          companies.length === 0
+            ? "暂无测试公司，请先在管理后台创建公司"
+            : "请先选择文档归属的测试公司"
+        );
+        return;
+      }
       const uploadableFiles = Array.from(files).filter((file) => {
         const ext = '.' + file.name.split('.').pop()?.toLowerCase();
         return ALLOWED_EXTENSIONS.includes(ext);
@@ -140,6 +190,8 @@ export function UploadCard({ disabled, onUploadComplete }: UploadCardProps) {
         const results = await uploadDocuments(uploadableFiles, {
           collectionId: activeCollectionId,
           accessLevel: uploadLevel,
+          // admin 的归属公司（非 admin 传了也会被后端忽略）
+          companyId: isPlatformAdmin ? companyId : null,
           onProgress: ({ progress }) => setUploadProgress(progress),
         });
 
@@ -200,7 +252,17 @@ export function UploadCard({ disabled, onUploadComplete }: UploadCardProps) {
         if (inputRef.current) inputRef.current.value = "";
       }
     },
-    [activeCollectionId, onUploadComplete, refresh]
+    // uploadLevel 必须入依赖：否则切换「存入层级」后仍用挂载时的旧值（stale closure），
+    // 选了「公司知识库」也会被当成默认的「个人知识库」上传。
+    [
+      activeCollectionId,
+      companyId,
+      companies.length,
+      isPlatformAdmin,
+      onUploadComplete,
+      refresh,
+      uploadLevel,
+    ]
   );
 
   const handleDragOver = useCallback(
@@ -241,6 +303,40 @@ export function UploadCard({ disabled, onUploadComplete }: UploadCardProps) {
           </CardDescription>
         </CardHeader>
         <CardContent>
+          {/* 归属公司（仅平台管理员）：admin 不属于任何公司，必须显式选一家测试公司，
+              否则文档会落进它自己都看不到的租户（后端同样强制校验） */}
+          {isPlatformAdmin && (
+            <div className="mb-4 flex flex-wrap items-center gap-2">
+              <span className="flex items-center gap-1 text-xs text-muted-foreground">
+                <Building2 className="size-3.5" />
+                归属公司
+              </span>
+              <Select
+                aria-label="文档归属公司"
+                className="w-56"
+                value={companyId}
+                onChange={(e) => setCompanyId(e.target.value)}
+                disabled={uploading}
+              >
+                <SelectItem value="">
+                  {companies.length === 0
+                    ? "暂无测试公司，请先在管理后台创建公司"
+                    : "请选择归属的测试公司"}
+                </SelectItem>
+                {companies.map((c) => (
+                  <SelectItem key={c.companyId} value={c.companyId}>
+                    {c.companyName}（{c.docCount}）
+                  </SelectItem>
+                ))}
+              </Select>
+              {noCompanySelected && companies.length > 0 && (
+                <span className="text-[11px] text-amber-600 dark:text-amber-400">
+                  选择公司后才能上传
+                </span>
+              )}
+            </div>
+          )}
+
           {/* 三层知识库：上传目标层级（无权限的层级不可选，先传个人库再申请共享） */}
           <div className="mb-4 flex flex-wrap items-center gap-1.5">
             <span className="mr-1 text-xs text-muted-foreground">存入</span>
@@ -313,11 +409,13 @@ export function UploadCard({ disabled, onUploadComplete }: UploadCardProps) {
               )}
             </motion.div>
             <p className="text-sm font-medium">
-              {uploading
-                ? `上传中… ${uploadProgress}%`
-                : isDragging
-                  ? "松开以上传"
-                  : "拖拽文件到此处"}
+              {noCompanySelected
+                ? "请先选择归属公司"
+                : uploading
+                  ? `上传中… ${uploadProgress}%`
+                  : isDragging
+                    ? "松开以上传"
+                    : "拖拽文件到此处"}
             </p>
             <p className="mt-1 text-xs text-muted-foreground">
               {uploading

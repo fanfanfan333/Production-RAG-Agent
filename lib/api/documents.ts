@@ -14,7 +14,8 @@ import type {
 
 export async function getDocuments(
   collectionId?: string | null,
-  accessLevel?: AccessLevel | "all"
+  accessLevel?: AccessLevel | "all",
+  companyId?: string | null
 ): Promise<{
   documents: Document[];
   stats: DashboardStats;
@@ -24,6 +25,9 @@ export async function getDocuments(
   // 三层知识库筛选（个人 / 部门 / 公司）走服务端过滤：分页才有意义 ——
   // 客户端过滤只能筛当前这一页的 20 条，会造成"翻页后数量对不上"。
   if (accessLevel && accessLevel !== "all") params.set("access_level", accessLevel);
+  // 公司筛选（文档页，仅 admin 有该入口）：同样在服务端过滤，
+  // 取值来自 /companies/accessible，越界取值后端返回空集。
+  if (companyId) params.set("company_id", companyId);
   const query = params.toString();
   const raw = await apiFetch<unknown>(
     `/documents${query ? `?${query}` : ""}`

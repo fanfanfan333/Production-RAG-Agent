@@ -1,0 +1,132 @@
+classDiagram
+    %% ============================================================
+    %% 增量：公司注册表 + 测试公司作用域 + 文档三层标注
+    %% 只画与本次变更相关的类/服务，不重画既有 RAG 全图
+    %% ============================================================
+
+    class Company {
+        %% 新表 companies（一等注册实体）
+        +String tenant_id  "PK，稳定标识，改名不变"
+        +String display_name "展示名，唯一"
+        +String name_key  "UNIQUE，归一化键"
+        +UUID created_by  "FK users.id SET NULL；创建者"
+        +bool is_test    "创建者为平台管理员"
+        +datetime created_at
+        +datetime updated_at
+    }
+
+    class CompanyRegistryService {
+        <<service>>
+        +normalize_company_name_key(name) str
+        +generate_tenant_id() str
+        +create_company(admin, display_name) Company
+        +rename_company(admin, tenant_id, new_name) Company
+        +get_company(tenant_id) Company?
+        +find_by_name(name) Company?
+        +list_registered_companies() list~Company~
+        +company_display_names(tenant_ids) dict
+        +tenant_ids_created_by(admin_id) frozenset
+        +assert_admin_owns(admin, tenant_id) None
+        +backfill_from_existing() int
+        +seed_assignment(mapping) int
+    }
+
+    class DocumentScope {
+        %% tenancy.py —— 可见范围的唯一入参形态
+        +UUID owner_id
+        +frozenset tenant_ids  "公司集合；None=不限制(仅 unrestricted)"
+        +frozenset owns_tenant_ids "可见他人 private 的租户(仅 admin 自建)"
+        +str department_id
+        +bool tenant_wide
+        +bool cross_tenant  "len(tenant_ids)>1"
+        +str label
+        +acl_kwargs() dict  "统一喂给 list/retrieve 的 kwargs"
+    }
+
+    class Tenancy {
+        <<module 纯函数>>
+        +DEFAULT_TENANT_ID
+        +ACCESS_PRIVATE
+        +ACCESS_DEPARTMENT
+        +ACCESS_TENANT
+        +tenant_clause(tenant_ids) ColumnElement
+        +tenant_scope_fingerprint(tenant_ids) str
+        +scope_for(user, owned_tenant_ids) DocumentScope
+        +request_scope(user) DocumentScope  "async，解析 admin 自建公司"
+        +document_acl_clause(owner_id, department_id, tenant_wide, owns_tenant_ids) ColumnElement
+        +document_scope_clause(owner_id, department_id, tenant_ids, owns_tenant_ids, tenant_wide) ColumnElement
+        +can_access_document(doc, user, tenant_ids, owns_tenant_ids, owner_id) bool
+        +delete_permission_for(doc, user, tenant_ids, owns_tenant_ids) tuple
+        +can_request_delete(doc, user, tenant_ids, owns_tenant_ids) bool
+        +permission_context(user, owner_id, tenant_ids, owns_tenant_ids) str
+        +scoped_cache_key(tenant_scope, perm_context, raw_key) str
+    }
+
+    class DocumentQueryService {
+        <<service>>
+        +list_documents(tenant_ids, owns_tenant_ids, ...) DocumentListResponse
+        +get_document_chunks(tenant_ids, owns_tenant_ids, ...) dict
+        +delete_document(tenant_ids, owns_tenant_ids, ...) Document
+        -_compose_scope_labels(rows) dict  "tenant_name / department_name"
+    }
+
+    class RetrievalService {
+        <<service>>
+        +retrieve_chunks(tenant_ids, owns_tenant_ids, tenant_wide, ...) list~RetrievedChunk~
+        +_visibility_conditions(owner_id, department_id, tenant_wide, owns_tenant_ids) list
+        +_scroll_corpus(tenant_ids, ...) list~RetrievedChunk~
+        +_bm25_keyword_candidates(tenant_scope, perm_context, ...) list
+        +_pg_keyword_candidates(tenant_ids, owns_tenant_ids, ...) list
+    }
+
+    class KeywordSearch {
+        <<module>>
+        +keyword_search(session, tenant_ids, owner_id, tenant_wide, owns_tenant_ids, ...) rows
+    }
+
+    class StaffService {
+        <<service>>
+        +create_staff_request(user, company_id, company_name, department_name, duty) StaffRequest
+        +can_review_staff(reviewer_tenant_ids, request, reviewer) bool
+        +list_inbox(reviewer) list
+        +list_members(actor, company_id) list
+        +list_companies(actor) list  "admin→自建测试公司"
+        +set_member_identity(actor, ...) dict
+        +delete_member(actor, target_id) dict
+    }
+
+    class CompaniesApi {
+        <<router /companies>>
+        +GET /companies  "注册表清单(身份验证下拉)"
+        +GET /companies/accessible  "我可访问的公司+doc_count(文档页筛选, document.read)【Rev2】"
+        +POST /companies  "admin 创建"
+        +PATCH /companies/{id}  "admin 改名"
+    }
+
+    class AccessibleCompanyItem {
+        %% schemas/company.py 【Rev2 新增】
+        +str company_id
+        +str display_name
+        +int doc_count  "走 document_scope_clause 统计 → 与列表一致"
+    }
+
+    class DocumentsApi {
+        <<router>>
+        +POST /upload  "admin 必填 company_id"
+        +GET /documents  "tenant_name / department_name"
+    }
+
+    DocumentScope ..> Tenancy : built by scope_for/request_scope
+    CompanyRegistryService ..> Company : CRUD
+    Tenancy ..> CompanyRegistryService : admin 自建公司集合
+    DocumentQueryService ..> Tenancy : document_scope_clause
+    RetrievalService ..> Tenancy : _visibility_conditions / document_scope_clause
+    KeywordSearch ..> Tenancy : document_scope_clause
+    StaffService ..> CompanyRegistryService : 解析/校验公司标识
+    CompaniesApi ..> CompanyRegistryService : create/rename/list
+    CompaniesApi ..> Tenancy : request_scope(accessible)
+    CompaniesApi ..> AccessibleCompanyItem : /companies/accessible
+    CompaniesApi ..> DocumentQueryService : count_by_tenant (doc_count 同源)
+    DocumentsApi ..> CompanyRegistryService : assert_admin_owns
+    DocumentsApi ..> DocumentQueryService : list_documents
+    DocumentsApi ..> Tenancy : request_scope

@@ -3,6 +3,10 @@
 import { Building2, Lock, Users } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { AccessLevel } from "@/lib/types";
+// 文本组装是纯函数，单独成模块（零依赖，便于 node 直接跑最小检查）
+import { tierBadgeText } from "@/lib/documents/tier-label";
+
+export { tierBadgeText };
 
 /**
  * 三层知识库的中文标注徽标：个人 / 部门 / 公司。
@@ -39,14 +43,21 @@ const TIER_STYLES: Record<
 export function AccessTierBadge({
   level,
   label,
+  companyName,
+  departmentName,
   className,
 }: {
   level?: AccessLevel;
   label?: string;
+  /** 公司展示名（部门/公司层级追加显示；取不到则只显示层级词）。 */
+  companyName?: string | null;
+  /** 部门展示名（仅部门层级追加显示）。 */
+  departmentName?: string | null;
   className?: string;
 }) {
   const style = TIER_STYLES[level ?? "private"] ?? TIER_STYLES.private;
   const Icon = style.icon;
+  const text = tierBadgeText(level, label, companyName, departmentName);
 
   return (
     <span
@@ -55,10 +66,10 @@ export function AccessTierBadge({
         style.className,
         className
       )}
-      title={`知识库层级：${label || style.label}知识库`}
+      title={`知识库层级：${text}知识库`}
     >
       <Icon className="size-3" />
-      {label || style.label}
+      {text}
     </span>
   );
 }

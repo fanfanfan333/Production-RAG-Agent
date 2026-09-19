@@ -123,6 +123,9 @@ def build_context(
         BuiltContext —— context 为空字符串表示没有任何证据
     """
     settings = get_settings()
+    # 图片 URL 口径与 multimodal 分支共用同一函数，避免两处各拼一遍（漂移）。
+    # 惰性导入：仅在本函数被调用时解析，规避模块级循环导入。
+    from app.services.nodes.multimodal_context_node import image_url_for
     use_parent = (
         settings.HIERARCHICAL_RAG_ENABLED if expand_parent is None else expand_parent
     )
@@ -218,6 +221,19 @@ def build_context(
             "analyze_quality": dict(chunk.analyze_quality or {}),
             "analyze_fusion": dict(chunk.analyze_fusion or {}),
             "quality_score": chunk.quality_score,
+            # ── 内容类型与图片信息（与 multimodal 分支 sources **契约一致**）────
+            # 关闭 MULTIMODAL_CONTEXT_ENABLED 走本函数时，若缺这几个键，前端的
+            # isImageSource 判定失效 → 图片引用不显示原图、无徽标。此处补齐，保证
+            # 降级路径的 sources 与多模态路径同构。
+            "content_type": chunk.content_type,
+            "image_id": chunk.image_id,
+            "image_path": chunk.image_path,
+            "image_url": image_url_for(chunk.document_id, chunk.image_path),
+            "image_caption": chunk.image_caption,
+            "image_type": chunk.image_type,
+            "analyze_engine": chunk.analyze_engine,
+            "analyze_confidence": float(chunk.analyze_confidence or 0.0),
+            "manual_review": bool(chunk.manual_review),
         })
 
     if masked:

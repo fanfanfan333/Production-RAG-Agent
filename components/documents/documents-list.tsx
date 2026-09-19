@@ -23,7 +23,12 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { deleteDocument, getDocumentChunks } from "@/lib/api/documents";
+import {
+  fetchAccessibleCompanies,
+  type AccessibleCompany,
+} from "@/lib/api/companies";
 import { useApp } from "@/lib/context/app-context";
+import { useAuth } from "@/lib/context/auth-context";
 import { useDocuments } from "@/lib/hooks/use-documents";
 import type {
   AccessLevel,
@@ -48,6 +53,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Select, SelectItem } from "@/components/ui/select";
 import { cn, describeIngestStage, formatBytes, formatRelativeTime } from "@/lib/utils";
 import { AccessTierBadge, tierScopeName } from "@/components/documents/access-badge";
 import {
@@ -154,12 +160,38 @@ function DocumentViewer({ doc }: { doc: Document }) {
 
 export function DocumentsList() {
   const { refresh } = useApp();
+  const { user } = useAuth();
   const router = useRouter();
   const [tier, setTier] = useState<AccessLevel | "all">("all");
+  // 公司筛选（仅平台管理员可见）：候选 = GET /companies/accessible，
+  // 与可见范围同源；默认「全部公司」。
+  const isPlatformAdmin =
+    user?.role === "admin" || Boolean(user?.permissions?.includes("*"));
+  const [companies, setCompanies] = useState<AccessibleCompany[]>([]);
+  const [companyId, setCompanyId] = useState("");
   const { documents, loading, error, refetch } = useDocuments({
     pollProcessing: true,
     accessLevel: tier,
+    companyId: companyId || null,
   });
+
+  useEffect(() => {
+    if (!isPlatformAdmin) return;
+    let cancelled = false;
+    fetchAccessibleCompanies()
+      .then((list) => {
+        if (!cancelled) setCompanies(list);
+      })
+      .catch(() => {
+        /* 候选拉取失败不阻塞文档列表本身 */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [isPlatformAdmin]);
+
+  // admin 尚未创建任何测试公司：fail-closed（空列表 + 引导，不回退全平台）
+  const adminHasNoCompany = isPlatformAdmin && companies.length === 0;
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [viewingDoc, setViewingDoc] = useState<Document | null>(null);
   const [sharingDoc, setSharingDoc] = useState<Document | null>(null);
@@ -223,6 +255,31 @@ export function DocumentsList() {
           </CardDescription>
         </div>
 
+        {/* 公司筛选器：仅平台管理员可见，候选 = 可见范围内的测试公司 */}
+        {isPlatformAdmin && (
+          <div className="flex items-center gap-2">
+            <span className="flex items-center gap-1 text-xs text-muted-foreground">
+              <Building2 className="size-3.5" />
+              公司
+            </span>
+            <Select
+              aria-label="按公司筛选"
+              className="w-56"
+              value={companyId}
+              onChange={(e) => setCompanyId(e.target.value)}
+            >
+              <SelectItem value="">
+                全部公司（{companies.reduce((sum, c) => sum + c.docCount, 0)}）
+              </SelectItem>
+              {companies.map((c) => (
+                <SelectItem key={c.companyId} value={c.companyId}>
+                  {c.companyName}（{c.docCount}）
+                </SelectItem>
+              ))}
+            </Select>
+          </div>
+        )}
+
         {/* 三层知识库切换 */}
         <div className="flex flex-wrap items-center gap-1.5">
           {TIER_TABS.map((tab) => {
@@ -273,9 +330,11 @@ export function DocumentsList() {
           </div>
         ) : documents.length === 0 ? (
           <p className="px-6 py-8 text-center text-sm text-muted-foreground">
-            {tier === "all"
-              ? "尚未上传任何文档。"
-              : `${tierScopeName(tier as AccessLevel)}中还没有文档。`}
+            {adminHasNoCompany && !companyId && tier === "all"
+              ? "暂无测试公司，请先创建公司。"
+              : tier === "all"
+                ? "尚未上传任何文档。"
+                : `${tierScopeName(tier as AccessLevel)}中还没有文档。`}
           </p>
         ) : (
           <ul className="divide-y divide-border/60">
@@ -311,7 +370,12 @@ export function DocumentsList() {
                   <div className="min-w-0 flex-1">
                     <div className="flex items-center gap-2">
                       <p className="truncate text-sm font-medium">{doc.name}</p>
-                      <AccessTierBadge level={level} label={doc.accessLabel} />
+                      <AccessTierBadge
+                        level={level}
+                        label={doc.accessLabel}
+                        companyName={doc.tenantName}
+                        departmentName={doc.departmentName}
+                      />
                     </div>
                     <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
                       <span>{doc.type}</span>

@@ -12,6 +12,10 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import {
+  fetchRegisteredCompanies,
+  type RegisteredCompany,
+} from "@/lib/api/companies";
+import {
   cancelStaffRequest,
   createStaffRequest,
   fetchStaffProfile,
@@ -27,6 +31,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import { Select, SelectItem } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
 
 /**
@@ -58,7 +63,9 @@ export function IdentityDialog({
   const { logout } = useAuth();
   const [profile, setProfile] = useState<StaffProfile | null>(null);
   const [loading, setLoading] = useState(true);
-  const [company, setCompany] = useState("");
+  // 公司字段绑定注册表：选中的是 companyId（下拉候选 = 已注册公司）
+  const [companies, setCompanies] = useState<RegisteredCompany[]>([]);
+  const [companyId, setCompanyId] = useState("");
   const [department, setDepartment] = useState("");
   const [duty, setDuty] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -68,11 +75,21 @@ export function IdentityDialog({
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const me = await fetchStaffProfile();
+      const [me, registered] = await Promise.all([
+        fetchStaffProfile(),
+        // 下拉候选拉取失败不阻塞表单 —— 后端提交时仍会校验「公司已注册」
+        fetchRegisteredCompanies().catch(() => [] as RegisteredCompany[]),
+      ]);
       setProfile(me);
+      setCompanies(registered);
       const last = me.latestRequest;
       if (last && last.status !== "approved" && last.status !== "cancelled") {
-        setCompany(last.companyName);
+        // 预填上次申请：公司按注册表标识/当前名匹配；公司被改名后
+        // 旧名匹配不上就留空让用户重选（旧名按未注册处理，见 P1-2）。
+        const matched =
+          registered.find((c) => c.companyId === last.companyId) ??
+          registered.find((c) => c.companyName === last.companyName);
+        setCompanyId(matched?.companyId ?? "");
         setDepartment(last.departmentName);
         setDuty(last.duty);
       }
@@ -95,8 +112,12 @@ export function IdentityDialog({
 
   const submit = async () => {
     setError(null);
-    if (!company.trim()) {
-      setError("请填写公司名称");
+    if (!companyId) {
+      setError(
+        companies.length === 0
+          ? "暂无可选公司，请先联系管理员注册后再提交"
+          : "请选择公司名称"
+      );
       return;
     }
     if (!department.trim()) {
@@ -111,7 +132,7 @@ export function IdentityDialog({
     setSubmitting(true);
     try {
       const res = await createStaffRequest({
-        companyName: company.trim(),
+        companyId,
         departmentName: department.trim(),
         duty: duty.trim(),
       });
@@ -212,15 +233,32 @@ export function IdentityDialog({
             )}
 
             <div className="space-y-4">
-              <Field
-                id="company"
-                label="公司名称"
-                icon={<Building2 className="size-3.5" />}
-                placeholder="如：某某科技有限公司"
-                value={company}
-                onChange={setCompany}
-                disabled={submitting}
-              />
+              <div className="space-y-1.5">
+                <label
+                  htmlFor="company"
+                  className="flex items-center gap-1.5 text-[13px] font-medium"
+                >
+                  <Building2 className="size-3.5" />
+                  公司名称
+                </label>
+                <Select
+                  id="company"
+                  value={companyId}
+                  onChange={(e) => setCompanyId(e.target.value)}
+                  disabled={submitting}
+                >
+                  <SelectItem value="">
+                    {companies.length === 0
+                      ? "暂无可选公司（请先由管理员注册该公司）"
+                      : "请选择已注册公司"}
+                  </SelectItem>
+                  {companies.map((c) => (
+                    <SelectItem key={c.companyId} value={c.companyId}>
+                      {c.companyName}
+                    </SelectItem>
+                  ))}
+                </Select>
+              </div>
               <Field
                 id="department"
                 label="公司部门"

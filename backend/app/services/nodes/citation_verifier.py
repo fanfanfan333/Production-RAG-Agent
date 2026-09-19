@@ -150,8 +150,14 @@ def _canon_number(token: str) -> str:
 
 
 def _canon_date(token: str) -> str:
-    """归一化日期：统一分隔符，去掉"日"（2024年1月31日 → 2024-1-31）."""
-    return (
+    """归一化日期：统一分隔符、去"日"、**月/日补零**.
+
+    补零是必需的：文档常写「2024年01月」，而模型复述成「2024年1月」——
+    不做补零时前者归一为 ``2024-01``、后者 ``2024-1``，两者不相等 →
+    正确答案被误判"日期与原文不一致"而被删引用。
+    补零后 ``2024-1`` 与 ``2024-01`` 均归一为 ``2024-01``（年份保持原样）。
+    """
+    s = (
         token.replace("年", "-")
         .replace("月", "-")
         .replace("日", "")
@@ -159,6 +165,11 @@ def _canon_date(token: str) -> str:
         .replace(" ", "")
         .strip("-")
     )
+    parts = s.split("-")
+    if len(parts) <= 1:
+        return s
+    # parts[0] = 年份（原样）；其余 = 月/日（纯数字补零到两位）
+    return "-".join([parts[0], *(p.zfill(2) if p.isdigit() else p for p in parts[1:])])
 
 
 def extract_numbers(text: str) -> set[str]:
@@ -432,6 +443,13 @@ class CitationCheck:
     # 命中句：答案实际依据的那几句原文（含偏移与行号）—— 引用卡片据此高亮，
     # 让"引用"从"整块切片"收紧到"具体几句"。
     evidence: tuple[EvidenceSpan, ...] = ()
+    # 被引来源是否含有**可比对的证据文本**（能否真的拿它跟句子做内容词比对）。
+    #
+    # False = 来源拿不到任何 token/片段（不透明来源：纯图片既无 OCR 也无 vision、
+    # 或只剩元数据）—— 此时 supported=False 的语义是**"无从判断"**，而非
+    # "确证无依据"。前端/审计据此把这类条目排除出"无依据句"显式标注，
+    # 避免把中文句、图片块(vision)、表格块来源的句子误标（宁可少标，不可错标）。
+    evidence_available: bool = True
 
     @property
     def passed(self) -> bool:
@@ -472,6 +490,7 @@ class CitationCheck:
             "missing_dates": list(self.missing_dates),
             "location": self.location,
             "evidence": [e.as_dict() for e in self.evidence],
+            "evidence_available": self.evidence_available,
         }
 
 
@@ -657,6 +676,9 @@ def verify_citations(
             # 合并引用区间内所有 source 的正文（区间引用本就表示"这几条共同支持"）
             cited_text = "\n".join(src_texts[g - 1] for g in group)
             ratio = _support_ratio(plain_sentence, cited_text)
+            # 来源是否含可供比对的证据文本：拿不到任何 token 时，"未支持"是
+            # **无从判断**而非"确证无依据" —— 前端据此把该句排除出"无依据"标注。
+            evidence_available = bool(tokenize(cited_text))
 
             # ── 引用位置正确？── 若别条 source 明显更贴合，则位置可疑 ──────
             best_other = None
@@ -715,6 +737,7 @@ def verify_citations(
                     min_ratio=evidence_min_ratio,
                     max_sentences=evidence_max_sentences,
                 ),
+                evidence_available=evidence_available,
             )
             verdicts.append(check)
 

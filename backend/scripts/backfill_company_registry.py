@@ -5,7 +5,7 @@
     c8111de986583 → 测试公司1   created_by=admin  is_test=true
     cfb08c53677c4 → 测试公司2   created_by=admin  is_test=true
     c309a7cb9f496 → A公司        created_by=NULL   is_test=false
-    cfb33b1db5679d → B公司        created_by=NULL   is_test=false
+    cf33b1db5679d → B公司        created_by=NULL   is_test=false
     default       → 不入表（历史/占位租户，list_companies 本就排除 admin）
 
 关键约束

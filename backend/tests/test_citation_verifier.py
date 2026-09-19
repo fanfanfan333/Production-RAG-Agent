@@ -75,7 +75,9 @@ def test_extract_numbers_normalizes():
 
 def test_extract_dates_normalizes():
     got = extract_dates("2024年1月31日签署，2024-03-01 生效，有效期至 2025年")
-    assert "2024-1-31" in got, got
+    # 月/日补零：2024年1月 → 2024-01（与 2024-01 判等，修复"2024年1月 vs
+    # 2024年01月 被判不一致"的假阳性）
+    assert "2024-01-31" in got, got
     assert "2024-03-01" in got, got
     assert "2025" in got, got
     print("[OK] test_extract_dates_normalizes")
@@ -167,7 +169,7 @@ def test_date_mismatch_flagged():
     report = verify_citations(answer, sources)
     assert report.date_mismatch_indices == (1,), report.as_audit()
     v = report.verdicts[0]
-    assert "2025-6-1" in v.missing_dates, v.as_dict()
+    assert "2025-06-01" in v.missing_dates, v.as_dict()
     print("[OK] test_date_mismatch_flagged")
 
 

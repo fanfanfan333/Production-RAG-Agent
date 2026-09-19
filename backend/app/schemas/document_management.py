@@ -49,6 +49,15 @@ class DocumentSummary(BaseModel):
     access_label: str = "个人"
     tenant_id: str = "default"
     department_id: str | None = None
+    # ── 三层标注的展示名（T03）───────────────────────────────────────────────
+    # 后端只给**原始字段**，拼接（"公司 · 部门" / 仅"个人"）放前端 —— 但后端保证：
+    # 能取到就是干净字符串，取不到就是 None，**绝不产出** "None"/"undefined" 之类。
+    #   tenant_name     公司展示名，来自 companies 注册表 display_name；
+    #                   未注册（如 default 历史租户）为 None。
+    #   department_name 该公司内该 department_id 对应的部门名，
+    #                   取自 users.department_name 的成员归属聚合（不依赖 owner）。
+    tenant_name: str | None = None
+    department_name: str | None = None
 
     # ── 权限能力（前端按钮显隐与后端校验同源）─────────────────────────────────
     owner_id: uuid.UUID | None = None

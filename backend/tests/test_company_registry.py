@@ -114,6 +114,49 @@ def test_backfill_plan_shape():
     null_owned = [i for i in DEFAULT_BACKFILL_ASSIGNMENTS if i.get("created_by") is None]
     assert sorted(i["tenant_id"] for i in null_owned) == [
         "c309a7cb9f496",
-        "cfb33b1db5679d",
+        "cf33b1db5679d",
     ]
     assert all(not i["is_test"] for i in null_owned), "A/B 公司不是测试公司"
+
+
+def test_create_company_maps_unique_violation_to_409(monkeypatch):
+    """并发重名边界：name_key 唯一约束被触发 → 409「公司已存在」，而不是 500。"""
+    if not _IMPORT_OK:
+        return
+
+    import asyncio
+
+    import pytest
+    from sqlalchemy.exc import IntegrityError
+
+    from app.services import company_registry as cr
+
+    class _StubSession:
+        """前置查重不冲突（模拟并发窗口），flush 时唯一约束报错。"""
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def scalar(self, *args, **kwargs):
+            return None
+
+        async def get(self, *args, **kwargs):
+            return None
+
+        def add(self, obj):
+            return None
+
+        async def flush(self):
+            raise IntegrityError("INSERT companies", {}, Exception("dup key"))
+
+        async def refresh(self, obj):
+            return None
+
+    monkeypatch.setattr(cr, "get_db_session", lambda: _StubSession())
+
+    with pytest.raises(CompanyError) as err:
+        asyncio.run(cr.create_company(None, "测试公司1"))
+    assert err.value.status_code == 409

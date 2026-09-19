@@ -22,6 +22,7 @@ import unicodedata
 import uuid
 
 from sqlalchemy import func, select, update
+from sqlalchemy.exc import IntegrityError
 
 from app.db.company_models import Company
 from app.db.postgres import get_db_session
@@ -47,7 +48,7 @@ DEFAULT_BACKFILL_ASSIGNMENTS: tuple[dict, ...] = (
     {"tenant_id": "c8111de986583", "display_name": "测试公司1", "created_by": "admin", "is_test": True},
     {"tenant_id": "cfb08c53677c4", "display_name": "测试公司2", "created_by": "admin", "is_test": True},
     {"tenant_id": "c309a7cb9f496", "display_name": "A公司", "created_by": None, "is_test": False},
-    {"tenant_id": "cfb33b1db5679d", "display_name": "B公司", "created_by": None, "is_test": False},
+    {"tenant_id": "cf33b1db5679d", "display_name": "B公司", "created_by": None, "is_test": False},
 )
 
 
@@ -171,6 +172,35 @@ async def tenant_ids_created_by(admin_id: uuid.UUID | None) -> frozenset[str]:
     return frozenset(rows)
 
 
+async def test_tenant_ids() -> frozenset[str]:
+    """
+    全部「测试公司」（``companies.is_test = true``）的 ``tenant_id`` 集合.
+
+    这是「测试公司集合」的**唯一来源**：内容消费排除
+    （``tenancy.exclude_test_tenants``，被 ``tenancy.content_scope`` 与
+    ``retrieval_service.retrieve_chunks`` 共用同一实现点）从这里取，禁止在别处再
+    拼一遍 ``is_test`` 的 SQL —— 两处各写一份必然漂移。
+
+    语义（用户**最终口径**，已覆盖此前"测试公司成员也看不到"的旧说法）：
+        * **测试公司成员**在自己测试公司内**一切照常** —— 列表可见、检索**能命中**、
+          可上传、可预览（用知识库测 bug 的前提）；测试账号不受任何排除影响。
+        * **仅平台管理员 admin** 的**内容消费**（检索 / 摘要 / 文档关联 / 对话内
+          文档列表）排除测试公司；admin 的**文档列表 / 管理端点**（``GET /documents``）
+          **仍可见**测试公司文档，以便管理它们。
+        * 排除只在 admin 身份下生效：判据是其 ``owns_tenant_ids`` 非空（本系统中只有
+          平台管理员才可能拥有自建公司集合 → 非 admin 恒为空集，见 ``scope_for``）。
+    ``is_test`` 是物化列（``created_by`` 被 ON DELETE SET NULL 清空后仍能辨类别），
+    因此这里不需要回退到 ``created_by`` 推断。
+    """
+    async with get_db_session() as session:
+        rows = (
+            await session.execute(
+                select(Company.tenant_id).where(Company.is_test.is_(True))
+            )
+        ).scalars().all()
+    return frozenset(rows)
+
+
 # ── 写：创建 / 改名 ───────────────────────────────────────────────────────────
 
 
@@ -205,7 +235,12 @@ async def create_company(actor: User | None, display_name: str) -> Company:
             is_test=is_admin,
         )
         session.add(company)
-        await session.flush()
+        try:
+            await session.flush()
+        except IntegrityError as exc:
+            # 并发下两个同名请求可能同时通过前置查重；``name_key`` 唯一约束是
+            # 最后一道闸 —— 把它翻译成与单线程一致的 409，而不是 500。
+            raise CompanyError(MSG_DUPLICATE, status_code=409) from exc
         await session.refresh(company)
 
     logger.info(
@@ -262,7 +297,12 @@ async def rename_company(actor: User | None, tenant_id: str, new_name: str) -> C
                 .where(User.tenant_id == tenant_id)
                 .values(company_name=name)
             )
-            await session.flush()
+            try:
+                await session.flush()
+            except IntegrityError as exc:
+                # 改成一个已被占用的名字（并发下前置查重可能漏掉）→ 与单线程
+                # 一致的 409，而不是 500。
+                raise CompanyError(MSG_DUPLICATE, status_code=409) from exc
             await session.refresh(company)
 
     if old_name != name:
@@ -297,7 +337,7 @@ async def backfill_from_existing(
         c8111de986583 → 测试公司1（created_by=admin, is_test）
         cfb08c53677c4 → 测试公司2（created_by=admin, is_test）
         c309a7cb9f496 → A公司（created_by=NULL）
-        cfb33b1db5679d → B公司（created_by=NULL）
+        cf33b1db5679d → B公司（created_by=NULL）
         default       → **不入表**
 
     - **幂等**：已存在的租户 → 更新（而非重复插入）；``name_key`` 冲突时

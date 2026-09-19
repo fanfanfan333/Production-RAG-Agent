@@ -9,9 +9,12 @@ export function useDocuments(options?: {
   pollProcessing?: boolean;
   /** 三层知识库筛选：undefined/"all" = 全部；否则只看某一层。 */
   accessLevel?: AccessLevel | "all";
+  /** 公司筛选（文档页，仅 admin 有该入口）：只看归属该公司的文档。 */
+  companyId?: string | null;
 }) {
   const { refreshKey, activeCollectionId } = useApp();
   const accessLevel = options?.accessLevel ?? "all";
+  const companyId = options?.companyId ?? null;
   const [documents, setDocuments] = useState<Document[]>([]);
   const [stats, setStats] = useState<DashboardStats>({
     totalDocuments: 0,
@@ -25,7 +28,7 @@ export function useDocuments(options?: {
   const refetch = useCallback(async () => {
     setError(null);
     try {
-      const data = await getDocuments(activeCollectionId, accessLevel);
+      const data = await getDocuments(activeCollectionId, accessLevel, companyId);
       setDocuments(data.documents);
       setStats(data.stats);
     } catch (err) {
@@ -33,7 +36,7 @@ export function useDocuments(options?: {
     } finally {
       setLoading(false);
     }
-  }, [activeCollectionId, accessLevel]);
+  }, [activeCollectionId, accessLevel, companyId]);
 
   useEffect(() => {
     setLoading(true);

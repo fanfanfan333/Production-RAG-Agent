@@ -148,6 +148,67 @@ async def list_department_options(tenant_id: str | None) -> list[dict]:
     return merge_department_rows(rows)
 
 
+async def department_display_names(
+    pairs: set[tuple[str, str]] | None,
+) -> dict[tuple[str, str], str]:
+    """
+    批量取「(tenant_id, department_id) → 部门展示名」映射（列表页标注用，避免 N+1）.
+
+    与 :func:`list_department_options` **同源**（都是 ``users.department_name`` 的
+    成员归属），区别有二：
+
+      1. 跨租户、按调用方给定的**精确 pair 集合**批量取（列表页一页可能横跨多公司）；
+      2. **不依赖文档归属人** —— 文档 ``owner_id`` 已解绑（离职，置 NULL）时，只要该
+         公司仍有成员挂在该 ``department_id`` 上，仍能取到部门名。
+
+    同一 ``(tenant_id, department_id)`` 若挂着多个不同的 ``department_name``
+    （成员换过名，与 :func:`merge_department_rows` 同一现象），取字典序最小者，
+    保证同一份数据每次渲染一致。
+
+    Args:
+        pairs: 需要解析的 ``(tenant_id, department_id)`` 集合；``None``/空集 → 空字典。
+
+    Returns:
+        ``{(tenant_id, department_id): department_name}``；取不到名字的 pair 不出现
+        在结果里（调用方按 ``None`` 兜底，标签渲染时降级为公司名 / 层级词）。
+    """
+    wanted = {(str(t), str(d)) for t, d in (pairs or ()) if t and d}
+    if not wanted:
+        return {}
+
+    tenant_ids = sorted({t for t, _ in wanted})
+    department_ids = sorted({d for _, d in wanted})
+
+    async with get_db_session() as session:
+        rows = (
+            await session.execute(
+                select(
+                    User.tenant_id,
+                    User.department_id,
+                    User.department_name,
+                ).where(
+                    User.tenant_id.in_(tenant_ids),
+                    User.department_id.in_(department_ids),
+                    User.department_id.is_not(None),
+                    User.department_id != "",
+                )
+            )
+        ).all()
+
+    result: dict[tuple[str, str], str] = {}
+    for tenant_id, department_id, department_name in rows:
+        key = (str(tenant_id), str(department_id))
+        if key not in wanted:
+            continue
+        name = (department_name or "").strip()
+        if not name:
+            continue
+        current = result.get(key)
+        if current is None or name < current:
+            result[key] = name
+    return result
+
+
 async def transfer_document_to_department(
     document_id: uuid.UUID,
     *,

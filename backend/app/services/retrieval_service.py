@@ -14,7 +14,7 @@ import asyncio
 import re
 import time
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from app.config import get_settings
 from app.db.qdrant import get_qdrant_client
@@ -26,6 +26,7 @@ from app.services.pg_keyword_search import keyword_search
 from app.services.tenancy import (
     DEFAULT_TENANT_ID,
     document_scope_clause,
+    exclude_test_tenants,
     normalize_tenant_id,
     scoped_cache_key,
     tenant_scope_fingerprint,
@@ -853,6 +854,22 @@ async def _hydrate_parents(chunks: list[RetrievedChunk]) -> int:
     from sqlalchemy import select
     from app.db.postgres import get_db_session
     from app.db.models import ChunkParent
+    import uuid
+
+    # 安全约束：父块必须与**子块自己所属的文档**绑定。
+    # parent_id 是 "{document_id}:p:{index}"，正常情况天然同文档；但 Qdrant payload
+    # 一旦被污染（parent_id 被改写成别的文档/租户），仅按 parent_id 回填就会把**他人
+    # 文档的父块正文**灌进上下文。因此这里同时用子块的 document_id 集合做谓词，
+    # 并在回填时逐条核对父块 document_id == 子块 document_id —— 父块跨文档/跨租户泄漏
+    # 从根上关死（fail-closed：无法核对的子块不回填）。
+    wanted_docs: set[uuid.UUID] = set()
+    for c in parents:
+        if not c.document_id:
+            continue
+        try:
+            wanted_docs.add(uuid.UUID(str(c.document_id)))
+        except (ValueError, TypeError):
+            continue
 
     wanted = list({c.parent_id for c in parents})
     rows: dict[str, ChunkParent] = {}
@@ -864,7 +881,8 @@ async def _hydrate_parents(chunks: list[RetrievedChunk]) -> int:
             for i in range(0, len(wanted), batch):
                 res = await session.execute(
                     select(ChunkParent).where(
-                        ChunkParent.parent_id.in_(wanted[i:i + batch])
+                        ChunkParent.parent_id.in_(wanted[i:i + batch]),
+                        ChunkParent.document_id.in_(list(wanted_docs)),
                     )
                 )
                 for row in res.scalars():
@@ -879,6 +897,14 @@ async def _hydrate_parents(chunks: list[RetrievedChunk]) -> int:
     for c in parents:
         row = rows.get(c.parent_id)
         if row is None:
+            continue
+        # 双保险：父块必须与子块同属一份文档（防止 parent_id 与 document_id 不一致的污染）
+        if str(row.document_id) != str(c.document_id):
+            logger.warning(
+                "parent hydration: document mismatch for parent_id=%s "
+                "(child doc=%s parent doc=%s) — skipped",
+                c.parent_id, c.document_id, row.document_id,
+            )
             continue
         c.parent_text = row.text
         c.parent_char_start = row.char_start
@@ -1240,6 +1266,21 @@ async def retrieve_chunks(
         )
         return []
 
+    # ── 测试公司文档：**平台管理员 admin 不可检索**（用户新规则）─────────────────
+    # 规则实现收敛在 ``tenancy.exclude_test_tenants``（**唯一实现点**）：本函数
+    # 与 ``tenancy.content_scope`` 共用同一段逻辑，杜绝「两处各排除一遍」。
+    # 触发条件 = 调用者是平台管理员（``owns_tenant_ids`` 非空 ⟺ admin，见
+    # ``tenancy.scope_for``）；非 admin（含测试公司成员）原样返回，保证测试账号
+    # 在自己公司内可正常检索。剔除后 admin 的 tenant_ids 变空集，但**不影响**
+    # admin 自己落在 default 的个人库（个人库分支只看 ``owner_id == 我``）。
+    # 三条检索腿（① Qdrant 向量 ② PG 关键词/内存 BM25 ③ DB 兜底校验）全部消费
+    # 下面这两个局部变量，因此一处剔除、三腿同源生效。
+    # ``unrestricted=True``（后端诊断脚本专用，非用户请求路径）跳过本排除。
+    if not unrestricted:
+        tenant_ids, owns_tenant_ids = await exclude_test_tenants(
+            tenant_ids, owns_tenant_ids
+        )
+
     # 检索查询集合：原查询（改写后）+ 去重变体
     queries, vector_only = _search_query_sets(
         query, extra_queries, extra_vector_queries
@@ -1599,40 +1640,14 @@ async def retrieve_chunks(
                         continue
                     rows.append(key)
                     if key not in merged:
-                        merged[key] = RetrievedChunk(
-                            document_id=c.document_id,
-                            filename=c.filename,
-                            page_number=c.page_number,
-                            chunk_index=c.chunk_index,
-                            text=c.text,
-                            score=keyword_only_score,
-                            parent_id=c.parent_id,
-                            parent_text=c.parent_text,
-                            parent_char_start=c.parent_char_start,
-                            parent_char_end=c.parent_char_end,
-                            heading=c.heading,
-                            section=c.section,
-                            content_type=c.content_type,
-                            image_id=c.image_id,
-                            image_path=c.image_path,
-                            image_caption=c.image_caption,
-                            parent_index=c.parent_index,
-                            section_id=c.section_id,
-                            section_path=c.section_path,
-                            doc_type=c.doc_type,
-                            doc_year=c.doc_year,
-                            language=c.language,
-                            title=c.title,
-                            doc_number=c.doc_number,
-                            author=c.author,
-                            keywords=c.keywords,
-                            business_tags=c.business_tags,
-                            # 位置信息随 BM25-only 命中一起带入引用层
-                            line_start=c.line_start,
-                            line_end=c.line_end,
-                            # Multi-Tenant：归属租户一并带入（审计/调试可见）
-                            tenant_id=c.tenant_id,
-                        )
+                        # 以 BM25 候选 chunk 为基底、仅覆盖 score —— 这样**全部**
+                        # 字段（含图片分类 image_type / 位置 position·bbox / 质检
+                        # analyze_quality·analyze_fusion / 引擎 analyze_engine·
+                        # analyze_confidence·manual_review）都随命中带入，与 PG
+                        # 关键词腿（**_media_fields + _position_fields +
+                        # _analysis_fields）契约一致。此前手写逐字段构造漏掉上述
+                        # 8 个，导致内存后端下前端徽标/原图/位置标签失效。
+                        merged[key] = replace(c, score=keyword_only_score)
                 keyword_rank_lists.append(rows)
             except Exception:
                 logger.exception(

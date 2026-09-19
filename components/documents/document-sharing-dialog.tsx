@@ -327,7 +327,12 @@ function SharingDialogBody({
         <p className="text-xs text-muted-foreground">当前层级</p>
         <p className="mt-1 text-sm font-medium">{tierScopeName(current)}</p>
       </div>
-      <AccessTierBadge level={current} label={doc.accessLabel} />
+      <AccessTierBadge
+        level={current}
+        label={doc.accessLabel}
+        companyName={doc.tenantName}
+        departmentName={doc.departmentName}
+      />
     </div>
   );
 

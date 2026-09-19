@@ -92,6 +92,11 @@ export function normalizeDocument(raw: Record<string, unknown>): Document {
     departmentId: (pick<string>(raw, ["department_id", "departmentId"]) ?? null) as
       | string
       | null,
+    // 三层标注的展示名（后端批量取好；缺失为 null，徽标据此退化为仅层级词）
+    tenantName: (pick<string>(raw, ["tenant_name", "tenantName"]) ??
+      null) as string | null,
+    departmentName: (pick<string>(raw, ["department_name", "departmentName"]) ??
+      null) as string | null,
     ownerUsername: (pick<string>(raw, ["owner_username", "ownerUsername"]) ??
       null) as string | null,
 
@@ -416,6 +421,9 @@ export function normalizeVerdicts(raw: unknown): CitationVerdict[] {
     missing_dates: strArray(v.missing_dates),
     location: typeof v.location === "string" ? v.location : null,
     evidence: normalizeEvidenceSpans(v.evidence),
+    // 缺失/旧数据一律视为 true（来源可比对）→ 不改变历史回放的既有行为；
+    // 只有后端显式给 false（不透明来源）才把该句排除出"无依据"标注。
+    evidence_available: v.evidence_available !== false,
   }));
 }
 
