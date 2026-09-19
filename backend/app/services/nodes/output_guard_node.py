@@ -173,12 +173,29 @@ def inspect_output(
     # ── (1) Citation Check ───────────────────────────────────────────────────
     max_idx = _max_source_index(sources)
 
+    # 为何此处是"越界整段移除"，而不是像 citation_verifier 那样"只丢坏下标"？
+    # ─────────────────────────────────────────────────────────────────────
+    # citation_verifier 能逐下标保留，是因为它对**每一个**下标都做了内容级核验
+    # （存在性 + 位置 + 支持度 + 数字/日期），被留下的每一条都带独立证据；而本节点
+    # 只掌握"下标越界"这一个事实，对被保留的那几个下标**没有任何可依赖性判断**，
+    # 且整条标记已被证明含幻觉成分（凭空引用了不存在的编号）。故整段移除更保守、
+    # 更正确 —— 请勿"顺手改成跟 citation_verifier 一样"。
+    #
+    # 执行顺序是 citation_verifier → output_guard：verifier 先行，已把部分区间改写
+    # 成单下标；因此默认配置（CITATION_VERIFIER_ENABLED=true）下这条分支基本不可达，
+    # 只在关掉 verifier 时才显现。
     def _filter_citation(match: re.Match[str]) -> str:
         nonlocal changed_anything
         n = int(match.group(1))
         m2 = match.group(2)
         end = int(m2) if m2 else n
-        if n > max_idx or end > max_idx:
+        # 同时校验**下界**：编号是 1-based，[Source 0] 既不 > max_idx、也不触发任何
+        # 上界判断，旧写法会让它原样漏过去。0 号没有对应来源 —— 前端会把 [Source 0]
+        # 渲染成指向上标链接 #source-0，而下方并没有 id="source-0" 的卡片，用户点到
+        # 一个死链（前端对裸 [N] 那条路径本就写了 `num < 1` 的同类守卫，此处与之一致）。
+        # (注：[Source 3-1] 这类 N>M 的退化区间在 max_idx=3 时仍原样通过，
+        #  与 verifier 的保留语义一致，勿"修"。)
+        if n < 1 or end < 1 or n > max_idx or end > max_idx:
             citations_removed.extend(range(n, end + 1))
             changed_anything = True
             return ""

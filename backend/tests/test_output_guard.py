@@ -88,6 +88,23 @@ def test_citation_with_empty_sources():
     print("[OK] test_citation_with_empty_sources")
 
 
+def test_citation_zero_index_removed():
+    """
+    [Source 0] 不是合法编号（1-based），必须被移除.
+
+    0 号没有对应来源：旧写法只查上界 `n > max_idx or end > max_idx`，0 既不大于
+    max_idx、也不触发任何上界判断，于是被原样放行；前端会把 [Source 0] 渲染成指向
+    上标链接 #source-0，而下方并没有 id="source-0" 的卡片 —— 用户点到一个死链。
+    （前端对裸 [N] 那条路径本就写了 `num < 1` 的同类守卫，此处与之一致。）
+    """
+    text = "开头 [Source 1]，畸形下界 [Source 0]。"
+    result = inspect_output(text, _sources(3), intent="knowledge_qa")
+    assert "[Source 0]" not in result.sanitized_text
+    assert 0 in result.citations_removed
+    assert "[Source 1]" in result.sanitized_text   # 合法引用不受影响
+    print("[OK] test_citation_zero_index_removed")
+
+
 # ── (2) 系统提示词泄露 ───────────────────────────────────────────────────────
 
 def test_leak_english_system_prompt():
@@ -228,6 +245,7 @@ def main():
         test_citation_out_of_range_removed,
         test_citation_range_out_of_bounds_truncated,
         test_citation_with_empty_sources,
+        test_citation_zero_index_removed,
         test_leak_english_system_prompt,
         test_leak_chinese_developer_message,
         test_leak_clean_answer_unchanged,

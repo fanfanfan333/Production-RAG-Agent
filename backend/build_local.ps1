@@ -17,7 +17,13 @@ param(
     [string]$Service = "backend"
 )
 
-$ErrorActionPreference = "Stop"
+# EAP 用 "Continue" 而非 "Stop"：原生工具（docker）把**进度/警告**写到 stderr，
+# 在 PS 5.1 下若调用方用 `2>&1` / `*>&1` 重定向（如 `& .\build_local.ps1 *>&1 | Out-File …`），
+# "Stop" 会把这些 stderr 当成**终止性错误**直接打断脚本 —— 即使构建本身是成功的。
+# 脚本对每个原生调用的结果都**显式检查 `$LASTEXITCODE`**（失败即 `exit 1/3/4`），
+# 因此放宽 EAP **不会削弱任何一道防护**，只是让"进程内调用"与"powershell -File 外部调用"
+# 两种方式行为一致。
+$ErrorActionPreference = "Continue"
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $root
@@ -67,6 +73,7 @@ $keyFiles = @(
     "app/services/retrieval_service.py",
     "app/services/document_query_service.py",
     "app/services/nodes/citation_verifier.py",
+    "app/services/nodes/output_guard_node.py",
     "app/api/companies.py",
     "app/api/document_management.py",
     "app/api/query.py",
@@ -75,11 +82,15 @@ $keyFiles = @(
 
 $mismatch = @()
 foreach ($f in $keyFiles) {
+    # EAP=Continue 下异常不再中断脚本：显式清空，避免某一轮取哈希失败时残留
+    # 上一轮的值，把「没校验的」当成「校验通过的」。取不到即视为不一致（fail-closed）。
+    $disk = ""
+    $contHash = ""
     $diskPath = Join-Path $root ($f -replace "/", "\")
     if (-not (Test-Path $diskPath)) { $mismatch += "$f (磁盘缺文件)"; continue }
-    $disk = (Get-FileHash -Algorithm MD5 $diskPath).Hash.ToLower()
+    try { $disk = (Get-FileHash -Algorithm MD5 $diskPath).Hash.ToLower() } catch { $disk = "" }
     $cont = (docker compose -f docker-compose.yml exec -T $Service md5sum "/app/$f" 2>$null)
-    $contHash = if ($cont) { ($cont -split "\s+")[0].Trim().ToLower() } else { "" }
+    if ($cont) { $contHash = ($cont -split "\s+")[0].Trim().ToLower() }
     if ($disk -ne $contHash) {
         $mismatch += "$f disk=$disk cont=$contHash"
     } else {
