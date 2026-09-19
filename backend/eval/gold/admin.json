@@ -1,0 +1,39 @@
+{
+  "account": "admin",
+  "revision": 1,
+  "note": "admin 口径 = content_scope（检索/内容消费）：tenant_ids={default}（所属租户）+ 自己的个人库；测试公司（1/2）在内容消费侧被剔除，A/B 公司不可见。default 租户 2 份 private 文档均归 admin 本人。",
+  "expected_scope": {
+    "request_tenant_ids": ["c8111de986583", "cfb08c53677c4", "default"],
+    "content_tenant_ids": ["default"],
+    "content_owns_tenant_ids": []
+  },
+  "cases": [
+    {"query": "研发部技术方案里，数据层承担哪些职责？", "expect": [{"filename": "研发部-2024年度技术方案-2e19.docx", "chunk_index": 1}], "note": "研发部｜3 数据层设计"},
+    {"query": "这份技术方案采用的检索策略是什么？", "expect": [{"filename": "研发部-2024年度技术方案-2e19.docx", "chunk_index": 2}], "note": "研发部｜5 检索策略"},
+    {"query": "反幻觉机制在检索阶段具体做了什么？", "expect": [{"filename": "研发部-2024年度技术方案-2e19.docx", "chunk_index": 3}], "note": "研发部｜7 反幻觉机制"},
+    {"query": "项目的预算与资源投入是怎么安排的？", "expect": [{"filename": "研发部-2024年度技术方案-2e19.docx", "chunk_index": 4}], "note": "研发部｜9 预算与资源"},
+    {"query": "各期交付物和完成时间分别是什么？", "expect": [{"filename": "研发部-2024年度技术方案-2e19.docx", "chunk_index": 5}], "note": "研发部｜11 里程碑对照表（低分哨兵块）"},
+    {"query": "这份技术方案的文号和编制单位是什么？", "expect": [{"filename": "研发部-2024年度技术方案-2e19.docx", "chunk_index": 0}], "note": "研发部｜文号 中科发〔2024〕7号"},
+    {"query": "python 里打开文件的 mode 有哪些，各自含义是什么？", "expect": [{"filename": "Python AI大模型成神手册 (1).docx", "chunk_index": 2}], "note": "Python｜文件操作"},
+    {"query": "pyecharts 怎么设置标题位置和图例？", "expect": [{"filename": "Python AI大模型成神手册 (1).docx", "chunk_index": 3}], "note": "Python｜pyecharts"},
+    {"query": "元组和字符串能不能被修改？", "expect": [{"filename": "Python AI大模型成神手册 (1).docx", "chunk_index": 1}], "note": "Python｜可变性"},
+    {"query": "怎么提高 python 读入数据的效率？", "expect": [{"filename": "Python AI大模型成神手册 (1).docx", "chunk_index": 0}], "note": "Python｜数据读入"}
+  ],
+  "probes": [
+    {
+      "query": "紫罗兰计划的年度预算是多少，由谁负责审批？",
+      "forbidden_docs": ["紫罗兰计划-bjld8.txt", "紫罗兰计划-1z5pp.txt"],
+      "why": "测试公司内容在 admin 的 content_scope（检索）中必须被剔除 —— 零命中"
+    },
+    {
+      "query": "A公司用印申请的审批流程是怎样的？",
+      "forbidden_docs": ["A公司-印章使用与档案归档操作手册-李四.docx"],
+      "why": "A公司 private 文档对 admin 不可见（跨公司 + 他人个人库）"
+    },
+    {
+      "query": "B公司2024年第四季度营业收入和毛利分别是多少？",
+      "forbidden_docs": ["B公司-2024年第四季度经营分析报告-王五.docx", "B公司-固定资产盘点与办公用品领用规范-某某.docx"],
+      "why": "B公司文档对 admin 不可见（跨公司）"
+    }
+  ]
+}

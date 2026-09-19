@@ -1,0 +1,40 @@
+{
+  "account": "wangwu",
+  "username": "wangwu@b-company.com",
+  "revision": 1,
+  "note": "wangwu = B公司 cf33b1db5679d 的 dept_manager，部门 dd6104e61cf30。可见集 = 自己私库（B公司经营分析报告）+ 本租户 department/tenant 级文档（B公司暂无）。同公司他人私库（固定资产规范，owner=某某）也不可见；跨公司与测试公司零命中。",
+  "expected_scope": {
+    "request_tenant_ids": ["cf33b1db5679d"],
+    "content_tenant_ids": ["cf33b1db5679d"],
+    "content_owns_tenant_ids": []
+  },
+  "cases": [
+    {"query": "第四季度公司的营业收入和毛利分别是多少？", "expect": [{"filename": "B公司-2024年第四季度经营分析报告-王五.docx", "chunk_index": 0}], "note": "B报告｜一、总体经营情况"},
+    {"query": "收入按业务板块是如何划分的？", "expect": [{"filename": "B公司-2024年第四季度经营分析报告-王五.docx", "chunk_index": 1}], "note": "B报告｜二、收入结构分析 + 表1"},
+    {"query": "第四季度的期间费用构成和金额是怎样的？", "expect": [{"filename": "B公司-2024年第四季度经营分析报告-王五.docx", "chunk_index": 2}], "note": "B报告｜三、成本与费用 + 表2"},
+    {"query": "应收账款周转天数和超期应收款的情况如何？", "expect": [{"filename": "B公司-2024年第四季度经营分析报告-王五.docx", "chunk_index": 3}], "note": "B报告｜四、存在的主要问题"},
+    {"query": "下季度针对原材料成本压力有哪些举措？", "expect": [{"filename": "B公司-2024年第四季度经营分析报告-王五.docx", "chunk_index": 3}], "note": "B报告｜五、下季度举措"}
+  ],
+  "probes": [
+    {
+      "query": "A公司各类印章由哪个部门保管？",
+      "forbidden_docs": ["A公司-印章使用与档案归档操作手册-李四.docx"],
+      "why": "跨公司：A公司内容对 B公司成员 wangwu 零命中"
+    },
+    {
+      "query": "紫罗兰计划的年度预算是多少，由谁负责审批？",
+      "forbidden_docs": ["紫罗兰计划-bjld8.txt", "紫罗兰计划-1z5pp.txt"],
+      "why": "测试公司内容对非本租户成员 wangwu 零命中"
+    },
+    {
+      "query": "固定资产入账标准是什么，资产标签损坏如何处理？",
+      "forbidden_docs": ["B公司-固定资产盘点与办公用品领用规范-某某.docx"],
+      "why": "同公司但他人 private（owner=某某）：个人库仅归属人可见，dept_manager 亦不可见"
+    },
+    {
+      "query": "研发部2024年度技术方案的数据层设计包含什么？",
+      "forbidden_docs": ["研发部-2024年度技术方案-2e19.docx", "Python AI大模型成神手册 (1).docx"],
+      "why": "admin 的 default 私库对 wangwu 零命中（跨公司 + 他人个人库）"
+    }
+  ]
+}

@@ -1,0 +1,35 @@
+{
+  "account": "lisi",
+  "username": "lisi@a-company.com",
+  "revision": 1,
+  "note": "lisi = A公司 c309a7cb9f496 的 employee，部门 dd6104e61cf30。可见集 = 自己私库（A公司印章手册）+ 本租户 department/tenant 级文档（A公司暂无）。跨公司与测试公司内容零命中。",
+  "expected_scope": {
+    "request_tenant_ids": ["c309a7cb9f496"],
+    "content_tenant_ids": ["c309a7cb9f496"],
+    "content_owns_tenant_ids": []
+  },
+  "cases": [
+    {"query": "印章使用与档案归档手册的适用范围包括哪些？", "expect": [{"filename": "A公司-印章使用与档案归档操作手册-李四.docx", "chunk_index": 0}], "note": "A手册｜一、适用范围"},
+    {"query": "各类公司印章由哪个部门保管、使用范围是什么？", "expect": [{"filename": "A公司-印章使用与档案归档操作手册-李四.docx", "chunk_index": 1}], "note": "A手册｜二、印章种类与保管 + 表1"},
+    {"query": "用印申请的审批流程是怎样的？", "expect": [{"filename": "A公司-印章使用与档案归档操作手册-李四.docx", "chunk_index": 2}], "note": "A手册｜三、用印申请流程（线上申请、分级审批）"},
+    {"query": "档案归档的时限要求和分类编号规则是怎样的？", "expect": [{"filename": "A公司-印章使用与档案归档操作手册-李四.docx", "chunk_index": 3}], "note": "A手册｜四、档案归档规范 + 表2"},
+    {"query": "扫描件能否替代纸质原件归档？", "expect": [{"filename": "A公司-印章使用与档案归档操作手册-李四.docx", "chunk_index": 4}], "note": "A手册｜五、常见问题"}
+  ],
+  "probes": [
+    {
+      "query": "B公司2024年第四季度营业收入和毛利分别是多少？",
+      "forbidden_docs": ["B公司-2024年第四季度经营分析报告-王五.docx", "B公司-固定资产盘点与办公用品领用规范-某某.docx"],
+      "why": "跨公司：B公司内容对 A公司成员 lisi 零命中"
+    },
+    {
+      "query": "紫罗兰计划的年度预算是多少，由谁负责审批？",
+      "forbidden_docs": ["紫罗兰计划-bjld8.txt", "紫罗兰计划-1z5pp.txt"],
+      "why": "测试公司内容对非本租户成员 lisi 零命中"
+    },
+    {
+      "query": "研发部2024年度技术方案的里程碑和交付物是什么？",
+      "forbidden_docs": ["研发部-2024年度技术方案-2e19.docx", "Python AI大模型成神手册 (1).docx"],
+      "why": "admin 的 default 私库对 lisi 零命中（他人个人库）"
+    }
+  ]
+}
