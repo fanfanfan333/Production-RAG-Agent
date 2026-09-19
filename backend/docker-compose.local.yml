@@ -1,0 +1,39 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# 本机构建覆盖配置（Windows + Docker Desktop，无稳定公网）
+#
+# 为什么需要它
+# ────────────
+# `docker-compose.yml` 的 backend 用 `build.dockerfile: Dockerfile`（通用/CI 配方），
+# 而通用配方在**本机装不上依赖**：requirements.txt 钉了 `torch==2.14.0+cpu` /
+# `torchvision==0.29.0+cpu`，`+cpu` 是 PEP 440 本地版本标识，标准 PyPI 上没有。
+# 本机可用的路径是 `Dockerfile.local`：预取离线 wheelhouse（`_wheels/`，约 813 MB /
+# 212 个 wheel，含 torch 的 +cpu 轮子）→ 构建期 `--no-index --find-links /wheels`
+# 纯离线安装 → apt 走 `https://mirrors.cloud.tencent.com`。
+#
+# 用法（本机一键复现）
+# ────────────────────
+#   cd backend
+#   docker compose -f docker-compose.yml -f docker-compose.local.yml up -d --build
+#
+#   或直接用（推荐，带"假烤"校验，构建失败即中止）：
+#   powershell -ExecutionPolicy Bypass -File build_local.ps1
+#
+# ⚠️ 假烤镜像的温床（务必知道）
+# ─────────────────────────
+# `docker compose up -d`（不带 --build）在 build 失败时**仍可能用同名旧镜像把容器
+# 拉起来** —— 现象是"明明报错说构建失败，服务却是 healthy 的"，跑的还是旧代码。
+# 因此：
+#   1) 构建与启动串成一条链（`build && up`，本文件的 --build 即为此），或直接用
+#      build_local.ps1（它构建失败会直接退出，不会去起旧镜像）；
+#   2) 构建后**必须**做容器内外 md5 比对（build_local.ps1 已内置），
+#      只有 md5 一致才算"真烤进去"。
+# 这正是 2026-09 多次踩到的坑：靠 md5 比对才揭穿。
+# ─────────────────────────────────────────────────────────────────────────────
+services:
+  backend:
+    build:
+      context: .
+      # ← 唯一改动：把构建配方切到离线 wheelhouse 版本（其余 compose 配置继承自
+      #   docker-compose.yml，不要在别处重复声明，以免两处漂移）。
+      dockerfile: Dockerfile.local
+      target: runtime

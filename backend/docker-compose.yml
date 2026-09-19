@@ -14,6 +14,16 @@ volumes:
   hf_cache:
   uploads_data:
 
+# ── 日志轮转（企业级默认值）─────────────────────────────────────────────────
+# 默认的 json-file 驱动**不轮转**：容器长跑后 docker 侧日志会无限增长吃满磁盘。
+# 本服务日志量不小（每请求一行 gateway 访问日志 + 解析/检索明细），因此统一限制
+# 单文件 10MB、最多保留 3 个 → 单容器日志上限约 30MB。
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Services
 # ─────────────────────────────────────────────────────────────────────────────
@@ -24,6 +34,13 @@ services:
     image: postgres:16-alpine
     container_name: rag_postgres
     restart: unless-stopped
+    logging: *default-logging
+    # 资源上限（cap，非预留）：防止单个服务耗尽宿主内存拖垮其余容器。
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+          cpus: "2"
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-raguser}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
@@ -43,6 +60,12 @@ services:
     image: qdrant/qdrant:v1.12.4
     container_name: rag_qdrant
     restart: unless-stopped
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+          cpus: "2"
     volumes:
       - qdrant_data:/qdrant/storage
     # 企业落地第一阶段: no host port mapping — Qdrant is only reachable inside
@@ -67,6 +90,12 @@ services:
     image: quay.io/keycloak/keycloak:26.0
     container_name: rag_keycloak
     restart: unless-stopped
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+          cpus: "2"
     command:
       - start-dev
       - --import-realm
@@ -103,6 +132,15 @@ services:
       target: runtime
     container_name: rag_backend
     restart: unless-stopped
+    logging: *default-logging
+    # 资源上限（cap，非预留）。torch/精排/解析都在本容器内，取偏宽的值；
+    # 宿主内存较小（<8G）时调到略低于可用内存即可，切勿设得比实际占用还低，
+    # 否则大文档入库会触发 OOM-kill。
+    deploy:
+      resources:
+        limits:
+          memory: 6g
+          cpus: "4"
     env_file:
       - .env
     environment:

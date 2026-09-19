@@ -1,4 +1,21 @@
 # ─────────────────────────────────────────────────────────────────────────────
+# ⚠️ 本机（Windows + Docker Desktop, 无公网/间歇公网）请**不要**直接用本文件：
+#    `requirements.txt` 钉了 `torch==2.14.0+cpu` / `torchvision==0.29.0+cpu`，
+#    `+cpu` 是 PEP 440 本地版本标识，**标准 PyPI 上没有**（下载会失败）。
+#    正确做法是用下面的「离线 wheelhouse」配方：
+#
+#        docker build -f Dockerfile.local -t backend-backend:latest .   # 需先备好 _wheels/
+#    或一键（构建失败即中止 + 构建后校验容器内代码与磁盘一致，防"假烤"）：
+#        powershell -ExecutionPolicy Bypass -File build_local.ps1
+#
+#    也可以用覆盖文件（等价于上面的 -f Dockerfile.local）：
+#        docker compose -f docker-compose.yml -f docker-compose.local.yml up -d --build
+#
+#    本文件保留为「有公网/CI + 内部 wheelhouse 镜像」的通用配方；它仍需一个
+#    能提供 `+cpu` wheel 的源或等价离线镜像，否则 pip 装不上 GPU-less torch。
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Stage 1 — builder: install dependencies into a virtual environment
 # ─────────────────────────────────────────────────────────────────────────────
 FROM python:3.12-slim AS builder
@@ -37,12 +54,16 @@ RUN echo 'precedence ::ffff:0:0/96  100' >> /etc/gai.conf
 
 # Install build tools required by some packages (e.g. asyncpg, pymupdf, paddleocr)
 # 逐个镜像试到 apt-get update 成功为止；全部失败则让 install 显式失败（不静默降级）。
+#
+# ⚠️ 必须**连同 scheme 一起替换**：只换域名（`deb.debian.org` → `<mirror>`）时
+# URI 仍是 `http://`，请求被发到 80 端口 —— 而国内镜像的 80 端口普遍返回 502，
+# 表现为"源看着换了却依然 apt 失败"。Dockerfile.local 早已写明这个坑，这里同步修。
 RUN set -eu; \
     for m in ${APT_MIRROR} mirrors.cloud.tencent.com mirrors.huaweicloud.com; do \
-      sed -i "s|deb.debian.org|${m}|g" /etc/apt/sources.list.d/debian.sources; \
+      sed -i "s|http://deb.debian.org|https://${m}|g" /etc/apt/sources.list.d/debian.sources; \
       if apt-get -o Acquire::Retries=3 update; then echo "APT_MIRROR_OK=${m}"; break; fi; \
       echo "APT_MIRROR_FAILED=${m}"; \
-      sed -i "s|${m}|deb.debian.org|g" /etc/apt/sources.list.d/debian.sources; \
+      sed -i "s|https://${m}|http://deb.debian.org|g" /etc/apt/sources.list.d/debian.sources; \
     done; \
     apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
     gcc \
@@ -54,6 +75,11 @@ RUN set -eu; \
 COPY requirements.txt .
 # 上游 PyPI 镜像同样会抖动（TUNA 直接连接被重置）：加 --retries 让 pip 自己重试，
 # 而不是一次抖动就废掉十几分钟的依赖安装层。
+#
+# ⚠️ 这一步需要能解析 `torch==2.14.0+cpu`（见文件顶部说明）。标准 PyPI 没有
+#    `+cpu` 轮子，因此本配方要么指向内部 wheelhouse 镜像，要么改用 Dockerfile.local
+#    的离线 `--find-links /wheels` 路径。若在这里看到
+#    "No matching distribution found for torch==2.14.0+cpu"，就是走错了配方。
 RUN pip install --upgrade pip \
  && pip install --no-cache-dir --retries 5 --timeout 60 --prefix=/install -r requirements.txt
 
@@ -82,10 +108,10 @@ ARG APT_MIRROR=mirrors.aliyun.com
 RUN echo 'precedence ::ffff:0:0/96  100' >> /etc/gai.conf \
  && set -eu; \
     for m in ${APT_MIRROR} mirrors.cloud.tencent.com mirrors.huaweicloud.com; do \
-      sed -i "s|deb.debian.org|${m}|g" /etc/apt/sources.list.d/debian.sources; \
+      sed -i "s|http://deb.debian.org|https://${m}|g" /etc/apt/sources.list.d/debian.sources; \
       if apt-get -o Acquire::Retries=3 update; then echo "APT_MIRROR_OK=${m}"; break; fi; \
       echo "APT_MIRROR_FAILED=${m}"; \
-      sed -i "s|${m}|deb.debian.org|g" /etc/apt/sources.list.d/debian.sources; \
+      sed -i "s|https://${m}|http://deb.debian.org|g" /etc/apt/sources.list.d/debian.sources; \
     done; \
     apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
     tesseract-ocr \
