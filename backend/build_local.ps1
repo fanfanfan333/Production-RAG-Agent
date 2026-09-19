@@ -42,6 +42,22 @@ if ($LASTEXITCODE -ne 0) {
     exit 3
 }
 
+# ── 等容器真正就绪再比对 ─────────────────────────────────────────────────────
+# `up -d` 在容器进程真正可用之前就可能返回；紧接着 exec 会撞上
+# "service ... is not running"（实测踩到），把一次成功的重建误判为失败。
+# 逐个 2s 轮询到 exec 成功或超时（最多 120s）。
+Write-Host "==> waiting for $Service to be ready"
+$ready = $false
+for ($i = 0; $i -lt 60; $i++) {
+    docker compose -f docker-compose.yml exec -T $Service true 2>$null | Out-Null
+    if ($LASTEXITCODE -eq 0) { $ready = $true; break }
+    Start-Sleep -Seconds 2
+}
+if (-not $ready) {
+    Write-Host "容器在 120s 内未就绪，无法校验 md5（假烤无法排除）" -ForegroundColor Red
+    exit 4
+}
+
 # ── 容器内外 md5 比对：只有一致才算真烤进去 ─────────────────────────────────
 $keyFiles = @(
     "app/main.py",
@@ -50,6 +66,7 @@ $keyFiles = @(
     "app/services/company_registry.py",
     "app/services/retrieval_service.py",
     "app/services/document_query_service.py",
+    "app/services/nodes/citation_verifier.py",
     "app/api/companies.py",
     "app/api/document_management.py",
     "app/api/query.py",

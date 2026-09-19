@@ -767,9 +767,18 @@ def verify_citations(
         def _drop(match: re.Match[str]) -> str:
             n = int(match.group(1))
             end = int(match.group(2)) if match.group(2) else n
-            if any(i in bad_indices for i in range(n, end + 1)):
+            indices = list(range(n, end + 1))
+            # n > M 的畸形区间（如 [Source 3-1]）解析不出任何下标：无从判断，
+            # 按"宁可漏判，不可错杀"原样保留（回退到改动前的行为），否则只要
+            # 别处存在坏下标，这条本身无坏下标的引用就会被顺带删掉。
+            if not indices:
+                return match.group(0)
+            keep = [i for i in indices if i not in bad_indices]
+            if not keep:
                 return ""
-            return match.group(0)
+            if len(keep) == len(indices):
+                return match.group(0)
+            return " ".join(f"[Source {i}]" for i in keep)
 
         clean_text = _CITATION_RE.sub(_drop, clean_text)
         clean_text = re.sub(r"[ \t]{2,}", " ", clean_text)

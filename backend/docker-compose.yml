@@ -158,6 +158,14 @@ services:
       QDRANT_HOST: qdrant
       KEYCLOAK_URL: ${KEYCLOAK_URL:-http://keycloak:8080}
       KEYCLOAK_PUBLIC_URL: ${KEYCLOAK_PUBLIC_URL:-http://localhost:8080}
+      # Ollama 跑在宿主机；容器内的 localhost 指向容器自身 → 必然拒连。
+      # compose 的 environment 优先级高于 env_file，所以这里能盖掉 .env 的 localhost。
+      # ⚠️ 必须写字面量，不能写 ${OLLAMA_BASE_URL:-...}：compose 插值会读项目目录的
+      #    .env（里面正是 localhost:11434），写插值等于没覆盖（静默失效）。
+      OLLAMA_BASE_URL: http://host.docker.internal:11434
+    # 让 Linux 宿主机也能解析 host.docker.internal（README §7.4 承诺的别名落地）。
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       # 挂载整个 /app/.cache，让 HuggingFace / PaddleOCR / Docling 的模型权重
       # 全部持久化，避免每次重建容器都重复下载（BGE 1.3GB + Table Transformer

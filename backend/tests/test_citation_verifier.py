@@ -217,6 +217,71 @@ def test_range_citation_out_of_bounds():
     print("[OK] test_range_citation_out_of_bounds")
 
 
+def test_range_citation_keeps_surviving_indices():
+    """
+    回归：区间引用只删“坏”的下标，保留存活的下标（不再整条抹掉）.
+
+    缺陷：旧 `_drop` 只要区间内命中任意一个坏下标就 `return ""`，把整条
+    `[Source 1-3]` 连合法的 1、3 一起删 —— 一句本来有出处的话变成裸句，
+    溯源断链。这与本模块自己写明的原则冲突：宁可漏判，不可错杀。
+
+    构造：句1 用 `[Source 1-3]`（区间被整体判为支持，故 1 不是坏下标）；
+    句2 单引 `[Source 2]` 且判为不支持 → bad_indices={2}。此时区间
+    `[Source 1-3]` 必须只剩 1 与 3，单引的 2 被删除。
+    """
+    sources = _sources(
+        "甲方应在合同生效后三十日内支付首付款。",
+        "乙方应在验收合格后提供原始凭证。",
+        "合同争议提交北京仲裁委员会仲裁。",
+    )
+    answer = (
+        "甲方应在合同生效后三十日内支付首付款，乙方应在验收合格后提供原始凭证，"
+        "合同争议提交北京仲裁委员会仲裁 [Source 1-3]。"
+        "该产品的市场占有率达到了百分之八十，处于绝对领先地位 [Source 2]。"
+    )
+    report = verify_citations(answer, sources, annotate=False)
+    # 下标 2 判为不支持（其独立引用被删）
+    assert 2 in report.unsupported_indices, report.as_audit()
+    # 区间引用里合法的 1、3 必须保留，坏掉的 2 必须删掉
+    assert "[Source 1]" in report.clean_text, report.clean_text
+    assert "[Source 3]" in report.clean_text, report.clean_text
+    assert "Source 2" not in report.clean_text, report.clean_text
+    print("[OK] test_range_citation_keeps_surviving_indices")
+
+
+def test_degenerate_range_citation_is_preserved():
+    """
+    回归：退化区间 `[Source N-M]`（N > M）解析不出任何下标，必须原样保留.
+
+    缺陷：`list(range(n, end + 1))` 在 n > M 时为空序列 → `keep == []` →
+    命中 `if not keep: return ""` 把整条抹掉。于是文本里只要别处存在任意坏
+    下标（bad_indices 非空、外层净化才会进），一条**本身不含任何坏下标**的
+    畸形引用 `[Source 3-1]` 就会被顺带删除 —— 这是错杀，违反本模块
+    "宁可漏判，不可错杀" 的立身之本。修复：下标集合为空时不动它。
+    """
+    sources = _sources(
+        "合同争议提交北京仲裁委员会仲裁。",
+        "乙方应在验收合格后提供原始凭证。",
+        "甲方应在合同生效后三十日内支付首付款。",
+    )
+    # 句2 引 [Source 2] 判不支持 → bad_indices={2} 非空；句1 的 [Source 3-1]
+    # 是退化区间（3 > 1），本身不含任何坏下标。
+    answer = (
+        "合同争议提交北京仲裁委员会仲裁 [Source 3-1]。"
+        "该产品市占率达百分之八十 [Source 2]。"
+    )
+    report = verify_citations(answer, sources, annotate=False)
+    assert 2 in report.unsupported_indices, report.as_audit()
+    assert "[Source 3-1]" in report.clean_text, report.clean_text   # 原样保留
+    assert "Source 2" not in report.clean_text, report.clean_text    # 坏的删掉
+
+    # 子断言：bad_indices 为空时不进入净化 → 正文一个字符都不变（新旧都必须成立）
+    only_degen = "合同争议提交北京仲裁委员会仲裁 [Source 3-1]。"
+    r0 = verify_citations(only_degen, sources, annotate=False)
+    assert r0.clean_text == only_degen, r0.clean_text
+    print("[OK] test_degenerate_range_citation_is_preserved")
+
+
 def test_strip_unsupported_can_be_disabled():
     sources = _sources("公司的注册地址为北京市海淀区。")
     answer = "市场占有率百分之八十 [Source 1]。"
@@ -577,6 +642,8 @@ if __name__ == "__main__":
         test_no_citations,
         test_empty_answer,
         test_range_citation_out_of_bounds,
+        test_range_citation_keeps_surviving_indices,
+        test_degenerate_range_citation_is_preserved,
         test_strip_unsupported_can_be_disabled,
         test_audit_payload_json_serializable,
         test_split_sentences_with_spans_matches_plain_split,
