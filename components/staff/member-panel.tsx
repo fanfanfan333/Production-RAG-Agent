@@ -15,7 +15,7 @@ import {
   Users,
 } from "lucide-react";
 import { toast } from "sonner";
-import { createCompany, renameCompany } from "@/lib/api/companies";
+import { createCompany, deleteCompany, previewCompanyDeletion, renameCompany } from "@/lib/api/companies";
 import {
   deleteStaffMember,
   getStaffCompanies,
@@ -25,6 +25,7 @@ import {
 } from "@/lib/api/staff";
 import { useAuth } from "@/lib/context/auth-context";
 import type {
+  CompanyDeletionImpact,
   CompanyOption,
   MemberDeletionImpact,
   StaffMember,
@@ -81,9 +82,10 @@ export function MemberPanel() {
   const [error, setError] = useState<string | null>(null);
   const [editing, setEditing] = useState<StaffMember | null>(null);
   const [deleting, setDeleting] = useState<StaffMember | null>(null);
-  // 公司注册表操作（仅平台管理员）：创建公司 / 改名
+  // 公司注册表操作（仅平台管理员）：创建公司 / 改名 / 删除
   const [creatingCompany, setCreatingCompany] = useState(false);
   const [renamingCompany, setRenamingCompany] = useState<CompanyOption | null>(null);
+  const [deletingCompany, setDeletingCompany] = useState<CompanyOption | null>(null);
 
   const load = useCallback(async () => {
     setError(null);
@@ -115,6 +117,12 @@ export function MemberPanel() {
         : members.filter((m) => m.identityStatus === filter),
     [members, filter]
   );
+
+  /** 公司管理清单的计数汇总（纯计数，不引入额外请求）。 */
+  const companyStats = useMemo(() => {
+    const test = companies.filter((c) => c.isTest).length;
+    return { total: companies.length, test, normal: companies.length - test };
+  }, [companies]);
 
   /** 我可授予的角色（严格低于自己等级的）——与后端 can_grant_role 同规则。 */
   const myRank = roleRank(user?.role);
@@ -157,10 +165,19 @@ export function MemberPanel() {
           <div className="rounded-lg border border-border/60 bg-muted/20 px-3.5 py-3">
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div>
-                <p className="text-[13px] font-medium">公司管理</p>
+                <div className="flex flex-wrap items-center gap-2">
+                  <p className="text-[13px] font-medium">公司管理</p>
+                  <span className="text-[11px] text-muted-foreground">
+                    共 {companyStats.total} 家 · 测试 {companyStats.test} · 普通{" "}
+                    {companyStats.normal}
+                  </span>
+                </div>
                 <p className="mt-0.5 text-[11px] text-muted-foreground">
-                  先创建公司，新用户提交身份验证时才能选到它；改名只改展示名，
-                  <strong className="font-medium">成员与文档不受影响</strong>
+                  列出全部已注册公司；先创建公司，新用户提交身份验证时才能选到它；
+                  改名只改展示名，
+                  <strong className="font-medium">成员与文档不受影响</strong>；
+                  删除公司将移除其全部成员与文档，
+                  <strong className="font-medium">不可恢复</strong>
                 </p>
               </div>
               <Button
@@ -176,7 +193,7 @@ export function MemberPanel() {
 
             {companies.length === 0 ? (
               <p className="mt-2.5 text-[12px] text-muted-foreground">
-                暂无公司，请先创建公司
+                暂无已注册公司，请先创建公司
               </p>
             ) : (
               <ul className="mt-2 divide-y divide-border/60">
@@ -185,22 +202,42 @@ export function MemberPanel() {
                     key={c.companyId}
                     className="flex items-center justify-between gap-3 py-1.5"
                   >
-                    <span className="min-w-0 text-[13px]">
+                    <span className="flex min-w-0 items-center gap-2 text-[13px]">
                       <span className="truncate font-medium">{c.companyName}</span>
-                      <span className="ml-2 text-[11px] text-muted-foreground">
+                      <Badge variant={c.isTest ? "warning" : "secondary"}>
+                        {c.isTest ? "测试公司" : "普通公司"}
+                      </Badge>
+                      <span className="text-[11px] text-muted-foreground">
                         成员 {c.memberCount}
                       </span>
                     </span>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      className="gap-1.5 text-muted-foreground hover:text-foreground"
-                      title="仅修改展示名，成员与文档不受影响"
-                      onClick={() => setRenamingCompany(c)}
-                    >
-                      <Pencil className="size-3.5" />
-                      改名
-                    </Button>
+                    <div className="flex shrink-0 items-center gap-0.5">
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="gap-1.5 text-muted-foreground hover:text-foreground"
+                        disabled={!c.canRename}
+                        title={
+                          c.canRename
+                            ? "仅修改展示名，成员与文档不受影响"
+                            : "其他管理员创建的公司不可改名"
+                        }
+                        onClick={() => setRenamingCompany(c)}
+                      >
+                        <Pencil className="size-3.5" />
+                        改名
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="gap-1.5 text-muted-foreground hover:text-destructive"
+                        title="删除该公司及其全部成员与文档（不可恢复）"
+                        onClick={() => setDeletingCompany(c)}
+                      >
+                        <Trash2 className="size-3.5" />
+                        删除
+                      </Button>
+                    </div>
                   </li>
                 ))}
               </ul>
@@ -394,6 +431,15 @@ export function MemberPanel() {
           await load();
         }}
       />
+
+      <DeleteCompanyDialog
+        company={deletingCompany}
+        onClose={() => setDeletingCompany(null)}
+        onDone={async () => {
+          setDeletingCompany(null);
+          await load();
+        }}
+      />
     </Card>
   );
 }
@@ -550,6 +596,216 @@ function ImpactRow({
         {count} {unit}
       </span>
     </li>
+  );
+}
+
+/**
+ * 删除公司确认弹窗（平台管理员，不可恢复）.
+ *
+ * 打开时先向后端要一份**影响预检**：删掉这家公司会失去什么、会留下什么，
+ * 数字全部来自数据库。除了红色警示条，还要求**输入公司名**才能确认 ——
+ * 这是一次"删掉整家公司（含全部员工账号与三级文档）"的破坏性操作，
+ * 必须防误点。预检未完成 / 失败时确认按钮保持禁用。
+ */
+function DeleteCompanyDialog({
+  company,
+  onClose,
+  onDone,
+}: {
+  company: CompanyOption | null;
+  onClose: () => void;
+  onDone: () => Promise<void> | void;
+}) {
+  const [impact, setImpact] = useState<CompanyDeletionImpact | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+  const [confirmName, setConfirmName] = useState("");
+
+  const companyId = company?.companyId ?? null;
+
+  useEffect(() => {
+    if (!companyId) return;
+    let cancelled = false;
+    setImpact(null);
+    setError(null);
+    setConfirmName("");
+    setLoading(true);
+    (async () => {
+      try {
+        const data = await previewCompanyDeletion(companyId);
+        if (!cancelled) setImpact(data);
+      } catch (err) {
+        if (!cancelled)
+          setError(err instanceof Error ? err.message : "无法获取删除影响，请稍后重试");
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [companyId]);
+
+  if (!company) return null;
+
+  const matched = confirmName.trim() === company.companyName.trim();
+
+  const submit = async () => {
+    if (!matched) return;
+    setError(null);
+    setSubmitting(true);
+    try {
+      const { message } = await deleteCompany(company.companyId);
+      toast.success(message);
+      await onDone();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "删除失败");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <Dialog open onOpenChange={(open) => !open && !submitting && onClose()}>
+      <DialogContent className="max-w-md">
+        <DialogHeader>
+          <DialogTitle className="flex items-center gap-2">
+            <Trash2 className="size-4 text-destructive" />
+            删除公司「{company.companyName}」？
+          </DialogTitle>
+          <DialogDescription>
+            {company.isTest ? "测试公司" : "普通公司"} · 标识 {company.companyId}
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className="space-y-4">
+          <p className="flex items-start gap-2 rounded-lg border border-destructive/25 bg-destructive/5 px-3 py-2 text-[12px] leading-relaxed text-destructive">
+            <ShieldAlert className="mt-0.5 size-3.5 shrink-0" />
+            <span>
+              此操作<strong>不可恢复</strong>：该公司下的
+              <strong>全部员工账号会被一并删除</strong>（连同其个人数据），员工需重新注册；
+              公司下的全部文档（个人 / 部门 / 公司三级）、对话与向量索引都会消失。
+            </span>
+          </p>
+
+          {loading ? (
+            <p className="flex items-center gap-2 py-2 text-[12px] text-muted-foreground">
+              <Loader2 className="size-3.5 animate-spin" />
+              正在统计该公司的数据…
+            </p>
+          ) : impact ? (
+            <div className="space-y-3 text-[12px]">
+              <div className="rounded-lg border border-border/60 bg-muted/30 px-3 py-2.5">
+                <p className="mb-1.5 font-medium text-foreground/90">将被删除</p>
+                <ul className="space-y-1">
+                  <ImpactRow
+                    icon={<Users className="size-3.5" />}
+                    label="员工账号（需重新注册）"
+                    count={impact.deleted.members}
+                    unit="人"
+                    tone="danger"
+                  />
+                  <ImpactRow
+                    icon={<FileText className="size-3.5" />}
+                    label={`文档（个人 ${impact.deleted.documentsPrivate} · 部门 ${impact.deleted.documentsDepartment} · 公司 ${impact.deleted.documentsTenant}）`}
+                    count={impact.deleted.documents}
+                    unit="份"
+                    tone="danger"
+                  />
+                  <ImpactRow
+                    icon={<MessagesSquare className="size-3.5" />}
+                    label="历史对话"
+                    count={impact.deleted.conversations}
+                    unit="个"
+                    tone="danger"
+                  />
+                  <ImpactRow
+                    icon={<FileText className="size-3.5" />}
+                    label="向量索引（按入库分块预计）"
+                    count={impact.deleted.vectors}
+                    unit="条"
+                    tone="danger"
+                  />
+                </ul>
+              </div>
+
+              <div className="rounded-lg border border-emerald-500/25 bg-emerald-500/5 px-3 py-2.5">
+                <p className="mb-1.5 font-medium text-foreground/90">将被保留</p>
+                <ul className="space-y-1">
+                  <ImpactRow
+                    icon={<ShieldAlert className="size-3.5" />}
+                    label="审计日志与审核留痕（身份验证 / 共享申请 / 疑难案例）"
+                    count={
+                      impact.kept.staffRequests +
+                      impact.kept.shareRequests +
+                      impact.kept.badCases
+                    }
+                    unit="条"
+                    tone="keep"
+                  />
+                  <ImpactRow
+                    icon={<FileText className="size-3.5" />}
+                    label="其它公司知识库文档（仅解除归属，同事仍可检索）"
+                    count={impact.kept.crossTenantDocuments}
+                    unit="份"
+                    tone="keep"
+                  />
+                </ul>
+              </div>
+            </div>
+          ) : null}
+
+          <div className="space-y-1.5">
+            <label
+              htmlFor="confirm-company-name"
+              className="text-[12px] font-medium text-muted-foreground"
+            >
+              请输入公司名称「{company.companyName}」以确认
+            </label>
+            <Input
+              id="confirm-company-name"
+              value={confirmName}
+              onChange={(e) => setConfirmName(e.target.value)}
+              placeholder={company.companyName}
+              disabled={submitting}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && matched) submit();
+              }}
+            />
+          </div>
+
+          {error && (
+            <p className="flex items-start gap-2 rounded-lg border border-destructive/20 bg-destructive/5 px-3 py-2 text-[12px] text-destructive">
+              <AlertCircle className="mt-0.5 size-3.5 shrink-0" />
+              {error}
+            </p>
+          )}
+
+          <div className="flex gap-2">
+            <Button
+              variant="outline"
+              className="flex-1"
+              onClick={onClose}
+              disabled={submitting}
+            >
+              取消
+            </Button>
+            <Button
+              variant="destructive"
+              className="flex-1 gap-2"
+              onClick={submit}
+              // 预检失败/未完成、或未输对公司名时不允许提交：宁可让用户重试，
+              // 也不要在不知道影响范围 / 没防误点的情况下点下去
+              disabled={submitting || loading || (!impact && !error) || !matched}
+            >
+              {submitting && <Loader2 className="size-4 animate-spin" />}
+              确认删除
+            </Button>
+          </div>
+        </div>
+      </DialogContent>
+    </Dialog>
   );
 }
 

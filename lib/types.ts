@@ -666,6 +666,10 @@ export interface CompanyOption {
   companyId: string;
   companyName: string;
   memberCount: number;
+  /** 是否为测试公司（注册表 ``is_test``），用于列表区分「测试公司 / 普通公司」。 */
+  isTest: boolean;
+  /** 当前用户能否给该公司改名（平台管理员：自建或无主公司为 true）。 */
+  canRename: boolean;
 }
 
 /**
@@ -699,6 +703,43 @@ export interface MemberDeletionImpact {
     staffRequests: number;
     shareRequests: number;
     badCases: number;
+  };
+}
+
+/**
+ * 删除公司前的数据影响预检（后端 /companies/{id}/deletion-preview）。
+ *
+ * 与 :interface:`MemberDeletionImpact` 同一套「将删除 / 将保留」视觉语言，但范围
+ * 是**整家公司**：员工账号、三级文档（个人 / 部门 / 公司）、会话与向量全删，
+ * 只留审计与审核留痕。数字全部来自数据库，与真正执行的删除同一份口径。
+ */
+export interface CompanyDeletionImpact {
+  company: {
+    id: string;
+    name: string;
+    isTest: boolean;
+  };
+  /** 会被永久删除的数据。 */
+  deleted: {
+    members: number;
+    documents: number;
+    /** 三级文档分布：个人 / 部门 / 公司。 */
+    documentsPrivate: number;
+    documentsDepartment: number;
+    documentsTenant: number;
+    conversations: number;
+    messages: number;
+    collections: number;
+    feedback: number;
+    vectors: number;
+  };
+  /** 会被保留的组织留痕。 */
+  kept: {
+    staffRequests: number;
+    shareRequests: number;
+    badCases: number;
+    /** 本公司成员名下、归属**其它公司**的文档：只解绑归属、不删除。 */
+    crossTenantDocuments: number;
   };
 }
 

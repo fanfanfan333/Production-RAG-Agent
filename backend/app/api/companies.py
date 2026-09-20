@@ -8,6 +8,8 @@
                                      （文档页公司筛选；候选与列表/检索**同源**）
   3. ``POST /companies``           平台管理员      创建公司（唯一名，重名 409）
   4. ``PATCH /companies/{id}``     平台管理员（须自建）改名（``tenant_id`` 不变）
+  5. ``GET /companies/{id}/deletion-preview`` 平台管理员  删除前的影响预检
+  6. ``DELETE /companies/{id}``    平台管理员      删除整家公司（不可恢复）
 
 ``GET /companies/accessible`` 的 ``doc_count`` 必须与 ``GET /documents?company_id=...``
 的条数逐条一致 —— 两者共用 ``document_query_service.count_by_tenant`` /
@@ -37,12 +39,28 @@ from app.services.company_registry import (
 )
 from app.services.document_query_service import count_by_tenant
 from app.services.permissions import require_permission
-from app.services.tenancy import request_scope
+from app.services.staff_service import (
+    StaffError,
+    delete_company,
+    preview_company_deletion,
+)
+from app.services.tenancy import (
+    DEFAULT_TENANT_ID,
+    is_platform_admin,
+    request_scope,
+)
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
 router = APIRouter(tags=["Companies"])
+
+# ``default`` 租户在**平台管理员**视角下的展示别名。companies 表里没有 ``default``
+# 行（它是"无公司"的历史兜底租户，见 ``tenancy.DEFAULT_TENANT_ID``），显示名原本
+# 会回退成裸 tenant_id，管理员就在下拉里看到一个无法解释的内部标识。改成中文
+# 别名只是**显示层**换名：tenant_id 仍是 ``default``，文档归属与检索 scope 一律
+# 不动（零数据迁移）。
+ADMIN_TENANT_DISPLAY_NAME = "管理员"
 
 
 def _http_from_company_error(exc: CompanyError) -> HTTPException:
@@ -83,7 +101,9 @@ async def list_companies_endpoint(
         "- 平台管理员：其**所属租户 ∪ 自建测试公司集合**（二者皆无文档时返回空列表）；\n"
         "- 普通成员：其所属公司。\n\n"
         "``doc_count`` 与文档列表过滤结果同源（同一 ``document_scope_clause``），"
-        "保证「筛选项里的计数 == 选中该公司的列表结果数」。"
+        "保证「筛选项里的计数 == 选中该公司的列表结果数」。\n\n"
+        "``default``（历史兜底租户）**只有平台管理员看得到**：管理员的那个选项显示"
+        "为「管理员」，其余账号的清单里该项被剔除。"
     ),
 )
 async def list_accessible_companies_endpoint(
@@ -94,6 +114,17 @@ async def list_accessible_companies_endpoint(
     tenant_ids = scope.tenant_ids or frozenset()  # None(诊断) 在此端点按空处理
     if not tenant_ids:
         return []
+
+    platform_admin = is_platform_admin(user)
+    if not platform_admin:
+        # ``default`` 是"尚未归属公司"的内部兜底租户，在上传/筛选的下拉里毫无语义
+        # —— 只有平台管理员（其 ``effective_tenant_id`` 就是它）需要用它代表自己
+        # 的归属。老账号（未设公司）也会落到该租户，若不在源头剔除，普通成员就会
+        # 在候选里看到一个既不对应任何注册公司、又说不清是什么的 "default" 项。
+        # 剔除只影响**候选清单**：文档可见范围（``request_scope``）原样保留。
+        tenant_ids = tenant_ids - {DEFAULT_TENANT_ID}
+        if not tenant_ids:
+            return []
 
     names = await company_display_names(tenant_ids)
     counts = await count_by_tenant(
@@ -106,11 +137,22 @@ async def list_accessible_companies_endpoint(
     return [
         AccessibleCompanyItem(
             company_id=t,
-            display_name=names.get(t, t),
+            display_name=_display_name_for(t, names, platform_admin),
             doc_count=counts.get(t, 0),
         )
         for t in sorted(tenant_ids)
     ]
+
+
+def _display_name_for(
+    tenant_id: str,
+    names: dict[str, str],
+    platform_admin: bool,
+) -> str:
+    """候选项的展示名：注册表里有行就用注册名，否则回落 ``tenant_id``."""
+    if platform_admin and tenant_id == DEFAULT_TENANT_ID:
+        return ADMIN_TENANT_DISPLAY_NAME
+    return names.get(tenant_id, tenant_id)
 
 
 # ── POST /companies ───────────────────────────────────────────────────────────
@@ -149,12 +191,13 @@ async def create_company_endpoint(
 
 @router.patch(
     "/companies/{company_id}",
-    summary="公司改名（平台管理员，须自建）",
+    summary="公司改名（平台管理员，须自建或无主）",
     description=(
-        "修改公司展示名。**只有创建该公司的平台管理员**可改名（非自建 → 403）；"
-        "重名（含大小写/空格变体）→ 409。\n\n"
+        "修改公司展示名。平台管理员可改**自己创建的**或**无主（创建者为空）的历史"
+        "公司**；他人创建的公司 → 403。重名（含大小写/空格变体）→ 409。\n\n"
         "``tenant_id`` 与全部文档/向量归属**不动**：改名只改 ``companies.display_name``"
-        " / ``name_key``，并同步本租户成员的 ``users.company_name``（展示副本）。"
+        " / ``name_key``，并同步本租户成员的 ``users.company_name``（展示副本）；"
+        "**不回填 ``created_by``**（无主公司改名后仍保持无主，不进入文档可见范围）。"
     ),
 )
 async def rename_company_endpoint(
@@ -173,6 +216,60 @@ async def rename_company_endpoint(
         "updated_at": company.updated_at.isoformat() if company.updated_at else None,
         "message": "已改名",
     }
+
+
+# ── GET /companies/{company_id}/deletion-preview ──────────────────────────────
+
+@router.get(
+    "/companies/{company_id}/deletion-preview",
+    summary="删除公司前的影响预检（将删除什么 / 将保留什么）",
+    description=(
+        "平台管理员专用。返回删除该公司**会失去什么 / 会留下什么**的逐项计数，"
+        "供确认弹窗展示 —— 数字全部来自数据库，与真正执行的删除**同一份口径**。\n\n"
+        "将删除：员工账号（连带个人数据）、该公司 ``tenant_id`` 下的**三级文档**"
+        "（个人 / 部门 / 公司，含分块与向量索引）、全部会话与消息、公司注册行。\n\n"
+        "将保留：审计日志与审核留痕（身份验证申请 / 共享申请 / 疑难案例）。\n\n"
+        "只有平台管理员（``is_admin``）可调用；``default`` 兜底租户不在注册表里，"
+        "预检直接 404，因此管理员删不掉自己的落脚点。"
+    ),
+)
+async def company_deletion_preview_endpoint(
+    company_id: Annotated[str, Path(description="公司标识（tenant_id）")],
+    actor: Annotated[User, Depends(require_admin)],
+) -> dict:
+    try:
+        return await preview_company_deletion(actor, company_id)
+    except StaffError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+
+# ── DELETE /companies/{company_id} ────────────────────────────────────────────
+
+@router.delete(
+    "/companies/{company_id}",
+    summary="删除整家公司（平台管理员，不可恢复）",
+    description=(
+        "平台管理员删除一家公司，**不可恢复**：\n\n"
+        "- 该公司下**全部员工账号**一并注销（连同其个人数据），员工需重新注册；\n"
+        "- 该公司 ``tenant_id`` 下的**全部文档**（个人 / 部门 / 公司三级）连同分块、"
+        "倒排索引、Qdrant 向量与磁盘原文件（``uploads/{tenant_id}/``）一起删除；\n"
+        "- 全部会话与消息删除；公司注册行删除。\n\n"
+        "**保留**：审计日志与审核留痕（身份验证申请 / 共享申请 / 疑难案例），用于"
+        "企业合规回溯。\n\n"
+        "只有平台管理员（``is_admin``）可调用；公司必须已注册（否则 404）—— "
+        "``default``（历史兜底租户）不在注册表里，因此**不可删除**。\n\n"
+        "失败语义：先清向量索引，Qdrant 不可用时整体中止、数据库**一行不动**，"
+        "可稍后原样重试。"
+    ),
+)
+async def delete_company_endpoint(
+    company_id: Annotated[str, Path(description="公司标识（tenant_id）")],
+    actor: Annotated[User, Depends(require_admin)],
+) -> dict:
+    try:
+        return await delete_company(actor, company_id)
+    except StaffError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
 
 
 async def _audit_company(action: str, actor: User, tenant_id: str, detail: str) -> None:

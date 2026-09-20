@@ -1,4 +1,5 @@
 import { apiFetch } from "@/lib/api/client";
+import type { CompanyDeletionImpact } from "@/lib/types";
 
 /**
  * 公司注册表 API.
@@ -84,4 +85,68 @@ export async function fetchAccessibleCompanies(): Promise<AccessibleCompany[]> {
     companyName: String(raw.display_name ?? raw.company_name ?? raw.company_id ?? ""),
     docCount: Number(raw.doc_count ?? 0),
   }));
+}
+
+// ── 删除公司（平台管理员，不可恢复）──────────────────────────────────────────
+
+/** 后端 snake_case → 前端 camelCase（归一化只有一份，组件里不出现 snake_case）。 */
+function normalizeCompanyImpact(raw: Record<string, unknown>): CompanyDeletionImpact {
+  const company = (raw.company ?? {}) as Record<string, unknown>;
+  const deleted = (raw.deleted ?? {}) as Record<string, unknown>;
+  const kept = (raw.kept ?? {}) as Record<string, unknown>;
+  return {
+    company: {
+      id: String(company.id ?? ""),
+      name: String(company.name ?? ""),
+      isTest: Boolean(company.is_test ?? false),
+    },
+    deleted: {
+      members: Number(deleted.members ?? 0),
+      documents: Number(deleted.documents ?? 0),
+      documentsPrivate: Number(deleted.documents_private ?? 0),
+      documentsDepartment: Number(deleted.documents_department ?? 0),
+      documentsTenant: Number(deleted.documents_tenant ?? 0),
+      conversations: Number(deleted.conversations ?? 0),
+      messages: Number(deleted.messages ?? 0),
+      collections: Number(deleted.collections ?? 0),
+      feedback: Number(deleted.feedback ?? 0),
+      vectors: Number(deleted.vectors ?? 0),
+    },
+    kept: {
+      staffRequests: Number(kept.staff_requests ?? 0),
+      shareRequests: Number(kept.share_requests ?? 0),
+      badCases: Number(kept.bad_cases ?? 0),
+      crossTenantDocuments: Number(kept.cross_tenant_documents ?? 0),
+    },
+  };
+}
+
+/**
+ * 删除公司前的影响预检。权限与可删范围由后端判定（只有平台管理员可用）——
+ * 前端据此决定按钮是否可点，但真正的守门永远在后端（预检本身也会 403 / 404）。
+ */
+export async function previewCompanyDeletion(
+  companyId: string
+): Promise<CompanyDeletionImpact> {
+  const raw = await apiFetch<Record<string, unknown>>(
+    `/companies/${encodeURIComponent(companyId)}/deletion-preview`
+  );
+  return normalizeCompanyImpact(raw);
+}
+
+/**
+ * 删除整家公司（不可恢复）：员工账号、三级文档、会话与向量全删，只留审计留痕。
+ * 删除可能耗时（清向量 + 磁盘），故放宽超时，参照 ``deleteStaffMember``。
+ */
+export async function deleteCompany(
+  companyId: string
+): Promise<{ message: string; impact: CompanyDeletionImpact }> {
+  const raw = await apiFetch<Record<string, unknown>>(
+    `/companies/${encodeURIComponent(companyId)}`,
+    { method: "DELETE", timeout: 120000 }
+  );
+  return {
+    message: String(raw.message ?? "公司已删除"),
+    impact: normalizeCompanyImpact(raw),
+  };
 }
