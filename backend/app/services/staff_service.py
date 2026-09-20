@@ -43,6 +43,7 @@ from datetime import datetime, timezone
 from sqlalchemy import delete, func, or_, select, update
 
 from app.db.badcase_models import BadCase
+from app.db.company_models import Company
 from app.db.conversation_models import Conversation, Message
 from app.db.feedback_models import AnswerFeedback
 from app.db.models import Document
@@ -831,22 +832,33 @@ async def list_companies(actor: User) -> list[dict]:
     """
     公司清单（管理后台的左侧过滤 + 成员面板公司下拉）
 
-    平台管理员：只看到**自己创建**的公司（``created_by == actor.id``，注册表为准）
-    —— 跨公司信息（哪怕只是"存在这家公司"）也不应泄漏；其自建公司 ``is_test=True``。
-    其他管理员：只看到自己所属公司。
+    清单口径（本次升级后的**唯一**口径）：
+        * 平台管理员：**全部已注册公司**（注册表为准，含历史无主公司如 A公司 /
+          B公司）——管理面板需要看得到"平台上有哪些公司、各有多少成员"。
+        * 其他管理员：**只看到自己所属公司**（``effective_tenant_id(actor)``）。
+
+    ``can_rename`` 判定（**仅表示"能否在管理面板改名"**，与文档可见范围无关）：
+        * 平台管理员 且（``company.created_by is None`` 无主公司 或
+          ``created_by == actor.id`` 自建公司）→ ``True``；
+        * 其他情况（非 admin 的 kb_admin、其他管理员自建的测试公司）→ ``False``；
+        * 注册表里查不到的兜底租户 → ``False``。
+
+    ⚠️ **本函数只影响「公司清单展示」，不改文档可见范围**：文档隔离（P0-6，
+    「admin 只看得到自己创建的测试公司的文档」）由 ``tenancy`` 负责，
+    这里从不读写 ``created_by``、也不碰 ``owns_tenant_ids``。
 
     平台管理员本人**不计入任何公司**：它是「全平台」身份，不属于某家公司。
     """
     if not is_administer(actor):
         raise StaffError("你没有管理成员身份的权限", status_code=403)
 
-    from app.services.company_registry import (
-        list_registered_companies,
-        tenant_ids_created_by,
-    )
+    from app.services.company_registry import list_registered_companies
+
+    registered = await list_registered_companies()
 
     if actor.is_admin:
-        allowed_ids = await tenant_ids_created_by(actor.id)
+        # 平台管理员：清单口径 = **全部已注册公司**（不再是「自己创建的公司」）。
+        allowed_ids = frozenset(c.tenant_id for c in registered)
     else:
         allowed_ids = frozenset({effective_tenant_id(actor)})
 
@@ -873,7 +885,7 @@ async def list_companies(actor: User) -> list[dict]:
             normalize_tenant_id(tid): cname for tid, cname in fallback_rows.all()
         }
 
-    registry = {c.tenant_id: c for c in await list_registered_companies()}
+    registry = {c.tenant_id: c for c in registered}
 
     items: list[dict] = []
     for tid in sorted(allowed_ids):
@@ -881,15 +893,26 @@ async def list_companies(actor: User) -> list[dict]:
         if company is not None:
             company_name = company.display_name
             is_test = bool(company.is_test)
+            # 仅平台管理员可给「自建公司」或「无主历史公司」改名（其余一律 False）。
+            can_rename = bool(
+                actor.is_admin
+                and (
+                    company.created_by is None
+                    or company.created_by == actor.id
+                )
+            )
         else:
+            # 未登记到注册表的历史租户：退回 users.company_name 作展示名，不可改名。
             company_name = fallback_names.get(tid) or normalize_tenant_id(tid)
             is_test = False
+            can_rename = False
         items.append(
             {
                 "company_id": tid,
                 "company_name": company_name,
                 "is_test": is_test,
                 "member_count": counts.get(tid, 0),
+                "can_rename": can_rename,
             }
         )
     return sorted(
@@ -1323,6 +1346,426 @@ async def delete_member(actor: User, target_id: uuid.UUID) -> dict:
         payload["deleted"]["personal_documents"],
         payload["deleted"]["conversations"],
         payload["kept"]["shared_documents"],
+    )
+    return payload
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 删除公司（平台管理员）—— 删除整家公司：员工账号、三级文档、会话与向量
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# 与 ``delete_member`` 是兄弟函数，但**删除范围不同**：
+#
+#     delete_member    删一个人的账号与**个人**数据，组织资产（部门/公司库文档、
+#                      审核留痕）保留
+#     delete_company   删整家公司：其 ``tenant_id`` 下的**全部**文档（private /
+#                      department / tenant 三级）、全部会话与消息、全部员工账号
+#                      （连同个人数据），以及公司注册行；只有审计与审核留痕保留
+#                      （成员名下**跨租户**的文档只解绑归属、不删 —— 见 delete_company）
+#
+# 权限口径**比改名更严**：只有平台管理员（``is_admin``）可删 —— 用户明确要求
+# "只有最高权限的 admin 平台管理员才可以删除"。刻意**不**额外限制"只能删自己
+# 创建的"，因此判定就是 ``is_admin``。
+#
+# 公司必须存在于注册表（``companies`` 行）：这天然保护了 ``default``
+# （admin 自己的落脚租户不在注册表里，删不掉）。
+#
+# 同 ``delete_member`` 的三条刻意安排：
+#   1. **向量先行**：Qdrant 删除失败 → 整体中止，PG 一行不动，可原样重试。
+#   2. **先显式删 documents、再删 users**：``documents.owner_id`` 是
+#      ``ON DELETE CASCADE``，若依赖级联，预检数字与实际删除量会对不上。
+#   3. **单事务**内完成全部 PG 删除，避免"文档没了但账号还在"的中间态。
+
+
+def _company_conversation_clause(tenant_id: str, member_ids: list[uuid.UUID]):
+    """本公司会话的判定（预检与执行**共用**，保证口径一致）.
+
+    覆盖两类：租户字段直接归属本公司的会话，以及本公司成员名下、``tenant_id``
+    尚未对齐的历史会话（老数据可能为空）—— 两者都必须在删公司时一并清掉。
+    """
+    clause = Conversation.tenant_id == tenant_id
+    if member_ids:
+        return or_(clause, Conversation.owner_id.in_(member_ids))
+    return clause
+
+
+async def _collect_company_assets(session, tenant_id: str) -> dict:
+    """
+    清点删除该公司会动到哪些数据（预检与执行共用同一份口径）.
+
+    ``document_ids`` 是**待删除**的该公司全部文档 id（用于清 Qdrant 向量与磁盘）；
+    ``member_ids`` 是本公司成员 id（用于清其文档集合 / 回答反馈）；
+    ``usernames`` 用于审计快照。其余计数用于把"删了什么 / 留了什么"如实写进
+    审计日志与前端确认弹窗 —— 界面上说的和代码做的是同一组数字。
+    """
+    member_rows = (
+        await session.execute(
+            select(User.id, User.username).where(User.tenant_id == tenant_id)
+        )
+    ).all()
+    member_ids: list[uuid.UUID] = [uid for uid, _ in member_rows]
+    usernames: list[str] = [un for _, un in member_rows]
+
+    doc_rows = (
+        await session.execute(
+            select(Document.id, Document.access_level).where(
+                Document.tenant_id == tenant_id
+            )
+        )
+    ).all()
+    document_ids: list[uuid.UUID] = [doc_id for doc_id, _ in doc_rows]
+
+    async def _count(stmt) -> int:
+        return int((await session.execute(stmt)).scalar_one() or 0)
+
+    conv_clause = _company_conversation_clause(tenant_id, member_ids)
+
+    # 三级文档分布（NULL 按个人库处理，与 _collect_member_assets 同一归一化口径）
+    private_docs = 0
+    department_docs = 0
+    tenant_docs = 0
+    for _doc_id, level in doc_rows:
+        value = (level or "").strip() or ACCESS_PRIVATE
+        if value == ACCESS_DEPARTMENT:
+            department_docs += 1
+        elif value == ACCESS_TENANT:
+            tenant_docs += 1
+        else:
+            private_docs += 1
+
+    # 成员级资产清点复用 ``_collect_member_assets``（单一实现点）：
+    # collections / feedback / 审核留痕 与"删除单个成员"完全同口径。
+    member_assets = {
+        "collections": 0,
+        "feedback": 0,
+        "staff_requests": 0,
+        "share_requests": 0,
+        "bad_cases": 0,
+    }
+    for uid in member_ids:
+        per_member = await _collect_member_assets(session, uid)
+        member_assets["collections"] += per_member["collections"]
+        member_assets["feedback"] += per_member["feedback"]
+        member_assets["staff_requests"] += per_member["staff_requests"]
+        member_assets["share_requests"] += per_member["share_requests"]
+        member_assets["bad_cases"] += per_member["bad_cases"]
+
+    # 跨租户文档：本公司成员名下、但归属**别的租户**的文档。它们物理上存在于别人的
+    # 数据空间里，删本公司时**只解绑归属、绝不删除**（见 delete_company）。这里计数，
+    # 让预检的 kept 栏与执行时的实际解绑行数同口径。
+    cross_tenant_documents = (
+        await _count(
+            select(func.count())
+            .select_from(Document)
+            .where(
+                Document.tenant_id != tenant_id,
+                Document.owner_id.in_(member_ids),
+            )
+        )
+        if member_ids
+        else 0
+    )
+
+    return {
+        "member_ids": member_ids,
+        "usernames": usernames,
+        "members": len(member_ids),
+        "document_ids": document_ids,
+        "documents": len(document_ids),
+        "documents_private": private_docs,
+        "documents_department": department_docs,
+        "documents_tenant": tenant_docs,
+        "cross_tenant_documents": cross_tenant_documents,
+        "conversations": await _count(
+            select(func.count()).select_from(Conversation).where(conv_clause)
+        ),
+        "messages": await _count(
+            select(func.count())
+            .select_from(Message)
+            .where(
+                Message.conversation_id.in_(
+                    select(Conversation.id).where(conv_clause)
+                )
+            )
+        ),
+        "collections": member_assets["collections"],
+        "feedback": member_assets["feedback"],
+        # 向量条数是**派生估算值**：Σ documents.chunk_count（入库早期逐块累加）。
+        # 它**不等于**实时 Qdrant 点数 —— 若某批 upsert 永久失败，文档会被置 FAILED
+        # 但 chunk_count 不回滚（见 document_service 入库流程）。删除的正确性不受影响
+        # （实际清向量按 document_id 走），但前端把它标注为"按入库分块**预计**"，
+        # 不要误以为它是精确值；这里也**刻意不**为此加一次 Qdrant 往返（预检会变慢且
+        # 可能失败）。
+        "vectors": await _count(
+            select(func.coalesce(func.sum(Document.chunk_count), 0)).where(
+                Document.tenant_id == tenant_id
+            )
+        ),
+        "staff_requests": member_assets["staff_requests"],
+        "share_requests": member_assets["share_requests"],
+        "bad_cases": member_assets["bad_cases"],
+    }
+
+
+def _company_impact_payload(assets: dict, company: Company) -> dict:
+    """把清点结果整理成「将删除 / 将保留」两组（前端直接渲染，无需二次口径）。"""
+    return {
+        "company": {
+            "id": company.tenant_id,
+            "name": company.display_name,
+            "is_test": bool(company.is_test),
+            "created_by": str(company.created_by) if company.created_by else None,
+        },
+        "deleted": {
+            "members": assets["members"],
+            "documents": assets["documents"],
+            "documents_private": assets["documents_private"],
+            "documents_department": assets["documents_department"],
+            "documents_tenant": assets["documents_tenant"],
+            "conversations": assets["conversations"],
+            "messages": assets["messages"],
+            "collections": assets["collections"],
+            "feedback": assets["feedback"],
+            # 注意：这是 Σ documents.chunk_count 的**派生估算值**，不是实时 Qdrant
+            # 点数（见 _collect_company_assets 的注释）；UI 标注为"按入库分块预计"。
+            "vectors": assets["vectors"],
+        },
+        "kept": {
+            "staff_requests": assets["staff_requests"],
+            "share_requests": assets["share_requests"],
+            "bad_cases": assets["bad_cases"],
+            # 跨租户文档：本公司成员名下、归属别的租户的文档 —— 只解绑归属、不删除
+            # （见 delete_company 的跨租户解绑步骤）。
+            "cross_tenant_documents": assets["cross_tenant_documents"],
+        },
+    }
+
+
+async def _deletable_company(actor: User, tenant_id: str) -> Company:
+    """
+    取回一个**可被 actor 删除**的公司；不可删时抛 StaffError.
+
+    判定（比改名更严：只看平台管理员，不要求"自建"）：
+      1. actor 必须是平台管理员（``is_admin``）—— 用户明确要求"只有最高权限的
+         admin 平台管理员才可以删除"。知识库管理员、企业管理员等一律 403。
+      2. ``tenant_id`` 必须命中注册表（``companies`` 行存在）—— 否则 404。
+         这同时天然保护 ``default``：admin 自己的落脚租户不在注册表里，删不掉。
+    """
+    if actor is None or not actor.is_admin:
+        raise StaffError("只有平台管理员可以删除公司", status_code=403)
+
+    normalized = normalize_tenant_id(tenant_id)
+    from app.services.company_registry import get_company
+
+    company = await get_company(normalized)
+    if company is None:
+        raise StaffError("公司不存在或未注册", status_code=404)
+    return company
+
+
+async def preview_company_deletion(actor: User, tenant_id: str) -> dict:
+    """
+    删除公司影响预检：不动任何数据，只回答"删掉会失去什么 / 会留下什么".
+
+    与 :func:`delete_company` **共用** ``_deletable_company`` 与
+    ``_collect_company_assets``：确认弹窗里的数字就是执行时会删掉的行数。
+    """
+    company = await _deletable_company(actor, tenant_id)
+    async with get_db_session() as session:
+        assets = await _collect_company_assets(session, company.tenant_id)
+    return _company_impact_payload(assets, company)
+
+
+def _remove_tenant_storage(tenant_id: str) -> None:
+    """整目录删除 ``uploads/{tenant_id}/``（best-effort，失败只记日志）."""
+    import shutil
+
+    from app.services.storage import storage_root
+
+    try:
+        root = storage_root()
+        target = root / normalize_tenant_id(tenant_id)
+        # 防御：只删存储根**之内**的租户目录（normalize_tenant_id 已挡目录穿越，
+        # 这里再确认一次，绝不误删到根之外的路径）。
+        if target.is_dir() and root in target.parents:
+            shutil.rmtree(target, ignore_errors=True)
+            logger.info(
+                "Removed tenant storage dir for tenant_id=%s (%s)", tenant_id, target
+            )
+    except Exception as exc:  # noqa: BLE001 — best-effort 收尾
+        logger.warning(
+            "Failed to remove tenant storage dir for tenant_id=%s: %s", tenant_id, exc
+        )
+
+
+async def delete_company(actor: User, tenant_id: str) -> dict:
+    """
+    删除整家公司（不可恢复）：员工账号、三级文档、会话与向量全删.
+
+    删除范围：
+
+        删除   公司注册行；该公司 ``tenant_id`` 下的**全部**文档（private /
+               department / tenant 三级，连同分块、倒排词项、Qdrant 向量与
+               ``uploads/{tenant_id}/`` 磁盘原文件/图片）；全部会话与消息；
+               全部员工账号（连同其文档集合与回答反馈）
+        解绑   本公司成员名下、但归属**别的租户**的文档（``tenant_id != 本公司``）：
+               仅置 ``owner_id = NULL``，**文档本身与其它租户的数据一律保留** ——
+               删 X 公司不允许改变任何其它租户的数据（租户隔离底线）
+        保留   审计日志、身份验证申请、共享申请、疑难案例（组织留痕）——
+               归属人外键为 ``ON DELETE SET NULL``，公司没了、留痕还在
+
+    跨租户文档为什么不能删：身份验证申请审核通过会把申请人的 ``tenant_id`` 改到
+    新公司，而他此前在原公司租户下上传的文档仍留在**原租户**；这些文档的物理位置
+    属于别的公司的数据空间，别的公司成员可能仍在检索它们，删本公司没有资格销毁。
+    ``documents.owner_id`` 是 ``ON DELETE CASCADE``，因此**必须在删 users 之前**先解绑，
+    否则删账号会把这些跨租户文档一并级联删除（这是本函数要修的缺陷）。
+
+    执行顺序（与 ``delete_member`` 同款刻意安排）：
+
+      1. **向量先行**。Qdrant 不可用时整体中止、PG 一行不动，用户可原样重试；
+         反过来（先删 PG 再删向量）会留下无人认领的向量，被检索命中后
+         变成"引用了一份已经不存在的文档"。
+      2. **先显式删 documents、再删 users**。``documents.owner_id`` 是
+         ``ON DELETE CASCADE``，依赖级联会删一半、让预检数字与实际不符。
+      3. **单事务**内完成全部 PG 删除，避免"文档没了但账号还在"的中间态。
+
+    有意**不**清理的表：``eval_runs``（评测运行留痕）—— 它的 ``tenant_id`` 是**无外键
+    的纯字符串列**（见 ``app/db/eval_models.py``），删公司不清它**不是遗漏**，而是
+    刻意保留跨版本回归的评测基线。
+
+    磁盘与向量清理是 best-effort 收尾（失败只记日志）—— 用户按下的"删除公司"
+    这个动作已经完成，不应因一个孤儿文件而报错。
+    """
+    company = await _deletable_company(actor, tenant_id)
+    tid = company.tenant_id
+
+    async with get_db_session() as session:
+        assets = await _collect_company_assets(session, tid)
+    document_ids: list[uuid.UUID] = assets["document_ids"]
+    member_ids: list[uuid.UUID] = assets["member_ids"]
+
+    # ── 1. 向量先行：失败即中止，PG 保持原样 ─────────────────────────────────
+    if document_ids:
+        from app.services.vector_service import delete_by_document_ids
+
+        try:
+            await delete_by_document_ids(document_ids)
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "Company deletion aborted — vector purge failed for tenant_id=%s: %s",
+                tid, exc,
+            )
+            raise StaffError(
+                "公司文档的向量索引删除失败，本次删除已中止（数据未变动），请稍后重试",
+                status_code=503,
+            ) from exc
+
+    # ── 2. 单事务：删文档 → 删会话 → 删成员个人数据 → 删账号 → 删公司行 ────────
+    async with get_db_session() as session:
+        conv_clause = _company_conversation_clause(tid, member_ids)
+        # ① 跨租户解绑（**必须在删 users 之前**）：本公司成员名下、归属**其它租户**的
+        #    文档，仅置 owner_id = NULL，文档本体与其它租户数据一律保留。
+        #    若不先解绑，下一步删 users 会因 documents.owner_id 的 ON DELETE CASCADE
+        #    把这些跨租户文档一并删除，破坏其它公司的数据。
+        if member_ids:
+            detached_cross_tenant = await session.execute(
+                update(Document)
+                .where(
+                    Document.tenant_id != tid,
+                    Document.owner_id.in_(
+                        select(User.id).where(User.tenant_id == tid)
+                    ),
+                )
+                .values(owner_id=None)
+            )
+        else:
+            detached_cross_tenant = None
+        # ② documents 先删（document_metadata / chunk_parents / document_chunk_terms
+        #    由 FK CASCADE 随之清理）；**先于 users**，避免级联删一半。
+        deleted_documents = await session.execute(
+            delete(Document).where(Document.tenant_id == tid)
+        )
+        # ③ 会话（messages 由 FK CASCADE 随之删除）
+        deleted_conversations = await session.execute(
+            delete(Conversation).where(conv_clause)
+        )
+        # ④ 本公司成员的文档集合与回答反馈（CASCADE 也会带走，这里显式删以对齐预检）
+        if member_ids:
+            await session.execute(
+                delete(Collection).where(Collection.owner_id.in_(member_ids))
+            )
+            await session.execute(
+                delete(AnswerFeedback).where(AnswerFeedback.user_id.in_(member_ids))
+            )
+        # ⑤ 员工账号（staff_requests / share_requests / bad_cases / quality_events
+        #    的归属人外键是 SET NULL，审核与留痕不会被带走）
+        deleted_users = await session.execute(delete(User).where(User.tenant_id == tid))
+        # ⑥ 最后删公司注册行
+        await session.execute(delete(Company).where(Company.tenant_id == tid))
+        # 影响行数在事务内取出（会话关闭后不再读结果对象）
+        affected = {
+            "documents": int(deleted_documents.rowcount or 0),
+            "conversations": int(deleted_conversations.rowcount or 0),
+            "members": int(deleted_users.rowcount or 0),
+            "cross_tenant_documents": int(
+                (detached_cross_tenant.rowcount if detached_cross_tenant is not None else 0) or 0
+            ),
+        }
+
+    # ── 3. 磁盘收尾（best-effort）：逐文档资产 + 整个租户目录 ────────────────
+    if document_ids:
+        from app.services.storage import delete_document_images
+
+        for doc_id in document_ids:
+            try:
+                delete_document_images(str(doc_id), tenant_id=tid)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Failed to purge on-disk assets for document_id=%s: %s", doc_id, exc
+                )
+    _remove_tenant_storage(tid)
+
+    payload = _company_impact_payload(assets, company)
+    # 用执行时的真实影响行数覆盖预检计数（预检到执行之间可能有人新传了文档）
+    payload["deleted"]["members"] = affected["members"]
+    payload["deleted"]["documents"] = affected["documents"]
+    payload["deleted"]["conversations"] = affected["conversations"]
+    # 跨租户文档的解绑行数同样以执行时为准（预检与执行共用口径）
+    payload["kept"]["cross_tenant_documents"] = affected["cross_tenant_documents"]
+    payload["message"] = (
+        f"已删除公司「{company.display_name}」及其 {affected['members']} 名员工账号、"
+        f"{affected['documents']} 份文档与 {affected['conversations']} 个对话；"
+        f"审计与审核留痕已保留，此操作不可恢复"
+    )
+
+    await record_audit(
+        "company.delete",
+        user_id=actor.id,
+        username=actor.username,
+        resource_type="company",
+        resource_id=tid,
+        detail=(
+            f"name={company.display_name}; is_test={bool(company.is_test)}; "
+            f"members=[{', '.join(assets['usernames'])}]; "
+            f"deleted[members={affected['members']}, documents={affected['documents']}, "
+            f"private_docs={payload['deleted']['documents_private']}, "
+            f"department_docs={payload['deleted']['documents_department']}, "
+            f"tenant_docs={payload['deleted']['documents_tenant']}, "
+            f"conversations={affected['conversations']}, "
+            f"messages={payload['deleted']['messages']}, "
+            f"collections={payload['deleted']['collections']}, "
+            f"feedback={payload['deleted']['feedback']}, "
+            f"vectors={payload['deleted']['vectors']}]; "
+            f"kept[staff_requests={payload['kept']['staff_requests']}, "
+            f"share_requests={payload['kept']['share_requests']}, "
+            f"bad_cases={payload['kept']['bad_cases']}, "
+            f"cross_tenant_docs={payload['kept']['cross_tenant_documents']}]"
+        ),
+    )
+    logger.info(
+        "Company deleted by %s: tenant_id=%s members=%d documents=%d conversations=%d",
+        actor.username, tid, affected["members"], affected["documents"],
+        affected["conversations"],
     )
     return payload
 
