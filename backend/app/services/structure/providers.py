@@ -535,7 +535,7 @@ class DoclingProvider(StructureProvider):
         for item in items:
             node, _level = item if isinstance(item, tuple) and len(item) == 2 else (item, None)
             page_no = _docling_page_no(node)
-            text = _docling_markdown(node)
+            text = _docling_markdown(node, doc)
             if not text.strip():
                 continue
             if page_no not in buckets:
@@ -561,6 +561,10 @@ class DoclingProvider(StructureProvider):
         markdown = "".join(parts).strip()
         if not markdown or not marks:
             return None
+        # 防复发护栏 + 表格分隔行归一化（见 _sanitize_docling_markdown）
+        markdown = _sanitize_docling_markdown(markdown, filename)
+        if not markdown:
+            return None
         return StructuredDocument(
             markdown=markdown,
             page_marks=marks,
@@ -582,12 +586,36 @@ def _docling_page_no(node) -> int:
     return 1
 
 
-def _docling_markdown(node) -> str:
+def _is_docling_table_item(node) -> bool:
+    """node 是否为 Docling 的 ``TableItem``（懒加载导入，避免 docling 缺失时崩溃）."""
+    try:
+        from docling_core.types.doc import TableItem
+        return isinstance(node, TableItem)
+    except Exception:        # noqa: BLE001 — docling 未安装时按类名兜底
+        return type(node).__name__ == "TableItem"
+
+
+def _docling_markdown(node, doc=None) -> str:
+    """
+    取一个 Docling 元素的 Markdown.
+
+    ``doc`` 是整篇 ``DoclingDocument``：**只有** ``TableItem`` 才需要它 ——
+    Docling 的 ``TableItem.export_to_markdown(doc=None)`` 在不传 doc 时走**旧分支**，
+    而 Word 里被判成 ``RichTableCell`` 的表头单元格在该分支下无法解析，会退化成
+    字面量 ``<!-- rich cell -->``（``docling_core/.../table_data.py:_get_text``）。
+    传 doc 后走 ``MarkdownDocSerializer``，表头文字才能正确还原。
+
+    ⚠️ **刻意只对 TableItem 传 doc**：``PictureItem.export_to_markdown`` 的签名
+    同样（在 docling 2.126.0 里甚至**必须**）收 doc，但给图片传 doc 会改变图片
+    元素的输出形态，进而破坏 ``docx_parser.annotate_image_placeholders`` 与
+    ``structure.outline`` 依赖的 ``<!-- image -->`` 占位约定。图片通道保持原样
+    （只走 ``fn()``），行为与修复前逐字一致。
+    """
     for attr in ("export_to_markdown",):
         fn = getattr(node, attr, None)
         if callable(fn):
             try:
-                out = fn()
+                out = fn(doc) if (doc is not None and _is_docling_table_item(node)) else fn()
                 if isinstance(out, str) and out.strip():
                     return out
             except Exception:        # noqa: BLE001
@@ -617,6 +645,54 @@ def _docling_markdown(node) -> str:
         except Exception:            # noqa: BLE001
             pass
     return ""
+
+
+# Docling 在无 doc 的旧分支下，把富文本表头单元格导出为该字面量（见 _docling_markdown）。
+_DOCLING_RICH_CELL_TOKEN = "<!-- rich cell -->"
+
+
+def _sanitize_docling_markdown(markdown: str, filename: str) -> str:
+    """
+    Docling 产出的 markdown 的**防复发护栏** + 表格分隔行归一化.
+
+    1. **兜底清掉**任何残留的 ``<!-- rich cell -->`` 令牌，保证它**永不可能**进入
+       正文 / 入库文本；同时计数并 ``logger.warning``（含文件名），让"漏了"变成
+       **可观测**而不是静默。整行只剩占位符/管道/分隔符时**整行删除** —— 宁可少
+       一行，也不留下 ``|  |  |`` 这种空列错位。
+    2. 调用 ``docling_support._normalize_docling_table`` 把 Docling 紧凑分隔行
+       （``|-----|``）统一成系统约定的 ``| --- |``，使 structure 路径与其它路径
+       的下游（chunker 检测 / Document Agent 还原 / 测试断言）**全链路一致**。
+    """
+    count = markdown.count(_DOCLING_RICH_CELL_TOKEN)
+    if count:
+        logger.warning(
+            "docling markdown for '%s' still contained %d '%s' placeholder(s); "
+            "cleaning before indexing (fix guard)",
+            filename, count, _DOCLING_RICH_CELL_TOKEN,
+        )
+        kept: list[str] = []
+        for line in markdown.splitlines():
+            if _DOCLING_RICH_CELL_TOKEN not in line:
+                kept.append(line)
+                continue
+            cleaned = line.replace(_DOCLING_RICH_CELL_TOKEN, "")
+            stripped = cleaned.strip()
+            core = stripped
+            for ch in ("|", "-", ":", " "):
+                core = core.replace(ch, "")
+            # 去掉占位符后整行只剩表格结构（管道/分隔符/空白）→ 丢弃整行
+            if not stripped or core == "":
+                continue
+            kept.append(cleaned)
+        markdown = "\n".join(kept)
+
+    try:
+        from app.services.parsers.docling_support import _normalize_docling_table
+        markdown = _normalize_docling_table(markdown)
+    except Exception as exc:      # noqa: BLE001 — 归一化失败不致命
+        logger.warning("Failed to normalize docling table separators for '%s': %s", filename, exc)
+
+    return markdown
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
