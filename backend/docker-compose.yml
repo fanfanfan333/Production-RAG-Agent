@@ -163,6 +163,19 @@ services:
       # ⚠️ 必须写字面量，不能写 ${OLLAMA_BASE_URL:-...}：compose 插值会读项目目录的
       #    .env（里面正是 localhost:11434），写插值等于没覆盖（静默失效）。
       OLLAMA_BASE_URL: http://host.docker.internal:11434
+      # ── 出网代理豁免（与上一行同源的问题）──────────────────────────────────
+      # httpx 只认 NO_PROXY 环境变量，**不读** Windows 注册表的 ProxyOverride：
+      # 注册表里给 localhost;127.* 写的例外在 httpx 眼里不存在，于是发给本机/
+      # 内网服务的请求会被送到代理，拿回 502 空响应体（表现为 responseError('')、
+      # "模型不可用"、vision 被判不可用后多模态链路静默降级为纯 OCR）。
+      # 容器里要豁免的三类：宿主机的 Ollama（host.docker.internal）、compose
+      # 网络内的 postgres/qdrant/keycloak。
+      # 应用侧还会把 HTTP_NO_PROXY（见 .env）合并进来，这里是给**非 Python 工具**
+      # （curl 健康检查等）与 `docker inspect` 用的显式声明。
+      # 写成 ${NO_PROXY:-...} 而非字面量：`environment` 优先级高于 `env_file`，
+      # 写字面量会把运维在 .env 里配置的 NO_PROXY **静默吃掉**。
+      NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1,::1,host.docker.internal,backend,postgres,qdrant,keycloak}
+      no_proxy: ${NO_PROXY:-localhost,127.0.0.1,::1,host.docker.internal,backend,postgres,qdrant,keycloak}
     # 让 Linux 宿主机也能解析 host.docker.internal（README §7.4 承诺的别名落地）。
     extra_hosts:
       - "host.docker.internal:host-gateway"

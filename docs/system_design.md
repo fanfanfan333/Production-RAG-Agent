@@ -37,11 +37,11 @@
 
 | 新参数 | 语义 | 谁能拿到非空 |
 |---|---|---|
-| `tenant_ids: frozenset[str] \| None` | 第一层公司过滤**集合**。`frozenset`（可空）= `tenant_id IN (...)`；空集 = **fail-closed 返回空**；`None` = 不限制（**仅** `unrestricted=True` 诊断路径） | 所有人（普通用户 = `{自己公司}`；admin = `{自建测试公司}`） |
+| `tenant_ids: frozenset[str] \| None` | 第一层公司过滤**集合**。`frozenset`（可空）= `tenant_id IN (...)`；空集 = **fail-closed 返回空**；`None` = 不限制（**仅** `unrestricted=True` 诊断路径） | 所有人（普通用户 = `{自己公司}`；admin = `{自身所属租户 default} ∪ {自建测试公司}`） |
 | `owns_tenant_ids: frozenset[str]` | 「**可见他人 private 文档**」的租户集合。仅当 actor 是该租户的**创建者**时非空 | **只有平台管理员**，值 = 其自建测试公司集合 |
 
 为什么拆成两个集合而不是只用一个：**普通 `company_admin` 有 `tenant_ids={本公司}` 但 `owns_tenant_ids=∅`**（看不到同事的私库）；
-**admin 有 `tenant_ids == owns_tenant_ids == {自建公司}`**（因为整家公司是它建的，含成员私库）。
+**admin 有 `tenant_ids = {自身所属租户} ∪ {自建公司}`、`owns_tenant_ids = {自建公司}`**（前者比后者多的那一项就是 admin 自己的 `default`：它是 admin 的空间、但其中没有「他人私库」可放行，故不进 `owns`）。
 两者语义不同、必须分开，否则「admin 放开 private」就会写成全局放开（违反 P0-8 与 §三.3）。
 
 **被否决的替代方案**：
@@ -126,15 +126,26 @@ CREATE INDEX ix_companies_created_by ON companies(created_by);
 | `default` | — | **不入表** | — | — |
 
 - **`default` 不入注册表**：它是历史/占位租户（admin 本人所在），`list_companies` 本就排除 `role=admin`。把它当公司会出现「名叫 default 的公司」这一自相矛盾项（见 `tenancy.company_display_name` 现有注释）。
-- **A公司 / B公司 → `created_by = NULL`**：§三.5 明确「不能属于 admin」，否则 admin 就能看到它们，违反 P0-6。`created_by=NULL` 使它们对 admin 的可见集合**恒不命中**；它们仍由本公司 `company_admin/kb_admin` 通过 tenant 内路径管理（非 admin 的 `list_companies/list_members` 走 `effective_tenant_id` 分支，不受影响）。
+- **A公司 / B公司 → `created_by = NULL`**：§三.5 明确「不能属于 admin」，否则 admin 就能看到它们的**文档**，违反 P0-6。`created_by=NULL` 使它们对 admin 的**文档可见集合**（`owns_tenant_ids`）**恒不命中**（P0-6 不变）；它们仍由本公司 `company_admin/kb_admin` 通过 tenant 内路径管理（非 admin 的 `list_companies/list_members` 走 `effective_tenant_id` 分支，不受影响）。
+  - **「文档可见集合」与「公司管理清单」是两个不同的范围**（用户 2026-09-19 拍板）：A公司 / B公司**会出现在平台管理员的「公司管理清单」**中 —— `staff_service.list_companies` 的口径已改为「**全部已注册公司**」（含无主历史公司），管理面板可见其**存在与成员数**，并可由平台管理员**改名**。
+  - 改名走 `company_registry.can_platform_admin_rename`（`created_by is None` → 放行），只改 `display_name` / `name_key` + 同步 `users.company_name`，**绝不回填 `created_by`** —— 一旦回填它们就会进入 `owns_tenant_ids`，那才是**真的**击穿 P0-6。
 - **不改 `documents.tenant_id`、不改 Qdrant payload、不重跑向量**：回填只写 `companies` 表 + `users.company_name`（展示副本，改名时同步）。
 - 脚本用 `--assign / --rename` 显式参数（含上表默认值），**幂等**（存在即跳过 / 更新而非插入）。
 
-### 决策 6（对应 §三.7）：admin 上传必须指定归属测试公司
+### 决策 6（对应 §三.7）：admin 上传必须**显式**指定归属公司
 
-`POST /upload` 增加 `company_id: str` 表单字段：
+`POST /upload` 增加 `company_id: str` 表单字段。
 
-- `is_platform_admin(user)` 时：**必填**，且必须 ∈ `request_scope(user).owns_tenant_ids`，否则 400「请选择归属的测试公司」（无任何测试公司时给出 P0-6 引导文案）。`tenant_id = company_id`（**不再**用 `effective_tenant_id(user)`——admin 的 `effective_tenant_id` 是 `default`，会落进一个它自己看不到的租户）。
+> **【Rev3 前提校正】** 本条决策原文写着「admin 的 `effective_tenant_id` 是 `default`，会落进一个它自己看不到的租户」—— **这句与实现相反，已作废**。事实是：admin 的自身租户就是 `default`，且 `default` **在** `request_scope(admin).tenant_ids` 内，admin **看得见**这块空间里的文档（`/companies/accessible` 里 `default` 一项 `doc_count=1` 即实证；该选项在下拉里显示为「**管理员**」）。
+
+因此决策 6 的实质不是「把 admin 关在自建测试公司里」，而是「**不许落到随机的占位租户**」：
+
+- `is_platform_admin(user)` 时 `company_id` **必填**，合法目标 = **调用者自身所属租户**（admin 即 `default`）∪ `request_scope(user).owns_tenant_ids`（自建测试公司集合）。
+  - **自身空间恒合法**：`normalize_tenant_id(company_id) == effective_tenant_id(user)` → 直接放行，与调用者有没有创建过公司**无关**（不是「创建过公司才有资格传」）。
+  - 未选择（空 / 空串）→ **400「请选择归属公司」**。⚠️ 空串必须**先**排除：`normalize_tenant_id("")` 会回落成 `"default"`，若让它参与「是不是自己」的比较，「未选择」会被误判成「选了自己」从而绕过 400。
+  - 选了**他人**公司（既非自身租户、也不在自建集合内）→ **403「只能上传到你创建的测试公司或管理员空间」**。
+  - 未选自身空间**且**一家自建公司都没有 → **400「暂无测试公司，请先创建公司」**（P0-6 引导文案）。
+  - `tenant_id = company_id`（选择生效）。
 - 且当 `access_level == department` 且 actor 是平台管理员时，**还需显式 `department_id`**（校验在该公司部门清单内），否则部门库文档 `department_id=None` → 部门内谁都检索不到（现行为即有此坑，本轮顺手堵上）。
 - 非 admin：忽略 `company_id`（服务端强制用 `effective_tenant_id(user)`），避免成员把文档传进别家公司。
 
@@ -501,7 +512,7 @@ async def backfill_from_existing() -> int
 ### T03 — 文档列表三层标注 + 公司筛选 + 上传归属收敛（后端）
 - **源文件**：修改 `backend/app/services/document_query_service.py`（payload 组装 + `_compose_scope_labels` + `company_id` 过滤）、`backend/app/schemas/document_management.py`、`backend/app/api/document_management.py`、`backend/app/api/documents.py`、新增 `backend/app/api/companies.py`、修改 `backend/app/main.py`（注册 companies router）、`backend/app/services/knowledge_tier_service.py`（复用 `list_department_options` 取部门名）
 - **内容**：`DocumentSummary` 加 `tenant_name/department_name`；`list_documents` 批量取公司名（注册表）+ 部门名（按 distinct tenant 调 `list_department_options`）+ 新增 `company_id` 过滤；`GET /companies`、`GET /companies/visible`；`POST /upload` 收敛 admin（决策 6）。
-- **验收点**：三类文档返回的 `access_level/tenant_name/department_name` 正确（部门=`测试公司1 · 营销部门` 数据齐、公司=`测试公司1`、个人仅层级词，且**无 null 参与拼接**）；`GET /companies/visible` 对 admin 返回其自建公司且与列表可见范围一致；admin 无公司时不选 `company_id` 上传 → 400；admin 选非自建公司 → 400/403。
+- **验收点**：三类文档返回的 `access_level/tenant_name/department_name` 正确（部门=`测试公司1 · 营销部门` 数据齐、公司=`测试公司1`、个人仅层级词，且**无 null 参与拼接**）；`GET /companies/accessible`（Rev2 取代 `/companies/visible`）对 admin 返回**自身租户（显示「管理员」）∪ 自建公司**，且与列表可见范围一致；admin 不选 `company_id`（含空串）上传 → **400「请选择归属公司」**；admin 选**他人**公司 → **403**（不是 400）；admin 选「管理员」（自身 `default`）→ **200，即使它一家自建公司都没有**。
 - **依赖**：T01、T02
 - **优先级**：P0（P1-1/P1-3 归入本任务）
 
@@ -529,7 +540,8 @@ async def backfill_from_existing() -> int
 - **`owns_tenant_ids` 的唯一来源**：`request_scope(admin).owns_tenant_ids`（= 自建测试公司）。它**只**用于「他人 private **可见**」这一个特例（**仅读路径**：`document_scope_clause`/`can_access_document`/`_visibility_conditions`）；任何把它写成「角色是 admin 即可」的写法都视为缺陷（P0-8）。**禁止**把它用于**删除**判定（【已裁决 10-A】：private 恒 owner-only）。
 - **SQL 组装唯一入口**：列表/检索/关键词/摘要/兜底校验一律 `document_scope_clause(...)`；`document_acl_clause` 不再单独出现在调用点。
 - **缓存键**：任何权限相关缓存必须经 `scoped_cache_key(tenant_scope, permission_context, raw_key)`，`permission_context` 必须含租户集合指纹。
-- **错误文案（全项目统一）**：重名 `公司已存在`；未注册 `请先由管理员注册该公司`；admin 未选公司 `请选择归属的测试公司`；admin 无测试公司 `暂无测试公司，请先创建公司`。
+- **错误文案（全项目统一）**：重名 `公司已存在`；未注册 `请先由管理员注册该公司`；admin 未选公司 `请选择归属公司`；admin 选他人公司（403）`只能上传到你创建的测试公司或管理员空间`；admin 既未选自身空间又无测试公司 `暂无测试公司，请先创建公司`。
+  - 注：旧文案「请选择归属的**测试**公司」已废止 —— 合法目标**不只是**测试公司，admin 的自身空间「管理员」同样是合法归属，因此统一为**中性**的「请选择归属公司」。
 - **标签展示规则（前端唯一函数）**：`private→"个人"`；`tenant→companyName || "公司"`；`department→ (companyName && departmentName) ? "companyName · departmentName" : (departmentName || companyName || "部门")`。**任一字段缺失都不得拼出 `undefined`**。tooltip 保留 `知识库层级：{companyName/部门/个人}知识库`。
 - **会话隔离口径**：会话属**个人**数据，用 `effective_tenant_id(user)`（admin = `default`），**不使用** `tenant_ids` 集合（admin 不因自建公司而看到别人的会话）。
 - **评测 scope**：`tenant_ids = 金标文档所属租户并集`、`owns_tenant_ids=∅`、`tenant_wide=True`，仅平台管理员可用；list 与 search 同一 scope。
@@ -544,20 +556,25 @@ async def backfill_from_existing() -> int
 1. **「测试公司」判定口径（PRD 默认 #1）** — **【已裁决】采纳建议**：`owns_tenant_ids` = **`created_by == 当前 admin 的 user id`** 的公司集合（按 **id 锁定**，不是「任意 admin」）。理由：多管理员时，「A 建的测试公司」不应自动对 B 可见/可检索，否则是跨人越权；按 id 锁定更安全、可单测。**推翻** PRD 原文「创建者是任意 admin」的松口径。
 
 2. **admin 上传层级与归属（PRD 默认 #2）** — **【已裁决】采纳但加一条**：
-   - admin 上传**必须**指定 `company_id`，且**限自建测试公司**（缺 → 400「请选择归属的测试公司」；非自建 → 403）。
-   - **admin 上传的默认 `access_level` = `tenant`（公司库）**，落在所选测试公司内。理由：admin 建测试公司就是为了让测试账号能检索到素材；若默认 private，测试账号登进去检索为空，会让人误判系统坏了。仍允许 admin 显式选 private（归属自己，无害）。
+   - admin 上传**必须**显式指定 `company_id`；合法目标 = **自身租户**（admin 即 `default`，下拉显示「管理员」，且**恒合法**）∪ **自建测试公司**（缺 → 400「请选择归属公司」；他人公司 → 403「只能上传到你创建的测试公司或管理员空间」；既没选自身空间又无自建公司 → 400「暂无测试公司，请先创建公司」）。完整真值表见**决策 6（Rev3 校正）**。
+   - **admin 上传的默认 `access_level` = `tenant`（公司库）**，落在所选空间内（自建测试公司 **或** 自身的「管理员」空间）。理由：admin 建测试公司就是为了让测试账号能检索到素材；若默认 private，测试账号登进去检索为空，会让人误判系统坏了。仍允许 admin 显式选 private（归属自己，无害）。
    - **非 admin 上传完全不变**（`DEFAULT_DOCUMENT_ACCESS_LEVEL` 保持 `private`）。
-   - admin 无独立个人库；其可见的 private = ①自己（任意租户，含 `default`）+ ②自建测试公司内成员的个人文档（由 `owns_tenant_ids` 表达）。
+   - admin **有自己的空间**：它的 `effective_tenant_id` 就是 `default`（下拉显示「管理员」，不属于任何**注册公司**、也不在 `companies` 表里）。其可见的 private = ①自己（任意租户，含 `default`）+ ②自建测试公司内成员的个人文档（由 `owns_tenant_ids` 表达）。
 
 3. **部门名权威来源（PRD 默认 #3）** — **【已裁决】采纳**。文档标签的部门名 = 「该文档 `tenant_id` 下、`department_id` 对应的部门名」，取自 `users.department_name` 聚合（复用 `list_department_options(tenant_id)`）；文档 `owner_id` 为 NULL（离职解绑）时同样能取到，**不依赖 owner**。
 
 4. **改名后名称→标识映射替换（PRD 默认 #4）** — **【已裁决】采纳**。放弃「名称确定性哈希」作为业务权威；**绑定/权限一律用注册表 `tenant_id`**；名称只用于「下拉展示」与「兼容旧入口的按名解析」，解析走 `name_key`（`find_by_name`）。因此**新名可解析、旧名失效**；`company_id_from_name` 仅保留给一次性回填脚本。**新公司 tenant_id 随机生成**（`generate_tenant_id()`），**不再由名称派生**（否则改名必然换 id，与 P0-4 冲突）。bjld8→测试公司1、1z5pp→测试公司2 **只改展示名，`tenant_id` 不变**。
 
-5. **admin 未创建测试公司时兜底（PRD 默认 #5）** — **【已裁决】采纳**：列表/检索均空 + 文档页引导「暂无测试公司，请先创建公司」；筛选器显示「全部公司(0)」；**`GET /companies/accessible` 返回空列表**（Rev2：原 `/companies/visible` 已被取代，见 §10.6）。**实现要求**：admin 的 `tenant_ids=frozenset()` 必须走 **fail-closed**（空集 → 返回空），**绝不能**因为「集合为空」被 `if tenant_ids:` 判成 falsy 而退化为「不限制」——本次改造最危险的 `falsy` 陷阱（详见决策 1 与 `tenant_clause` 三分支）。
+5. **admin 未创建测试公司时兜底（PRD 默认 #5）** — **【已裁决】采纳**：列表/检索在公司维度均为空 + 文档页引导「暂无测试公司，请先创建公司」；筛选器显示「全部公司(0)」；**`GET /companies/accessible` 除「管理员」外无任何公司项**（Rev2：原 `/companies/visible` 已被取代，见 §10.6）。
+   > **【Rev3 校正】** 「列表/检索**均空**」只在**公司维度**成立：admin 的 `tenant_ids` 恒含其自身所属租户 `default`（= {default} ∪ 自建集合，见 `scope_for`），因此即便一家测试公司都没有，admin **仍能看到自己 `default` 空间里的文档**（/companies/accessible 里也就仍有「管理员」这一项，只是除它之外没有公司）。「空」= 无公司项，**不等于** admin 一无所有。**实现要求**：admin 的 `tenant_ids=frozenset()` 必须走 **fail-closed**（空集 → 返回空），**绝不能**因为「集合为空」被 `if tenant_ids:` 判成 falsy 而退化为「不限制」——本次改造最危险的 `falsy` 陷阱（详见决策 1 与 `tenant_clause` 三分支）。
 
 6. **金标评测处理（§四.3）** — **【已裁决】采纳 Rev2（§10.5）**：金标评测用 admin **真实 scope**（`request_scope(admin)`），**不设特设评测 scope**（决策 9 整节作废）；保留「list == search」硬约束，并**新增回归断言**「admin 能看见自己 `default` 租户的 private 文档」。
 
-7. **A公司 / B公司的 `created_by`（§三.5）** — **【已裁决】采纳**：`created_by = NULL`（对 admin 恒不可见，不命中可见集合）。**不**扩大范围到 company_admin（本轮不做「公司自管理/公司管理员改名」）。
+7. **A公司 / B公司的 `created_by`（§三.5）** — **【已裁决】采纳**：`created_by = NULL`（对 admin 恒不可见，不命中**文档可见集合**）。**不**扩大范围到 company_admin（本轮不做「公司自管理/公司管理员改名」）。
+   > **【Rev4 增补裁决，用户 2026-09-19】公司管理清单放开 + 无主公司可改名**：本轮只调整**公司管理清单**的展示口径与**改名权限**，不动文档可见范围。
+   > - 公司管理清单放开为「**全部已注册公司**」（不再是「仅自己创建的」）——单一口径点 `staff_service.list_companies`。
+   > - 新增「平台管理员可给**无主（`created_by IS NULL`）**历史公司（A公司 / B公司）改名」，判定点 `company_registry.can_platform_admin_rename`。
+   > - **护栏：改名绝不写 `created_by`**（只改 `display_name` / `name_key` + 同步 `users.company_name`），因此**不改变任何人的文档可见范围**；原裁决（`created_by = NULL`）与 P0-6 均维持不变。
 
 ---
 
@@ -607,9 +624,11 @@ graph TD
 | `研发部-2024年度技术方案-2e19.docx` | `admin (c4f05143-c7a1-4de6-9145-d12bdf7e806c)` | **`default`** | `private` |
 | `Python AI大模型成神手册 (1).docx` | `admin` | **`default`** | `private` |
 
-admin 的 `tenant_ids`（自建测试公司）= `{c8111de986583, cfb08c53677c4}`，**不含 `default`**。
+admin 的 `tenant_ids` = `{default(自身所属租户)} ∪ {c8111de986583, cfb08c53677c4}`（自建测试公司；`owns_tenant_ids` **只**是后面的自建集合，不含 `default`）。
 
-**Rev1 的缺陷**：Rev1 把第一层做成 `and_(tenant_clause(tenant_ids), document_acl_clause(...))`。第一层 `tenant_id IN (c8111…, cfb08…)` 会把 `tenant_id=default` 的两份文档**直接滤掉** —— 无论 ACL 怎么写。结果：**admin 看不到自己上传的文档**。这是**真实功能回归**，不是评测脚本问题（评测只是把它暴露出来的第一现场）。
+> **【Rev3 校正】** 原文此处写「不含 `default`」是**旧实现**的口径：现在的 `scope_for` 对 admin 取 `home = {effective_tenant_id(user)} = {default}` 再并上自建集合，所以 `default` **在**集合内。
+
+**Rev1 的缺陷**：Rev1 把第一层做成 `and_(tenant_clause(tenant_ids), document_acl_clause(...))`，且当时 `default` 不在集合内 —— 第一层 `tenant_id IN (c8111…, cfb08…)` 会把 `tenant_id=default` 的两份文档**直接滤掉** —— 无论 ACL 怎么写。结果：**admin 看不到自己上传的文档**。这是**真实功能回归**，不是评测脚本问题（评测只是把它暴露出来的第一现场）。
 
 **裁决（team-lead）** —— 本节的唯一正确性锚点：
 
@@ -916,8 +935,9 @@ def scoped_cache_key(tenant_ids: frozenset[str] | None, perm_context: str, raw_k
 
 ```
 eval_scope = await request_scope(admin)          # ← 就是 admin 的真实 scope，不特设
-# 即： tenant_ids      = tenant_ids_created_by(admin.id)   （= 自建测试公司集合）
-#     owns_tenant_ids = 同上                                （admin 在自建公司内可见他人私库）
+# 即： tenant_ids      = {所属租户 default} ∪ tenant_ids_created_by(admin.id)
+#                        （= 自身「管理员」空间 ∪ 自建测试公司集合）
+#     owns_tenant_ids = tenant_ids_created_by(admin.id)  （不含 default：自身空间里没有「他人私库」）
 #     department_id   = None
 #     tenant_wide     = True                               （评测需跨部门命中金标块）
 ```
@@ -928,7 +948,7 @@ eval_scope = await request_scope(admin)          # ← 就是 admin 的真实 sc
   - 断言形式：`assert any(d.owner_id == admin.id for d in visible)`（**不写死文档名**，避免脆弱）。
   - 等价地：`can_access_document(doc, admin, owner_id=admin.id, tenant_ids=scope.tenant_ids, owns_tenant_ids=scope.owns_tenant_ids) is True`。
 - **`golden_v1.json` 的实际影响**（**修正 Rev1 的判断**）：16 正例里，`研发部-2024年度技术方案`、`Python AI大模型成神手册` 这两份 owner=admin/tenant=`default` 的文档，**在 Rev2 由 ①（private owner-only）自动可见 → 恢复命中**。其余（`紫罗兰计划`×2、`探测载体`×2 等）若落在 admin 自建测试公司（c8111/cfb08）内，则由 ①（company_bound）命中 → **同样恢复**。因此**预期 16 正例全部恢复**；仍需 QA 实测确认是否有依赖 A/B 公司文档的用例（若有，单独标注为「需重录」）。
-  - `scope_limitation` 文案更新为：**admin 可见 = 自建测试公司内全部层级 ∪（含 `default` 在内的）自己的个人库**。
+  - `scope_limitation` 文案更新为：**admin 可见 =（自建测试公司 ∪ 自身所属租户 `default`）内的全部层级 ∪（含 `default` 在内的）自己的个人库**。
   - `thresholds`（`min_recall_at_10` / `min_multi_evidence_all_found_rate` / `max_rerank_min_score_ratio`）**复测后更新**（由 QA 执行，见任务 #4）。
 - 3 份 negative 用例**不变**（仍不得命中他公司私库）。
 

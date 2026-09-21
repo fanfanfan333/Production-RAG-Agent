@@ -1,0 +1,273 @@
+%% 图 1 —— 主链路：12 环节贯通（请求级 UserScope 一次签发、三处复用同一份判定）
+sequenceDiagram
+    autonumber
+    actor U as 用户
+    participant API as api/query.py::_stream_rag
+    participant SS as security_scope.request_security_scope
+    participant MG as master_graph.stream_master
+    participant SP as security_policy (IR + 3 编译器)
+    participant QD as Qdrant（向量腿 + BM25 语料）
+    participant PG as PostgreSQL（documents / document_objects）
+    participant RRF as hybrid_search.rrf_fuse
+    participant RR as reranker.rerank_chunks
+    participant CB as nodes/multimodal_context_node
+    participant FC as master_graph._final_check_node（第12环）
+    participant LLM as ChatOllama
+    participant AU as audit_service.record_acl_drop
+
+    U->>API: POST /query
+    API->>SS: request_security_scope(user)
+    Note over SS: 唯一签发点（AST 门禁：只允许 api/** 调用）<br/>五维任一解析失败 → 最小权限
+    SS-->>API: UserScope(frozen)
+
+    API->>MG: stream_master(user_scope=scope, ...)
+    MG->>MG: _route_node / _rewrite_node（意图 + 改写 + 子查询 + HyDE）
+    MG->>SP: pred = scope.predicate(now)
+    Note over SP: ScopePredicate（frozen IR）—— 一次构造，全程复用
+
+    rect rgb(255, 243, 224)
+    Note over SP,QD: 第 7 环 · 检索前权限过滤（ANN / 倒排**之前**）
+    MG->>SP: to_qdrant(pred)
+    SP-->>MG: Filter(must_not=[Deny-1..6])
+    Note over SP: Deny-1 个人库 / Deny-2 公司边界 / Deny-3 部门（既有 Rev2）<br/>Deny-4 密级 / Deny-5 项目 / Deny-6 剔除+deny（新增）
+    MG->>QD: retrieve_chunks_scoped(query, scope=pred)
+    QD-->>MG: 向量候选（已剪枝）
+    MG->>SP: to_sql(pred, Document)
+    SP-->>MG: and_(document_scope_clause(既有三维), _security_sql(新增))
+    MG->>PG: keyword_search(scope=pred)
+    PG-->>MG: 关键词候选（已剪枝）
+    end
+
+    MG->>RRF: rrf_fuse(两路排名)
+    Note over RRF: 第 9 环：输入只来自第 7 环；权重不含权限字段
+    RRF-->>MG: 融合候选
+    MG->>RR: rerank_chunks(Top20)
+    Note over RR: 第 10 环：只评估语义相关性，不因权限调序
+    RR-->>MG: 精排候选
+
+    rect rgb(232, 244, 255)
+    Note over MG,PG: 第 11 环 · 检索后 ACL 权威复核（PG 为准）
+    MG->>PG: SELECT document_objects WHERE object_id IN (...)
+    PG-->>MG: 对象级权限行
+    loop 每个候选对象
+        MG->>SP: allows(pred, ObjectACLView.from_row(row))
+        SP-->>MG: Decision(allowed, reason, gate)
+        alt allowed == False
+            MG->>AU: record_acl_drop(stage="postcheck", reason=...)
+            Note over MG: 剔除（A3/A4）；<br/>acl_sync_state != synced 时额外审计
+        end
+    end
+    end
+
+    MG->>CB: build_multimodal_context(chunks, scope=pred)
+    Note over CB: 第 12 环-a：TextBlock 与 ImageBlock **分别**校验<br/>图片块先过图片级 ACL 再决定要不要 Vision
+
+    rect rgb(255, 233, 233)
+    Note over FC,LLM: 第 12 环-b · LLM 输入前最终校验
+    FC->>SP: 逐块 allows(pred, view)（含 image 对象）
+    SP-->>FC: Decision
+    alt 全部被剔除
+        FC->>AU: record_acl_drop(stage="final_check")
+        FC-->>U: 「没有可用资料 / 权限不足」—— **不生成任何内容**（A10）
+    else 部分被剔除
+        FC->>AU: record_acl_drop(stage="final_check")
+        FC->>LLM: 剩余证据 + 「部分内容因权限限制未包含」
+        Note over FC: 不泄露被剔除文档的名称/数量/存在性（Q6=A）
+    else 全部通过
+        FC->>LLM: 完整上下文
+    end
+    end
+
+    LLM-->>MG: answer
+    MG->>MG: _citation_verifier_node（引用五项校验）
+    MG-->>API: sources（每条带 permission_snapshot）
+    API-->>U: SSE answer + citations
+    Note over U: 用户点击引用 → 再次 allows() 校验（打开时权限可能已变更）
+
+
+%% 图 2 —— 文档权限变更（收紧同步，窗口为零）
+sequenceDiagram
+    autonumber
+    actor A as 管理员
+    participant API as api/security.py
+    participant SC as security_cascade.sync_doc_row
+    participant PG as PostgreSQL（documents + document_objects）
+    participant QD as Qdrant（payload 副本）
+    participant Q as 下一次查询
+
+    A->>API: PATCH /documents/{id}/security {security_level: 3}
+    API->>API: require_permission("security.escalate") + 禁止自我授予校验
+    API->>SC: sync_doc_row(document_id, security_level=3)
+    rect rgb(255, 233, 233)
+    Note over SC,PG: 收紧方向 —— PG **同步**（同一事务）
+    SC->>PG: UPDATE documents SET security_level=3, acl_sync_state='pending'
+    SC->>PG: UPDATE document_objects SET effective_security_level=GREATEST(...), acl_sync_state='pending'<br/>WHERE document_id=?（doc + text_chunk + table + code + image 全部派生行）
+    end
+    SC->>SC: asyncio.create_task(push_payload_async(...))  —— 异步推副本
+    SC->>PG: record_audit("security.level.change", detail="1→3")
+    SC-->>API: ok
+    API-->>A: 200
+
+    Q->>PG: 第 11 环对象级复核（PG 权威源）
+    PG-->>Q: 已是 security_level=3 ⇒ 低密级用户被剔除
+    Note over Q: **窗口为零**：副本还没推完也不影响，因为复核读的是 PG（A3）
+
+    SC->>QD: set_payload（异步）
+    alt 成功
+        SC->>PG: UPDATE acl_sync_state='synced'
+    else 失败
+        SC->>PG: UPDATE acl_sync_state='stale' + logger.error
+    end
+
+
+%% 图 3 —— 图片提级 + OCR 派生取严（红线 2：图看不了 ⇒ 字也搜不到）
+sequenceDiagram
+    autonumber
+    actor A as 管理员
+    participant IS as image_security.escalate_image_object
+    participant SC as security_cascade.cascade_image_derived
+    participant PG as PostgreSQL（document_objects）
+    participant R as 低密级用户检索
+    participant CB as 第 12 环 Context / 回显
+
+    A->>IS: 图片含身份证 → 提级 security_level=3（或 excluded=true）
+    IS->>PG: UPDATE image 行（object_type='image'）
+    IS->>SC: cascade_image_derived(image_object_id) —— **同步**
+    loop 每个 derived（parent_object_id = 源图片）
+        SC->>PG: effective_security_level = max(self, src.effective_security_level)
+        SC->>PG: excluded |= src.excluded
+        SC->>PG: acl_deny |= src.acl_deny
+        SC->>PG: acl_allow = []（派生不得获得父之外的可见性）
+        SC->>PG: project_ids = union（只加闸不放宽）
+    end
+    SC-->>IS: N 行已重算
+    IS->>PG: record_audit("image.escalate" / "image.exclude")
+
+    R->>PG: 检索（clearance=1）
+    PG-->>R: image 对象 eff=3 ⇒ 剔除；其 OCR 表格/代码 eff=3 ⇒ 剔除
+    Note over R: A5：既看不到原图，也搜不到 OCR 文本
+
+    CB->>CB: 图片块先过图片级 ACL，不通过则不 Vision、不回显、不进上下文
+    Note over CB: 「用图片描述文本替代图片回显」是被禁止的绕过方式
+
+%% 图 4 —— need-to-know 授予（pending 不可见 / 禁自我授予 / 到期回收）
+sequenceDiagram
+    autonumber
+    actor R as 申请（普通员工）
+    participant API as api/security.py
+    participant PG as PostgreSQL（acl_grants + document_objects）
+    participant V as 审批人
+    participant T as 定时任务 expire_acl_grants
+
+    R->>API: POST /security/grants {object_id, subject, expires_at, effect=allow}
+    API->>API: require_permission("security.grant")<br/>禁止自我授予（granted_by != subject_user_id）
+    API->>PG: INSERT acl_grants(status='pending')
+    Note over PG: **pending 期间不写 acl_allow** ⇒ 申请人以外（含管理员）不可见（A7）
+    API-->>R: 201 pending
+
+    V->>API: POST /security/grants/{id}/review {approve}
+    API->>API: require_permission("security.review.grant") + 审批链校验
+    API->>PG: status='approved' → 物化 acl_allow += subject；acl_expires_at = min(有效 grants)
+    API->>PG: 级联派生（放宽 ⇒ payload 异步）
+    API->>PG: record_audit("security.grant.review")
+    API-->>V: 200（立即可见）
+
+    T->>PG: 扫描 expires_at < now() 且 status='approved'
+    T->>PG: status='expired' → 从 acl_allow 移除 + 重算 acl_expires_at
+    T->>PG: record_audit("security.grant.expired")
+    Note over PG: 每次命中 need-to-know（尤其长期例外）都写审计（PRD 2.4）
+
+
+%% 图 5 ——【Rev2 追加】Query Rewrite / 子查询的 Scope 继承（决策 15）
+sequenceDiagram
+    autonumber
+    participant MG as master_graph._rewrite_node(256)
+    participant QT as query_transform.rewrite_query(293)
+    participant LLM as ChatOllama（改写器）
+    participant SQ as ScopedQuery（frozen）
+    participant MG2 as master_graph._retrieve_node(320)
+    participant RS as retrieve_chunks_scoped
+    participant SP as security_policy
+
+    MG->>QT: rewrite_query(query=str, history_messages)
+    Note over QT: **签名永久只吃文本** —— 无 scope / user / tenant / clearance 参数<br/>源码级测试：query_transform.py 不得 import security_scope
+    QT->>LLM: _REWRITE_SYSTEM_PROMPT(76) + user_block(387-401)
+    Note over LLM: user_block 只含 query + 最近4条历史（已 normalize + sanitize）<br/>**不含** department_id / project_ids / clearance（B9 硬门禁）
+    LLM-->>QT: JSON {rewritten, variants, subqueries, hyde}
+    QT->>QT: _passes_drift_gate(224) 逐个过防漂移闸门
+    QT-->>MG: RewriteResult（**只有字符串，无权限字段**）
+
+    MG->>SQ: ScopedQuery(text=rewritten, scope=scope, kind="main")
+    loop 每个 variant / subquery / hyde
+        MG->>SQ: .with_text(v) —— dataclasses.replace(text=...)，**scope 字段不参与**
+        Note over SQ: frozen=True ⇒ scope 恒为**同一实例**（`is`，不是 `==`）
+    end
+    MG-->>MG2: scoped_queries: list[ScopedQuery]
+
+    MG2->>MG2: sanitize_retrieval_query(342-363) 逐条清洗（**只改文本**）
+    MG2->>RS: retrieve_chunks_scoped(main, scope=pred, extra_queries=[...])
+    RS->>SP: pred = scope.predicate()（**一次**构造）
+    SP-->>RS: ScopePredicate（frozen）
+
+    rect rgb(255, 243, 224)
+    Note over RS: fan-out 全部在 retrieve_chunks **内部**，共用同一个 search_filter
+    RS->>RS: 向量腿 asyncio.gather(1387) —— 并发
+    RS->>RS: PG关键词腿 asyncio.gather(1541) —— 并发
+    RS->>RS: 内存BM25腿 for(1610) —— 串行（既有行为，不改）
+    end
+
+    Note over RS,SP: **风险论证**：改写器若把"我们部门"补成"B公司 研发部"<br/>① 文本只参与 embedding / tsquery，不参与 to_qdrant / to_sql<br/>② Scope 不随文本变化（frozen）<br/>③ 第11环 allows() 与相关性完全解耦<br/>⇒ 最坏后果是**召回质量下降**，不可能越权
+    RS-->>MG2: 候选（已被原 Scope 约束）
+    Note over MG2: 测试：monkeypatch 改写为"B公司…" → 断言候选全部 tenant==c_a 且 level<=1<br/>**阳性对照**：放宽 Scope 后同一 query 必须能召回 B 的对象
+
+
+%% 图 6 ——【Rev2 追加】引用点击时再校验（决策 16）
+sequenceDiagram
+    autonumber
+    actor U as 用户（点击引用）
+    participant CH as GET /documents/{id}/chunks (document_management.py:227)
+    participant IM as GET /documents/{id}/images/{name} (document_management.py:584)
+    participant SS as request_security_scope（**新请求重新签发**）
+    participant DO as PostgreSQL document_objects
+    participant SP as allows(pred, view)
+    participant AU as audit_service
+
+    rect rgb(232, 244, 255)
+    Note over U,CH: 路径 A · 文本来源（"定位原文"）
+    U->>CH: 点击引用（可能来自三天前的对话）
+    CH->>SS: request_security_scope(user)
+    Note over SS: **用当前 Scope**，不是生成时的 Scope ⇒ 收紧立即生效（A3）
+    CH->>DO: document_scope_clause(既有三维) + 批量取 document_objects
+    DO-->>CH: 文档行 + 该文档全部对象行
+    loop 每个 chunk
+        CH->>SP: allows(pred, ObjectACLView.from_row(row))
+        SP-->>CH: Decision
+        alt allowed == False（被单独提级 / 被剔除）
+            CH->>AU: record_acl_drop(stage="citation_open")
+            Note over CH: **不返回占位符** —— 直接不出现在列表里<br/>（占位符 = 泄露"这里有东西被藏了"）
+        end
+    end
+    CH-->>U: chunks（已逐块过滤）
+    end
+
+    rect rgb(255, 233, 233)
+    Note over U,IM: 路径 B · 原始图片回显
+    U->>IM: <img> 加载（?token=jwt，无 Authorization 头）
+    IM->>SS: request_security_scope(user)（同一套，不因认证方式放宽）
+    IM->>IM: can_access_document(613) —— **文档级，保留**
+    IM->>DO: resolve_image_object_id(document_id, image_name)
+    DO-->>IM: image 对象行（object_type='image'）
+    alt 反查不到对象行
+        IM-->>U: 404「文档不存在或无权访问」（**fail-closed，不因缺失而放行**）
+    end
+    IM->>SP: allows(pred, image_view)
+    alt allowed == False（图片被提级 / excluded）
+        IM->>AU: record_acl_drop(stage="citation_open")
+        IM-->>U: 404「文档不存在或无权访问」
+        Note over IM: 文案与"文档不存在"**逐字一致** ⇒ 不泄露存在性<br/>**禁止**用 image_caption / vision 结论当替身回显
+    else allowed
+        IM-->>U: FileResponse（原图）
+    end
+    end
+
+    Note over U: permission_snapshot 里**只存 scope_fingerprint**（哈希）<br/>**不存** project_ids / department_id / clearance 明文

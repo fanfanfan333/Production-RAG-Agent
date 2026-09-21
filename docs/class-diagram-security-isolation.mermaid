@@ -1,0 +1,228 @@
+classDiagram
+    direction LR
+
+    %% ── 既有（本轮一行不改）──────────────────────────────
+    class DocumentScope {
+        <<frozen dataclass>>
+        +UUID owner_id
+        +frozenset~str~ tenant_ids
+        +frozenset~str~ owns_tenant_ids
+        +str department_id
+        +bool tenant_wide
+        +acl_kwargs() dict
+    }
+    note for DocumentScope "tenancy.py:256 —— 上游 Rev2 形态，本轮不改动"
+
+    class User {
+        <<ORM: db/user_models.py>>
+        +UUID id
+        +str role
+        +str tenant_id
+        +str department_id
+        +int clearance
+    }
+    note for User "clearance 为本轮新增列（NULL = 按角色推导）"
+
+    class Document {
+        <<ORM: db/models.py>>
+        +UUID id
+        +str tenant_id
+        +str access_level
+        +str department_id
+        +int security_level
+        +str visibility_mode
+        +jsonb project_ids
+        +jsonb acl_allow
+        +jsonb acl_deny
+        +datetime acl_expires_at
+        +str acl_sync_state
+        +str share_status
+    }
+    note for Document "security_level..share_status 共 9 列为本轮新增（默认 1 / tier / [] / synced / none）"
+
+    %% ── 新增：请求级载体 ────────────────────────────────
+    class UserScope {
+        <<frozen dataclass>>
+        +DocumentScope base
+        +str user_id
+        +str role
+        +int clearance
+        +frozenset~str~ project_ids
+        +frozenset~str~ principals
+        +datetime issued_at
+        +bool strict
+        +scope_fingerprint() str
+        +acl_kwargs() dict
+        +security_kwargs() dict
+        +predicate(now) ScopePredicate
+    }
+    note for UserScope "组合而非继承：base 一个字段都不改，十余个既有调用点零破坏"
+
+    class ScopedQuery {
+        <<frozen dataclass · Rev2 追加>>
+        +str text
+        +UserScope scope
+        +str kind
+        +with_text(new_text) ScopedQuery
+    }
+    note for ScopedQuery "决策 15：text 可换（改写/变体/子问题/HyDE），scope 恒为同一实例\nwith_text 用 dataclasses.replace 且 scope 不出现在参数里 ⇒ 想换也换不了"
+
+    class ScopePredicate {
+        <<frozen dataclass · IR>>
+        +str user_id
+        +frozenset~str~ tenant_ids
+        +frozenset~str~ owns_tenant_ids
+        +str department_id
+        +bool tenant_wide
+        +int clearance
+        +frozenset~str~ project_ids
+        +frozenset~str~ principals
+        +datetime now
+        +bool unrestricted
+    }
+    note for ScopePredicate "三个编译器的唯一输入 —— 语义同源的结构保证"
+
+    class ObjectACLView {
+        <<frozen dataclass>>
+        +str object_id
+        +str object_type
+        +str document_id
+        +str tenant_id
+        +str owner_id
+        +str user_id
+        +str department_id
+        +str access_level
+        +str visibility_mode
+        +frozenset~str~ project_ids
+        +int security_level
+        +int parent_security_level
+        +int effective_security_level
+        +frozenset~str~ acl_allow
+        +frozenset~str~ acl_deny
+        +datetime acl_expires_at
+        +bool excluded
+        +str acl_sync_state
+        +from_row(row) ObjectACLView
+        +from_payload(payload) ObjectACLView
+    }
+    note for ObjectACLView "PG 行与 Qdrant payload 的共同最小字段集；user_id↔owner_id 映射只写在这里"
+
+    class Decision {
+        <<frozen dataclass>>
+        +bool allowed
+        +str reason
+        +str gate
+    }
+
+    %% ── 新增：三个编译器 ────────────────────────────────
+    class SecurityPolicy {
+        <<module: services/security_policy.py>>
+        +DEFAULT_CLEARANCE_BY_ROLE dict
+        +build_predicate(scope, now) ScopePredicate
+        +to_sql(pred, model) ColumnElement
+        +to_qdrant(pred) Filter
+        +allows(pred, obj) Decision
+        +qdrant_filter_matches(pred, payload) bool
+    }
+    note for SecurityPolicy "to_sql / to_qdrant / allows 三处复用同一份判定；qdrant_filter_matches 为测试用镜像求值器"
+
+    class SecurityScope {
+        <<module: services/security_scope.py>>
+        +request_security_scope(user, strict) UserScope
+        +principals_of(user, project_ids) frozenset
+        +cache_key_for_scope(scope, raw_key) str
+    }
+
+    class SecurityCascade {
+        <<module: services/security_cascade.py>>
+        +materialize_document_objects(doc, chunks, image_chunks) int
+        +sync_doc_row(document_id, fields) None
+        +cascade_image_derived(image_object_id) int
+        +push_payload_async(object_ids) None
+        +expire_acl_grants() int
+    }
+    note for SecurityCascade "收紧同步（PG 权威源零窗口）/ 放宽异步（payload 最终一致）"
+
+    class ImageSecurity {
+        <<module: services/image_security.py>>
+        +escalate_image_object(document_id, image_id, level, excluded, actor) DocumentObject
+        +list_image_objects(document_id) list
+    }
+    note for ImageSecurity "最小侵入：不修改 image_understanding/* 、vision_service.py、parsers/image_parser.py"
+
+    %% ── 新增：ORM ──────────────────────────────────────
+    class DocumentObject {
+        <<ORM: db/security_models.py>>
+        +str object_id
+        +UUID document_id
+        +str object_type
+        +str parent_object_id
+        +str inherited_from
+        +str tenant_id
+        +UUID owner_id
+        +str department_id
+        +str access_level
+        +str visibility_mode
+        +jsonb project_ids
+        +int security_level
+        +int parent_security_level
+        +int effective_security_level
+        +jsonb acl_allow
+        +jsonb acl_deny
+        +datetime acl_expires_at
+        +str acl_sync_state
+        +bool excluded
+        +str share_status
+        +int chunk_index
+        +str image_id
+    }
+    note for DocumentObject "doc / text_chunk / table / code / image 五种对象统一承载；excluded 为 PRD 之外的实现补字段"
+
+    class Project {
+        <<ORM>>
+        +str id
+        +str tenant_id
+        +str name
+        +UUID created_by
+    }
+
+    class ProjectMember {
+        <<ORM>>
+        +str project_id
+        +UUID user_id
+        +datetime expires_at
+    }
+
+    class AclGrant {
+        <<ORM>>
+        +UUID id
+        +str object_id
+        +str subject
+        +str effect
+        +str status
+        +UUID granted_by
+        +datetime expires_at
+    }
+    note for AclGrant "need-to-know 的权威源；pending 期间不写 acl_allow（A7）"
+
+    %% ── 关系 ───────────────────────────────────────────
+    UserScope *-- DocumentScope : 组合（base）
+    SecurityScope ..> UserScope : 签发（唯一入口）
+    ScopedQuery *-- UserScope : 绑定（scope 恒同一实例）
+    ScopedQuery ..> ScopePredicate : with_text 后 scope 不变 ⇒ 同一 pred
+    SecurityScope ..> ScopePredicate : build
+    UserScope ..> ScopePredicate : predicate()
+    SecurityPolicy ..> ScopePredicate : 消费
+    SecurityPolicy ..> ObjectACLView : 消费
+    SecurityPolicy ..> Decision : 产出
+    SecurityPolicy ..> DocumentScope : to_sql 内部复用 document_scope_clause
+    DocumentObject --> Document : document_id FK
+    DocumentObject --> DocumentObject : parent_object_id（OCR 派生 → 源图片）
+    Document --> User : owner_id FK
+    ProjectMember --> Project : project_id FK
+    ProjectMember --> User : user_id FK
+    AclGrant --> DocumentObject : object_id
+    SecurityCascade ..> DocumentObject : 物化 / 级联
+    SecurityCascade ..> Document : 双写（documents 行）
+    ImageSecurity ..> SecurityCascade : escalate → cascade_image_derived
+    AclGrant ..> DocumentObject : approved 后物化进 acl_allow

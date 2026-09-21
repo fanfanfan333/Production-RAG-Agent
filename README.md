@@ -1,6 +1,6 @@
 <div align="center">
 
-# RAG 智能助手
+# 企业LangGraphRAG 智能助手
 
 ### 企业私有知识库问答平台
 
@@ -703,7 +703,7 @@ Evidence Gate 是它之后的**确定性兜底**——不看语义，只看证�
 
 | 规则 | 原因 |
 | :-- | :-- |
-| **仅在贴底时跟随**（`pinnedRef` + `BOTTOM_THRESHOLD = 80px`） | 用户滚上去读历史 → 不打扰；改为显示「回到最新」按钮，由他决定何时回去 |
+| **仅在贴底时跟随**（`pinnedRef` + 迟滞双阈值 `LEAVE_BOTTOM_PX = 24` / `BACK_TO_BOTTOM_PX = 12`） | 用户滚上去读历史 → 不打扰；改为显示「回到最新」按钮，由他决定何时回去。离开用大阈值、回来用小阈值，中间地带保持原状态不横跳 |
 | **直接设 `scrollTop`，不用 `scrollIntoView`** | `scrollIntoView` 会连带滚动**所有祖先容器**，在嵌套布局里会把整页顶走 |
 | **流式期间用即时滚动**，不用 `behavior:"smooth"` | smooth 动画会被高频 token 不断打断重来，既追不上也费性能 |
 
@@ -784,6 +784,7 @@ cp .env.example .env
 | `POSTGRES_PASSWORD` | 无默认值，必须填写                           | compose 会读取该文件，留空会导致数据库启动失败                                      |
 | `JWT_SECRET`        | `dev-insecure-secret-change-me-...` | 生产环境必须更换：`openssl rand -hex 32`                                  |
 | `OLLAMA_BASE_URL`   | `http://localhost:11434`            | 后端跑在 Docker 内、Ollama 在宿主机时改为 `http://host.docker.internal:11434` |
+| `HTTP_NO_PROXY`     | `localhost,127.0.0.1,::1,host.docker.internal,backend,postgres,qdrant,keycloak` | 出网代理豁免。`httpx` 只认 `NO_PROXY` 环境变量、**不读** Windows 注册表的 `ProxyOverride`，不配会让本机/内网服务被送到代理并拿回 502 空响应体（症状是"模型不可用 / 链路不稳定"）。组件启动时把它**并入**（绝不覆盖）`NO_PROXY` / `no_proxy` |
 
 其余配置项均有合理默认值，本地开发可直接使用。完整说明见 `backend/.env.example` 注释与本文第八节。
 
@@ -1044,6 +1045,7 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 | `ENVIRONMENT` / `DEBUG`      | `production` / `false`（Swagger 将自动关闭）  |
 | `ALLOW_SELF_REGISTRATION`    | 生产环境建议设为 `false`，由管理员创建账号              |
 | Ollama / Qdrant / PostgreSQL | 不直接暴露公网，置于内网或反向代理之后                    |
+| 出网代理                         | 存在 `HTTP(S)_PROXY` 的网络里，确认 `NO_PROXY` 覆盖 Ollama / Qdrant / Keycloak 的主机名（`HTTP_NO_PROXY` 会自动并入，但容器外的客户端、curl 等需自行配置）—— 漏配不会报错，只会让链路静默降级 |
 
 ---
 

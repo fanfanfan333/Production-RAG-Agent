@@ -92,3 +92,23 @@ git_commit*.txt
 # 会话临时输出 / 一次性侦察产物（不入库）
 .scratch/
 backend/_recon.txt
+
+# ── 敏感内容：口令清单 / 个人简历 / 含真实漏洞细节的审计报告（严禁入库）──
+# test-accounts.md 含真实登录口令，即便已被 e2e 脚本泄漏也不再新增暴露面
+test-accounts.md
+docs/resume/
+docs/简历项目说明与补全建议.md
+deliverables/
+
+# ── 安全审计 / 诊断类报告（描述真实可被利用的隔离漏洞细节，不上传）──────
+docs/security_audit_rag_isolation.md
+docs/audit_parsing_and_vision.md
+docs/verification_golden_and_multimodal.md
+
+# ── 本机依赖镜像 / 大体积产物（262MB，严禁入库）──────────────────────
+_qa_pylibs/
+
+# ── 根目录会话侦察 / 临时产物（统一前缀 _）──────────────────────────
+/_*
+backend/_iq_t1.txt
+eval_cases.txt
