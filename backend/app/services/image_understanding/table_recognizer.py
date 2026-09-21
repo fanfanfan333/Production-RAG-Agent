@@ -30,6 +30,7 @@ Table Structure Recognition（表格结构识别）.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
 from PIL import Image
@@ -66,7 +67,18 @@ class TableStructure:
 
     @property
     def ok(self) -> bool:
-        return bool(self.markdown.strip()) and self.rows >= 1 and self.cols >= 1
+        """
+        这张表是否**可入库**.
+
+        硬性要求：有 Markdown、行列非空，且**列数 ≥ ``TABLE_IMAGE_MIN_COLS``**。
+        最后一条是 2026-09 补的：透视/阴影把框线切崩后，规则法会"塌"成 1 列，
+        旧判据（``cols>=1``）照样放行，于是往库里写了一张只有 1 列的畸形表 ——
+        比"还原失败退回 OCR 纯文本"更糟（错误的结构会污染检索）。宁可
+        ``ok=False`` 让调用方退回 OCR，也不输出 1 列垃圾表。
+        """
+        if not self.markdown.strip() or self.rows < 1 or self.cols < 1:
+            return False
+        return self.cols >= _min_cols_setting()
 
     def to_dict(self) -> dict:
         return {
@@ -254,8 +266,14 @@ def _escape(cell: str) -> str:
     return cell.replace("|", "\\|").replace("\n", " ").strip()
 
 
-def to_markdown(grid: list[list[str]]) -> str:
-    """二维单元格 → Markdown 表格（首行作表头）."""
+def to_markdown(grid: list[list[str]], caption: str = "") -> str:
+    """
+    二维单元格 → Markdown 表格（**首行作表头**）.
+
+    *caption* 是可选题注（表格上方的"表 3 xxx"）：**放在表格之前**，不占表头位。
+    保留它而不是丢掉，是因为题注常含"表 N / 单位 / 年份"等检索关键词，丢了就
+    再也找不回来；但它绝不能当表头（那正是本文件修的 P0）。
+    """
     if not grid or not grid[0]:
         return ""
     width = max(len(row) for row in grid)
@@ -267,7 +285,9 @@ def to_markdown(grid: list[list[str]]) -> str:
     ]
     for row in normalized[1:]:
         lines.append("| " + " | ".join(_escape(cell) for cell in row) + " |")
-    return "\n".join(lines)
+    table = "\n".join(lines)
+    cap = (caption or "").strip()
+    return f"{cap}\n\n{table}" if cap else table
 
 
 def _trim_grid(grid: list[list[str]]) -> list[list[str]]:
@@ -282,6 +302,98 @@ def _trim_grid(grid: list[list[str]]) -> list[list[str]]:
         if any(row[index].strip() for row in padded)
     ]
     return [[row[index] for index in keep_cols] for row in padded]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 题注（表格上方的标题）识别与剥离 —— 修复「标题行顶掉表头」
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# 缺陷：``to_markdown`` 把 ``grid[0]`` 当表头。真实文档里表格上方常有一行题注
+# （"表 3  2024 年度核心经营指标"）。在**无竖线**的表格上，OCR 行的 y 聚类会把
+# 这行题注也并进网格成为第 0 行 → **真表头被下移成数据行、表头文字整行丢失**。
+# `t1`（干净图 + 标题）即可复现，是最高频失效。
+#
+# 判据（三条互补，任一中即判为题注）：
+#   1. 整行只有 **1 个**非空单元 —— 表格表头至少 2 列，单块即题注；
+#   2. 行首文本匹配「表/图/Table/Figure + 编号」且非空单元 **≤2** —— 题注被
+#      OCR 拆成两块的情形（如「表 3」+「2024 年度核心经营指标」）；
+#   3. （在网格层）该行非空单元数 **< min_cols** —— 兜底：任何"不够列数"的
+#      首行都不是合格表头。
+#
+# 题注**不丢**：作为 caption 放在 Markdown 表格之前，并写进 ``meta["caption"]``。
+
+#: 题注首部：表 / 图 / 附表 / 附图 / Table / Figure + 编号
+_CAPTION_RE = re.compile(
+    r"^\s*(表|图|图表|附表|附图|table|figure|fig)\s*[\-–—:：.、]?\s*\d",
+    re.IGNORECASE,
+)
+
+
+def _min_cols_setting() -> int:
+    """``TABLE_IMAGE_MIN_COLS``（缺省 2，且下限为 2 —— 1 列不成表）."""
+    try:
+        value = int(getattr(get_settings(), "TABLE_IMAGE_MIN_COLS", 2) or 2)
+    except Exception:            # noqa: BLE001
+        value = 2
+    return max(2, value)
+
+
+def _non_empty(texts) -> list[str]:
+    return [str(t).strip() for t in texts if t is not None and str(t).strip()]
+
+
+def _is_caption_texts(texts) -> bool:
+    """一行文本是否像"表格题注/标题"（而非表头）."""
+    non = _non_empty(texts)
+    if not non:
+        return False
+    # 判据 1：单块 → 题注（表头 ≥ 2 列）
+    if len(non) == 1:
+        return True
+    # 判据 2：「表 N ...」被 OCR 拆成 ≤2 块
+    if len(non) <= 2 and _CAPTION_RE.match(" ".join(non)):
+        return True
+    return False
+
+
+def _strip_caption_rows(rows: list, *, min_cols: int) -> tuple[list[str], list]:
+    """
+    剥离**行级**（``_Line`` 列表）的前导题注行.
+
+    返回 ``(captions, body_rows)``。只剥前导行，且至少给表格留 1 行。
+    """
+    captions: list[str] = []
+    index = 0
+    while index < len(rows) - 1:
+        texts = [getattr(line, "text", "") for line in rows[index]]
+        non = _non_empty(texts)
+        if _is_caption_texts(texts) or len(non) < min_cols:
+            captions.append(" ".join(non))
+            index += 1
+            continue
+        break
+    return captions, rows[index:]
+
+
+def _strip_caption_grid(
+    grid: list[list[str]], *, min_cols: int
+) -> tuple[list[str], list[list[str]]]:
+    """剥离**网格级**（``list[list[str]]``）的前导题注行（同 :func:`_strip_caption_rows`）."""
+    captions: list[str] = []
+    index = 0
+    while index < len(grid) - 1:
+        row = grid[index]
+        non = _non_empty(row)
+        if _is_caption_texts(row) or len(non) < min_cols:
+            captions.append(" ".join(non))
+            index += 1
+            continue
+        break
+    return captions, grid[index:]
+
+
+def _join_caption(captions: list[str]) -> str:
+    return " ".join(c for c in (s.strip() for s in captions) if c)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -499,10 +611,21 @@ def _from_rules_with_cell_ocr(
         )
 
     grid = grid[:max_rows]
+    # 题注剥离（防御性）：框线法的行区间本就在表格框内，正常不含题注；但
+    # 万一题注行恰好落在首/末框线之间，这里仍保证不把它当表头。
+    captions, grid = _strip_caption_grid(grid, min_cols=min_cols)
+    if len(grid) < min_rows:
+        return TableStructure(method="failed", meta={"reason": "caption-only-grid"})
+    cols = max(len(r) for r in grid)
+    if cols < min_cols:
+        return TableStructure(
+            method="failed", meta={"reason": f"degenerate-cols={cols}"}
+        )
+    caption = _join_caption(captions)
     return TableStructure(
-        markdown=to_markdown(grid),
+        markdown=to_markdown(grid, caption=caption),
         rows=len(grid),
-        cols=max(len(r) for r in grid),
+        cols=cols,
         header=grid[0],
         method="rules+cell-ocr",
         meta={
@@ -511,6 +634,7 @@ def _from_rules_with_cell_ocr(
             "v_rules": len(col_positions),
             "cells_recognized": recognized,
             "cells_filled": filled,
+            "caption": caption,
         },
     )
 
@@ -570,15 +694,25 @@ def _from_rules(
         )
     grid = grid[:max_rows]
 
-    markdown = to_markdown(grid)
+    # 题注剥离 + 列数退化拦截（透视/阴影把框线切崩时会塌列）
+    captions, grid = _strip_caption_grid(grid, min_cols=min_cols)
+    if len(grid) < min_rows:
+        return TableStructure(method="failed", meta={"reason": "caption-only-grid"})
+    cols = max(len(r) for r in grid)
+    if cols < min_cols:
+        return TableStructure(
+            method="failed", meta={"reason": f"degenerate-cols={cols}"}
+        )
+
+    markdown = to_markdown(grid, caption=_join_caption(captions))
     return TableStructure(
         markdown=markdown,
         rows=len(grid),
-        cols=max(len(r) for r in grid),
+        cols=cols,
         header=grid[0],
         method=method,
         meta={"page": page_number, "h_rules": len(row_positions),
-              "v_rules": len(col_positions)},
+              "v_rules": len(col_positions), "caption": _join_caption(captions)},
     )
 
 
@@ -598,9 +732,16 @@ def _from_alignment(
             method="failed", meta={"reason": f"rows={len(rows)}<{min_rows}"}
         )
 
+    # ── 题注剥离（**必须在推断列中心之前**）────────────────────────────────
+    # 题注的 x0 往往既不是列起点、又比正文窄，若把它算进列锚点会凭空造出
+    # 一个"题注列"；先剥掉，列中心才干净。题注文本保留下来当 caption。
+    captions, body_rows = _strip_caption_rows(rows, min_cols=min_cols)
+    if len(body_rows) < min_rows:
+        return TableStructure(method="failed", meta={"reason": "caption-only-grid"})
+
     # 列锚点来自"每行的起始 x"，比用全部文字块聚类更稳
     anchors: list[float] = []
-    for row in rows:
+    for row in body_rows:
         if row:
             anchors.append(row[0].x0)
             # 一行里有多个明显分开的文字块（gap 较大）也算一个新列的起点
@@ -618,13 +759,25 @@ def _from_alignment(
         )
     column_centers = column_centers[:max_cols]
 
-    grid = [_row_cells_by_alignment(row, column_centers) for row in rows]
+    grid = [_row_cells_by_alignment(row, column_centers) for row in body_rows]
     grid = _trim_grid(grid)
     if len(grid) < min_rows:
         return TableStructure(
             method="failed", meta={"reason": f"rows={len(grid)}<{min_rows}"}
         )
     grid = grid[:max_rows]
+
+    # 网格层兜底：确保首行是"非空单元 ≥ min_cols"的合格表头（把任何漏网的
+    # 题注/前言行再剥一层），列数不足则直接判失败（不输出 1 列垃圾表）。
+    extra, grid = _strip_caption_grid(grid, min_cols=min_cols)
+    captions += extra
+    if len(grid) < min_rows:
+        return TableStructure(method="failed", meta={"reason": "caption-only-grid"})
+    cols = max(len(r) for r in grid)
+    if cols < min_cols:
+        return TableStructure(
+            method="failed", meta={"reason": f"degenerate-cols={cols}"}
+        )
 
     # 大多数行只有一个单元格 → 这更像段落而不是表格
     multi = sum(1 for row in grid if sum(1 for c in row if c.strip()) >= 2)
@@ -633,13 +786,14 @@ def _from_alignment(
             method="failed", meta={"reason": f"multi-cell rows={multi}/{len(grid)}"}
         )
 
+    caption = _join_caption(captions)
     return TableStructure(
-        markdown=to_markdown(grid),
+        markdown=to_markdown(grid, caption=caption),
         rows=len(grid),
-        cols=max(len(r) for r in grid),
+        cols=cols,
         header=grid[0],
         method="ocr-alignment",
-        meta={"page": page_number, "multi_cell_rows": multi},
+        meta={"page": page_number, "multi_cell_rows": multi, "caption": caption},
     )
 
 
@@ -678,13 +832,24 @@ def _from_text_lines(lines: list, *, page_number: int) -> TableStructure:
     if not grid:
         return TableStructure(method="failed", meta={"reason": "empty-text-grid"})
 
+    # 题注剥离（同前）：文本兜底路径同样不该把"表 N xxx"当表头。
+    captions, grid = _strip_caption_grid(grid, min_cols=max(2, best))
+    if not grid:
+        return TableStructure(method="failed", meta={"reason": "caption-only-grid"})
+    cols = max(len(r) for r in grid)
+    if cols < max(2, best):
+        return TableStructure(
+            method="failed", meta={"reason": f"degenerate-cols={cols}"}
+        )
+
     return TableStructure(
-        markdown=to_markdown(grid),
+        markdown=to_markdown(grid, caption=_join_caption(captions)),
         rows=len(grid),
-        cols=max(len(r) for r in grid),
+        cols=cols,
         header=grid[0],
         method="text-split",
-        meta={"page": page_number, "degraded": "no-ocr-coordinates"},
+        meta={"page": page_number, "degraded": "no-ocr-coordinates",
+              "caption": _join_caption(captions)},
     )
 
 

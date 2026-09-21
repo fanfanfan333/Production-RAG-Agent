@@ -122,7 +122,20 @@ _NUMBER_RE = re.compile(r"\d+(?:\.\d+)?")
 
 @dataclass
 class RewriteResult:
-    """改写结果（字段全部有安全默认，失败时等价于"什么都没做"）."""
+    """
+    改写结果（字段全部有安全默认，失败时等价于"什么都没做"）.
+
+    ⚠️【T3 决策 15-6 约束 —— 后来者必读】本结果**永远只含字符串**，
+    **不得新增任何权限相关字段**（主体 / 部门 / 公司 / 密级 / 项目 等一律不加）。
+
+    理由：改写缓存 key（见 :func:`_cache_put`）**刻意不带**请求级权限指纹 ——
+    指纹里含用户维度，带上会让命中率从"全公司共享"掉到"每人一份"（≈0），而改写
+    是 1-3 秒的 LLM 往返，是链路里最贵的一步之一。缓存串味的风险只是"某人的问题
+    文本被复用"（问题原文本就出现在他自己的请求里），**不是**权限泄漏。
+
+    **前提**：这里永远不含权限字段。一旦真的要给本结果加权限相关字段，
+    **必须同时**把请求级权限指纹加进缓存 key —— 否则就会串味。
+    """
 
     rewritten: str
     variants: list[str] = field(default_factory=list)
@@ -191,6 +204,14 @@ def _cache_get(key: str, ttl: float) -> RewriteResult | None:
 
 
 def _cache_put(key: str, value: RewriteResult, max_entries: int) -> None:
+    """
+    写入改写缓存（TTL + LRU）.
+
+    约束（T3 决策 15-6，**刻意**）：``key`` 保持 ``f"{query}\\x00{history_fingerprint}"``，
+    **不带**请求级权限指纹 —— 因为 ``value``（:class:`RewriteResult`）里只有字符串、
+    不含任何权限数据，缓存不可能串味到权限。若日后 :class:`RewriteResult` 新增了
+    任何权限相关字段，**必须同时**把权限指纹加进这里与 :func:`_cache_get` 的 key。
+    """
     _rewrite_cache[key] = (time.monotonic(), value)
     _rewrite_cache.move_to_end(key)
     while len(_rewrite_cache) > max(1, max_entries):
@@ -309,6 +330,12 @@ async def rewrite_query(
 
     （真正的实现体是 :func:`_rewrite_query_impl` —— 拆开是为了能在**所有**
     出口统一记一笔，而不是在十几个 return 前各抄一遍。）
+
+    ⚠️【T3 决策 15-4 约束】本函数签名**永久**为 ``(query, history_messages)``：
+    **禁止**新增任何主体 / 公司 / 部门 / 项目 / 密级 参数 —— 任何权限信息都
+    **不得**进入改写（它是纯文本组件，其 prompt 会被外发给 LLM；把组织架构
+    推给一个可能记录日志、可被提示注入的组件，等于反向泄密）。
+    文本与权限的绑定由检索层 ``ScopedQuery`` 承担（文本可换、权限不可换）。
     """
     result = await _rewrite_query_impl(query, history_messages)
     try:

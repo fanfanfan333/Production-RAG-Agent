@@ -17,6 +17,8 @@ Vision Analyzer（三层路由里的 Vision 支路）.
 
 from __future__ import annotations
 
+import re
+
 from app.config import get_settings
 from app.services.image_understanding.structured_content import (
     IMAGE_TYPE_CHART,
@@ -109,6 +111,30 @@ FALLBACK_PROMPT = (
     "用中文输出，只输出转写内容本身，不要任何前缀或解释。"
 )
 
+# 无文字图片的"图意总结"提示词（实施手册 3.3.1）。
+#
+# 触发条件很明确：OCR、结构化引擎、以及上面的转写/按类型提示词**全都没有产出
+# 任何文字**。此时这张图在分块阶段会被直接跳过（手册把"图片在分块阶段被跳过"
+# 列为最典型的丢信息问题），所以这里换个目标 —— 不要求"转写出图里的字"，
+# 而是要求"描述这张图是什么"，让这张图仍然拥有可检索的文本。
+#
+# 三段式（图注 + 关键要素 + 数值信息）直接取自手册 3.3.1 与表 3-2：
+# 「生成图注、关键要素、数值信息三段式描述」→「涉及视觉信息的问答可被召回」；
+# 「描述中缺少数值」是不推荐做法 →「强制输出峰值、均值等关键数值」。
+# 最后两句是给 VLM 幻觉兜底：看不清就不要猜（质检里的 VLM 幻觉检查也认这个口径）。
+TEXTLESS_SUMMARY_PROMPT = (
+    "这张图片里没有被识别出任何文字。请改为**描述图意**，按下面三段输出，"
+    "每段先写段名再写内容：\n"
+    "1) 图注：一句话说明这是什么图（照片/示意图/流程图/图表/界面截图/公式图形等）"
+    "以及它表达的主题；\n"
+    "2) 关键要素：逐个列出图中可见的对象、模块、节点、区域、颜色或图例的含义；\n"
+    "3) 数值信息：给出图中明确标注的数值（峰值、总量、比例、坐标轴刻度等）；"
+    "若图中确实没有任何数字，写「图中未标注数值」。\n"
+    "只描述图上真实可见的内容，看不清或不确定的部分写「不确定」，"
+    "**不要编造**图中不存在的对象与数值。\n"
+    "用中文输出，只输出这三段内容本身，不要任何前缀或解释。"
+)
+
 _PROMPTS = {
     IMAGE_TYPE_CHART: CHART_PROMPT,
     IMAGE_TYPE_DIAGRAM: DIAGRAM_PROMPT,
@@ -121,6 +147,61 @@ _PROMPTS = {
 
 def prompt_for(image_type: str) -> str:
     return _PROMPTS.get(image_type, CHART_PROMPT)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 提示词复读检测（"模型把指令原文当答案吐回来"）
+#
+# 实测（qwen2.5vl:3b，CPU，一张无文字示意图）：兜底转写提示词被模型**逐条复读**
+# 回来，但开头那句带"请尽最大努力"的话被丢掉了 —— 于是 quality.py 里按关键词
+# 匹配的 ``_PROMPT_LEAK_MARKERS`` 一个都没命中，这段**指令**被当成"图意描述"
+# 写进 ``vision_caption`` 并随图片分块入库：检索命中的是提示词，不是图片内容。
+#
+# 所以判据不能只靠关键词，要看**重合度**：把模型输出的每一行压成"文字骨架"
+# （去掉行首编号/项目符号与所有空白），看有多少条能在提示词的骨架里原样找到。
+# 复读时重合度接近 1，真实描述接近 0。
+# ─────────────────────────────────────────────────────────────────────────────
+
+#: 行首的列表编号 / 项目符号（``1)`` ``2.`` ``三、`` ``(4)`` ``•`` ``-``）
+_ECHO_LIST_MARKER_RE = re.compile(
+    r"(?m)^[ \t]*(?:\(\s*\d+\s*\)|\d+\s*[).、:：]"
+    r"|[一二三四五六七八九十]+\s*[)）、.:：]|[-*•·])[ \t]*"
+)
+#: 比对前的空白（含换行）一律去掉 —— 复读时换行/缩进经常被模型改动
+_ECHO_WS_RE = re.compile(r"\s+")
+
+#: 参与比对的行至少要有这么多字（太短的行容易"碰巧"出现在提示词里）
+_ECHO_LINE_MIN_CHARS = 6
+#: 命中行数占比达到此值即判为复读（真跑实测复读时为 6/6 = 1.0）
+_ECHO_LINE_RATIO = 0.6
+
+
+def _echo_skeleton(text: str) -> list[str]:
+    """把文本压成"可比对的行骨架"：去掉行首编号/项目符号与全部空白."""
+    lines: list[str] = []
+    for raw in (text or "").splitlines():
+        line = _ECHO_WS_RE.sub("", _ECHO_LIST_MARKER_RE.sub("", raw))
+        if len(line) >= _ECHO_LINE_MIN_CHARS:
+            lines.append(line)
+    return lines
+
+
+def looks_like_prompt_echo(text: str, prompt: str | None) -> bool:
+    """
+    该输出是不是把**提示词自己**复读回来了？
+
+    真复读 → 这段文字与图片内容无关，不能进 ``vision_caption``、更不能入库。
+    """
+    if not text or not prompt:
+        return False
+    out_lines = _echo_skeleton(text)
+    if len(out_lines) < 2:
+        return False
+    prompt_body = _ECHO_WS_RE.sub("", _ECHO_LIST_MARKER_RE.sub("", prompt))
+    if not prompt_body:
+        return False
+    hits = sum(1 for line in out_lines if line in prompt_body)
+    return hits >= 2 and hits / len(out_lines) >= _ECHO_LINE_RATIO
 
 
 def analyze_image_sync(
@@ -173,4 +254,8 @@ __all__ = [
     "FORMULA_PROMPT",
     "CODE_RESCUE_PROMPT",
     "FALLBACK_PROMPT",
+    # 无文字图片的图意总结（实施手册 3.3.1 三段式）
+    "TEXTLESS_SUMMARY_PROMPT",
+    # 提示词复读检测（模型把指令原文当答案吐回来）
+    "looks_like_prompt_echo",
 ]

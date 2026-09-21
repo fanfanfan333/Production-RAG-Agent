@@ -22,14 +22,18 @@ Document Agent（最终效果：Word 写入 / Word 插入图片）.
 
 from __future__ import annotations
 
+import json
+import os
 import re
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from app.config import get_settings
+from app.db.user_models import User
 from app.services.storage import resolve_image_path
+from app.services.tenancy import can_access_document, request_scope
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -83,21 +87,222 @@ def output_dir() -> Path:
     return root
 
 
+def _safe_generated_name(filename: str | None) -> str | None:
+    """
+    产物文件名的合法性校验（目录穿越防护的**唯一**实现点）.
+
+    只接受不含分隔符、不含父引用的纯文件名；其余一律视为不合法。
+    ``resolve_generated_file`` 与 sidecar 元数据的读写共用它，保证两者对
+    "什么是一个合法产物名"的判断完全一致 —— 否则会出现"产物能取到、
+    元数据取不到（或反之）"的错位，让归属校验落空。
+    """
+    if not filename:
+        return None
+    if "/" in filename or "\\" in filename or ".." in filename:
+        return None
+    return filename
+
+
+def _in_output_dir(name: str) -> Path | None:
+    """把 *name* 解析到输出目录内的绝对路径；落点不在根目录则 None."""
+    base = output_dir().resolve()
+    candidate = (base / name).resolve()
+    if candidate.parent != base:
+        return None
+    return candidate
+
+
 def resolve_generated_file(filename: str) -> Path | None:
     """
     Resolve a generated-document filename to an absolute path (traversal-safe).
 
     Only plain file names are accepted — no separators, no parent references.
     """
-    if not filename:
+    if _safe_generated_name(filename) is None:
         return None
-    if "/" in filename or "\\" in filename or ".." in filename:
-        return None
-    candidate = (output_dir() / filename).resolve()
-    base = output_dir().resolve()
-    if candidate.parent != base:
+    candidate = _in_output_dir(filename)
+    if candidate is None:
         return None
     return candidate if candidate.is_file() else None
+
+
+# ── 产物归属元数据（sidecar）──────────────────────────────────────────────────
+#
+# 产物是落盘的 .docx，**文件名与磁盘路径上都没有任何归属信息**。下载端点因此
+# 只剩"认或不认"两种单选：
+#   · 认   → 任何登录用户猜到文件名就能下载别人的产物（P0 越权，且能绕过
+#            检索前过滤 / 检索后 ACL / LLM 输入前校验整条隔离链路）；
+#   · 不认 → 连本人也下载不了。
+# 破局的办法是让产物**自带归属**：每次生成都写一份同名 sidecar JSON，记录
+# 所有者与它引用的源文档 id。下载端点据此判定，元数据缺失时 fail-closed。
+
+GENERATED_META_SUFFIX = ".meta.json"
+
+
+def meta_path_for(filename: str) -> Path | None:
+    """产物 *.docx* 对应的 sidecar 元数据绝对路径（同目录、同名 + 后缀）。"""
+    if _safe_generated_name(filename) is None:
+        return None
+    return _in_output_dir(filename + GENERATED_META_SUFFIX)
+
+
+def write_generated_meta(
+    filename: str,
+    *,
+    owner_id: object | None,
+    source_document_ids: list[str],
+    title: str = "",
+) -> Path:
+    """
+    写入产物的归属元数据（原子替换，杜绝"半截 JSON"）.
+
+    Raises:
+        ValueError: *filename* 非法（落到输出目录之外或含穿越片段）。
+    """
+    path = meta_path_for(filename)
+    if path is None:
+        raise ValueError(f"非法的产物文件名: {filename!r}")
+
+    payload = {
+        "filename": filename,
+        "title": title,
+        "owner_id": str(owner_id) if owner_id is not None else None,
+        "source_document_ids": list(source_document_ids),
+        "created_at": datetime.now(tz=timezone.utc).isoformat(),
+    }
+
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, path)
+    return path
+
+
+def read_generated_meta(filename: str) -> dict | None:
+    """
+    读取产物归属元数据。
+
+    缺失 / 不可解析 / 结构不对一律返回 ``None`` —— **从不抛给调用方**，由调用
+    方按 fail-closed 处理（拿不到归属 = 不许下载）。
+    """
+    path = meta_path_for(filename)
+    if path is None or not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:      # noqa: BLE001 — 任何读入失败都按"无归属"处理
+        logger.warning("Unreadable generated meta for '%s': %s", filename, exc)
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def source_document_ids_of(chunks: list) -> list[str]:
+    """从参与生成的 chunks 提取去重后的源文档 id（保序）。"""
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for chunk in chunks or []:
+        raw = getattr(chunk, "document_id", None)
+        if raw is None:
+            continue
+        doc_id = str(raw).strip()
+        if doc_id and doc_id not in seen:
+            seen.add(doc_id)
+            ordered.append(doc_id)
+    return ordered
+
+
+async def _load_source_documents(document_ids: list[str]) -> list:
+    """
+    按 id 取出产物引用的源文档行（保序，取不到的位置填 ``None``）.
+
+    返回空列表表示"连 id 都解析不了 / 查不出来"，调用方按拒绝处理。
+    """
+    from sqlalchemy import select
+
+    from app.db.models import Document
+    from app.db.postgres import get_db_session
+
+    parsed: list[uuid.UUID] = []
+    for raw in document_ids:
+        try:
+            parsed.append(uuid.UUID(str(raw)))
+        except (TypeError, ValueError):
+            logger.warning("Invalid source document id in generated meta: %r", raw)
+            return []
+
+    async with get_db_session() as session:
+        rows = (
+            await session.execute(select(Document).where(Document.id.in_(parsed)))
+        ).scalars().all()
+    by_id = {row.id: row for row in rows}
+    return [by_id.get(pid) for pid in parsed]
+
+
+async def authorize_generated_file(
+    filename: str,
+    user: User | None,
+) -> tuple[Path | None, str]:
+    """
+    判定调用者能否下载某个 Document Agent 产物（**fail-closed**）.
+
+    Returns:
+        ``(产物绝对路径, 决策说明)`` —— 放行的路径非 ``None``；
+        ``(None, 原因)`` 表示拒绝。**原因只写日志**，绝不出现在响应里。
+
+    判定顺序：
+        ① 未登录 / 文件不存在              → 拒绝
+        ② sidecar 归属记录缺失或不可解析   → 拒绝（无法确定归属即放行 = 越权）
+        ③ ``owner_id`` == 调用者           → 放行（产物所有者）
+        ④ 调用者对记录的**全部**源文档都能
+           过 ``can_access_document``      → 放行（被授权的协作者）
+        ⑤ 其余（源列表为空 / 源文档缺失 /
+           任一源文档不可见）              → 拒绝
+
+    为什么 ④ 要求"**全部**"而不是"任一"：产物是多条来源片段的合订本，只要
+    有一条源文档对调用者不可见，放行就等于把那条的内容泄露出去。这里复用
+    ``tenancy.request_scope`` + ``tenancy.can_access_document`` —— 与图片回显
+    端点同一个判定范式，不另发明一套权限检查。
+    """
+    if user is None or getattr(user, "id", None) is None:
+        return None, "anonymous"
+
+    resolved = resolve_generated_file(filename)
+    if resolved is None:
+        return None, "missing"
+
+    meta = read_generated_meta(filename)
+    if meta is None:
+        return None, "no-ownership-record"
+
+    owner_raw = meta.get("owner_id")
+    owner_uuid: uuid.UUID | None = None
+    if owner_raw:
+        try:
+            owner_uuid = uuid.UUID(str(owner_raw))
+        except (TypeError, ValueError):
+            owner_uuid = None
+    if owner_uuid is not None and owner_uuid == getattr(user, "id", None):
+        return resolved, "owner"
+
+    raw_source_ids = meta.get("source_document_ids")
+    if not isinstance(raw_source_ids, list) or not raw_source_ids:
+        return None, "no-source-binding"
+
+    docs = await _load_source_documents([str(x) for x in raw_source_ids])
+    if len(docs) != len(raw_source_ids) or not docs:
+        return None, "source-unresolvable"
+
+    scope = await request_scope(user)
+    for doc in docs:
+        if doc is None:
+            return None, "source-missing"
+        if not can_access_document(
+            doc,
+            user,
+            tenant_ids=scope.tenant_ids,
+            owns_tenant_ids=scope.owns_tenant_ids,
+        ):
+            return None, "source-denied"
+    return resolved, "source-access"
 
 
 # ── Markdown 表格 → Word 表格 ─────────────────────────────────────────────────
@@ -318,9 +523,16 @@ def generate_document(
     chunks: list,
     *,
     title: str | None = None,
+    owner_id: object | None = None,
+    source_document_ids: list[str] | None = None,
 ) -> GeneratedDocument:
     """
     生成一份 Word 文档并落盘，返回可下载的产物信息.
+
+    ``owner_id`` 是调用者的 User.id（第三层会话归属），``source_document_ids``
+    缺省由 *chunks* 推导 —— 二者写入 sidecar，成为下载端点**唯一**的归属依据。
+    不传 ``owner_id`` 时产物写入后来无人能下载的归属记录（fail-closed），因此
+    调用方（master graph 节点）应当始终带上当前用户。
 
     失败时返回带 ``error`` 的 GeneratedDocument（不抛异常）——调用方
     （master graph 节点）据此决定回退为纯文本回答。
@@ -347,6 +559,33 @@ def generate_document(
             filename="", download_url="", title=info.title, error=str(exc),
         )
 
+    # ── 产物归属：没有 sidecar 的产物在下载端点会被 fail-closed 拒掉 ────────
+    # 因此这里把"写元数据"当成生成的必要步骤：失败就撤销产物并返回 error，
+    # 不让磁盘上留下本人也下载不了的孤儿文件。
+    bound_sources = (
+        source_document_ids
+        if source_document_ids is not None
+        else source_document_ids_of(chunks)
+    )
+    try:
+        write_generated_meta(
+            filename,
+            owner_id=owner_id,
+            source_document_ids=bound_sources,
+            title=info.title,
+        )
+    except Exception as exc:      # noqa: BLE001
+        logger.exception("Document Agent failed to write ownership meta: %s", exc)
+        try:
+            target.unlink(missing_ok=True)
+        except Exception as cleanup_exc:  # noqa: BLE001
+            logger.warning(
+                "Failed to remove orphan artifact '%s': %s", filename, cleanup_exc
+            )
+        return GeneratedDocument(
+            filename="", download_url="", title=info.title, error=str(exc),
+        )
+
     info.filename = filename
     info.download_url = f"{settings.DOCUMENT_DOWNLOAD_PREFIX}/{filename}"
     info.size_bytes = size
@@ -369,8 +608,14 @@ def build_fallback_summary(query: str, info: GeneratedDocument) -> str:
 
 __all__ = [
     "GeneratedDocument",
+    "GENERATED_META_SUFFIX",
+    "authorize_generated_file",
     "generate_document",
+    "meta_path_for",
+    "read_generated_meta",
     "resolve_generated_file",
     "output_dir",
+    "source_document_ids_of",
     "build_fallback_summary",
+    "write_generated_meta",
 ]

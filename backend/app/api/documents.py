@@ -143,38 +143,70 @@ async def upload_documents(
         DEFAULT_DOCUMENT_ACCESS_LEVEL,
         access_scope_name,
         is_platform_admin,
+        is_valid_tenant_id,
         normalize_access_level,
+        normalize_tenant_id,
         publish_requirement,
     )
 
     is_admin = is_platform_admin(user)
 
-    # ── 决策 6：平台管理员上传**必须**指定归属的测试公司 ─────────────────────
-    # admin 的 effective_tenant_id 是 "default"（历史占位租户，不属于任何注册公司）。
-    # 产品口径：admin 上传的文档必须显式归属一个**自建测试公司**（tenant_id = 该
-    # 公司 id），便于「测试公司」统一管理；非 admin 一律归属本公司（company_id 被忽略）。
+    # ── 决策 6：平台管理员上传**必须**显式指定归属公司 ───────────────────────
+    # admin 的 effective_tenant_id 是 "default"（历史占位租户，不属于任何注册公司），
+    # 而它的 request_scope 本身包含 default —— 也就是说 admin **看得见**自己这块空间
+    # 里的文档（/companies/accessible 里 default 的 doc_count 就是实证）。所以决策 6
+    # 的实质不是"把 admin 关在测试公司里"，而是"不许落到随机的占位租户"：
+    #   · 必须显式选择（不选 → 400）；
+    #   · 不能选别人的公司（越界 → 403）；
+    #   · 合法目标 = 调用者自己的所属租户（对 admin 而言就是 default，前端显示
+    #     为「管理员」）∪ 自建测试公司集合。
+    # 不放行 default 会造成"看得见、点了必 403"的假选项，因此这里按可见性放行。
+    #
+    # 判据顺序按一条原则排列：**自己的空间永远可以传**。所以「选的就是自己」
+    # 这条先判、命中即放行，与调用者有没有创建过公司无关（不是"创建过公司才有
+    # 资格传"）；没创建过公司只在"没选 / 选了别人的"时才构成 400 / 403。
     upload_tenant_id = effective_tenant_id(user)
     if is_admin:
         from app.services.company_registry import tenant_ids_created_by
 
         owned = await tenant_ids_created_by(user.id)
-        if not owned:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="暂无测试公司，请先创建公司",
-            )
         chosen = (company_id or "").strip()
-        if not chosen:
+        # ⚠️ 空串必须先排除：normalize_tenant_id("") 会回落成 "default"，若在这
+        # 里参与比较，"未选择"会被误判成"选了自己"从而绕过下面的 400。
+        #
+        # 【T5 上线前修复】**非空但非法**的串同样不能进入比较：normalize_tenant_id
+        # 会把 "@@@随便@@@" 一律归一化成 "default"，与 admin 的 upload_tenant_id
+        # 相等 ⇒ 又被判成"选了自己"，400 / 403 双双失效、文档静默落到 default。
+        # 因此"给了标识"这件事必须先用**不归一化**的校验确认成真。
+        if chosen and not is_valid_tenant_id(chosen):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="请选择归属的测试公司",
+                detail="归属公司标识不合法",
             )
-        if chosen not in owned:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="只能上传到你**自己创建**的测试公司",
-            )
-        upload_tenant_id = chosen
+        chosen_is_self = bool(chosen) and normalize_tenant_id(chosen) == upload_tenant_id
+
+        if chosen_is_self:
+            # 「管理员」（default）就是 admin 自己的空间：不在 owned 里，但与它的
+            # effective_tenant_id 相同，属于恒合法的归属目标——即便它一家公司都没
+            # 创建过，也允许上传到这里。
+            upload_tenant_id = normalize_tenant_id(chosen)
+        else:
+            if not owned:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="暂无测试公司，请先创建公司",
+                )
+            if not chosen:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="请选择归属公司",
+                )
+            if chosen not in owned:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="只能上传到你创建的测试公司或管理员空间",
+                )
+            upload_tenant_id = chosen
 
     if access_level is None or not str(access_level).strip():
         # admin 默认落「公司库」（测试公司内成员才检索得到素材）；其余角色沿用

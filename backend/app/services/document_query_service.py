@@ -130,6 +130,7 @@ async def list_documents(
     company_id: str | None = None,
     viewer: User | None = None,
     access_level: str | None = None,
+    scope: "UserScope | None" = None,
 ) -> DocumentListResponse:
     """
     Return a paginated list of Document rows, optionally filtered by status,
@@ -163,9 +164,24 @@ async def list_documents(
             count_q = count_q.where(Document.status == status)
 
         # ── 三层隔离：唯一 SQL 组装点（公司边界 ∪ 自己个人库，与检索同规则）────
+        # V-03：传入五维 ``UserScope`` 时改用 ``to_sql(pred, Document)`` 下推
+        # （三维 ``document_scope_clause`` 已被其内部复用，并追加密级 / 项目 /
+        # deny / excluded 四个维度）。编译失败 fail-closed 返回空，绝不降级放行。
         from app.services.tenancy import document_scope_clause
 
-        if (
+        if scope is not None:
+            from app.services.security_policy import to_sql
+
+            try:
+                sec_filter = to_sql(scope.predicate(), Document)
+            except Exception:      # noqa: BLE001 — 编译失败不得静默放行
+                logger.exception(
+                    "list_documents: to_sql(pred) 编译失败 — fail-closed 返回空"
+                )
+                return DocumentListResponse(items=[], total=0, page=page, limit=limit)
+            base_q = base_q.where(sec_filter)
+            count_q = count_q.where(sec_filter)
+        elif (
             owner_id is not None
             or tenant_ids is not None
             or tenant_wide
@@ -474,6 +490,7 @@ async def get_document_chunks(
     owns_tenant_ids: frozenset[str] = frozenset(),
     user_department_id: str | None = None,
     tenant_wide: bool = False,
+    pred=None,
 ) -> dict:
     """
     Fetch the full ordered chunk list of one document for原文预览.
@@ -489,6 +506,11 @@ async def get_document_chunks(
         tenant_wide: 企业/知识库管理员可跨部门预览本公司的部门库与公司库文档。
                      **他人个人库文档对他们同样不可预览**（审核共享申请时只
                      看申请单上的文件名/申请人/目标层级，不展示正文）。
+        pred:        【T4】**可选**的 :class:`ScopePredicate`（决策 16：引用点击再校验）。
+                    给出时：① 文档级先过一次 :func:`allows`（不通过 → KeyError 404）；
+                    ② 返回前**逐 chunk** 查 ``document_objects`` 再 :func:`allows`，
+                    被剔除的 chunk **不出现在返回列表里**（不返回占位符），并写
+                    ``acl.drop.citation_open`` 审计。不给则行为**逐字不变**。
 
     Returns:
         {"document_id", "filename", "page_count", "total", "chunks": [...]}
@@ -519,6 +541,16 @@ async def get_document_chunks(
 
     if doc is None:
         raise KeyError("文档不存在或无权访问")
+
+    # ── 1.5【T4】文档级五维判定（密级 / 项目 / deny / excluded 的对象级复核前置）──
+    # 三层（tenant/department/private）已由上面的 document_scope_clause 判定；
+    # 这里补上新增的两个维度，保证"文档级不可见"也返回与"不存在"逐字一致的 404。
+    if pred is not None:
+        from app.services.security_cascade import document_view
+        from app.services.security_policy import allows
+
+        if not allows(pred, document_view(doc)).allowed:
+            raise KeyError("文档不存在或无权访问")
 
     # ── 2. Scroll all chunks from Qdrant ──────────────────────────────────────
     from qdrant_client.http import models as qmodels
@@ -561,6 +593,7 @@ async def get_document_chunks(
             except (TypeError, ValueError):
                 page_number = 1
             raw.append((
+                str(p.id),
                 chunk_index,
                 page_number,
                 str(payload.get("text", "")),
@@ -580,7 +613,8 @@ async def get_document_chunks(
             break
         offset = next_offset
 
-    raw.sort(key=lambda t: t[0])
+    # 阅读顺序按 chunk_index（元组里第 2 个字段；point_id 在第 1 位供 ACL 反查）
+    raw.sort(key=lambda t: t[1])
     chunks = [
         {
             "chunk_index": ci,
@@ -599,8 +633,12 @@ async def get_document_chunks(
             "analyze_quality": aq,
             "analyze_fusion": af,
         }
-        for ci, pn, text, ls, le, ct, iid, ipath, pos, bbox, aq, af in raw
+        for _pid, ci, pn, text, ls, le, ct, iid, ipath, pos, bbox, aq, af in raw
     ]
+
+    # ── 3.【T4】逐 chunk 对象级再校验（决策 16）───────────────────────────────
+    if pred is not None:
+        chunks = await _filter_citation_chunks(document_id, pred, raw)
 
     logger.info(
         "get_document_chunks id=%s filename='%s' → %d chunks",
@@ -614,3 +652,106 @@ async def get_document_chunks(
         "total": len(chunks),
         "chunks": chunks,
     }
+
+
+async def _filter_citation_chunks(
+    document_id: uuid.UUID, pred, raw: list[tuple]
+) -> list[dict]:
+    """
+    引用点击回源时的**逐 chunk**对象级过滤（第 12 环同源的 ``allows``）.
+
+    - 每个 chunk 的 ``object_id`` 由 :func:`make_object_id` 从
+      ``(document_id, qdrant_point_id)`` 构造，与入库物化时**逐字一致**。
+    - 被剔除的 chunk **不出现在返回列表里**（不返回占位符 —— 占位符等于承认
+      "这里有东西被藏了"，本身就是存在性信息）。
+    - 被剔除的对象写一条 ``acl.drop.citation_open`` 审计。
+    - **回退口径**：文档**从未物化**（对象行数为 0）时，逐块判定无据可依 ——
+      此时按文档级判定兜底（已经过上层 :func:`allows` + ``document_scope_clause``），
+      chunks 原样返回，避免回填上线前所有存量文档的原文预览集体变空（功能退化）。
+      文档一旦物化，缺失任一对象行即 **fail-closed 剔除**。
+    """
+    from app.db.security_models import (
+        OBJECT_TYPE_IMAGE,
+        make_object_id,
+        object_type_from_content_type,
+    )
+    from app.services.security_cascade import (
+        document_is_materialized,
+        load_object_views,
+    )
+    from app.services.security_policy import allows
+
+    materialized = await document_is_materialized(document_id)
+    if not materialized:
+        return [
+            {
+                "chunk_index": ci,
+                "page_number": pn,
+                "text": text,
+                "line_start": ls,
+                "line_end": le,
+                "content_type": ct,
+                "image_id": iid,
+                "image_path": ipath,
+                "position": pos,
+                "bbox": bbox,
+                "analyze_quality": aq,
+                "analyze_fusion": af,
+            }
+            for _pid, ci, pn, text, ls, le, ct, iid, ipath, pos, bbox, aq, af in raw
+        ]
+
+    def _object_id(pid: str, content_type: str, image_id: str | None) -> str:
+        ctype = (content_type or "text").lower()
+        if ctype == "image" and image_id:
+            return make_object_id(str(document_id), pid, object_type=OBJECT_TYPE_IMAGE)
+        return make_object_id(
+            str(document_id), pid, object_type=object_type_from_content_type(ctype)
+        )
+
+    object_ids = [
+        _object_id(pid, ct, iid) for pid, ci, pn, text, ls, le, ct, iid, ipath, pos, bbox, aq, af in raw
+    ]
+    views = await load_object_views(object_ids)
+
+    kept: list[dict] = []
+    dropped: list[tuple[str, object]] = []
+    for row, object_id in zip(raw, object_ids):
+        pid, ci, pn, text, ls, le, ct, iid, ipath, pos, bbox, aq, af = row
+        view = views.get(object_id)
+        if view is None or not allows(pred, view).allowed:
+            decision = allows(pred, view) if view is not None else None
+            dropped.append((object_id, decision))
+            continue
+        kept.append({
+            "chunk_index": ci,
+            "page_number": pn,
+            "text": text,
+            "line_start": ls,
+            "line_end": le,
+            "content_type": ct,
+            "image_id": iid,
+            "image_path": ipath,
+            "position": pos,
+            "bbox": bbox,
+            "analyze_quality": aq,
+            "analyze_fusion": af,
+        })
+
+    if dropped:
+        try:
+            from app.services.audit_service import record_acl_drop
+
+            for object_id, decision in dropped:
+                await record_acl_drop(
+                    "citation_open",
+                    object_id=object_id,
+                    document_id=str(document_id),
+                    reason=(decision.reason if decision is not None else "missing_object_view"),
+                    gate=(decision.gate if decision is not None else "tenant"),
+                )
+        except Exception:      # noqa: BLE001 — 审计失败不阻断
+            logger.warning("citation_open audit failed (id=%s)", document_id, exc_info=True)
+
+    return kept
+

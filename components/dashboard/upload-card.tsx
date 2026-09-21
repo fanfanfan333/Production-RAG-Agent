@@ -137,7 +137,9 @@ export function UploadCard({ disabled, onUploadComplete }: UploadCardProps) {
   // 就返回；解析 / 逐图 OCR / 向量化在服务端后台跑。所以这里不再有"处理中"的
   // 阻塞态和计时器：用户提交完就能离开页面，进度由文档列表轮询 current_stage
   // 显示（"正在解析内容与图片" / "正在生成向量 42%"）。
-  // admin 未选归属公司时同样禁用（否则文件会落进它看不到的 default 租户）。
+  // admin 未选归属公司时同样禁用：不显式选择的话，文档会落到默认归属（admin
+  // 自身的租户，即候选里的「管理员」）而不是某个明确的测试公司，用户事后很难
+  // 判断文件去哪了。所以这里要求先选，禁用逻辑本身不变。
   const isDisabled = disabled || uploading || noCompanySelected;
 
   const handleFiles = useCallback(
@@ -147,7 +149,7 @@ export function UploadCard({ disabled, onUploadComplete }: UploadCardProps) {
         toast.error(
           companies.length === 0
             ? "暂无测试公司，请先在管理后台创建公司"
-            : "请先选择文档归属的测试公司"
+            : "请先选择文档归属公司"
         );
         return;
       }
@@ -321,7 +323,7 @@ export function UploadCard({ disabled, onUploadComplete }: UploadCardProps) {
                 <SelectItem value="">
                   {companies.length === 0
                     ? "暂无测试公司，请先在管理后台创建公司"
-                    : "请选择归属的测试公司"}
+                    : "请选择归属公司"}
                 </SelectItem>
                 {companies.map((c) => (
                   <SelectItem key={c.companyId} value={c.companyId}>

@@ -14,7 +14,16 @@ when this module is imported (main.py imports it for exactly that reason).
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Integer,
+    SmallInteger,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql import func
@@ -92,6 +101,15 @@ class User(Base):
     department_id: Mapped[str | None] = mapped_column(
         String(64), nullable=True, index=True,
     )
+    # ── 密级（五维权限模型的第四维）────────────────────────────────────────────
+    # clearance = 该用户**能看多高密级**的内容（0..3）。
+    # NULL 不是一个"漏填的值"，而是**有意义的默认**：按角色推导
+    # （见 security_policy.DEFAULT_CLEARANCE_BY_ROLE）。刻意**不加** server_default
+    # —— 一旦写死初值，"管理员把某人的角色下调"就不会反映到密级上（A8 直接失效）。
+    # 管理员可以显式下调这一列（**平台管理员 admin 也不豁免**：clearance=3 是
+    # "有上限的高"，不是"无限" —— 已裁决 Q7）。
+    clearance: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+
     # ── 企业身份（身份验证申请通过后由 admin_users staff_service 写入）─────────
     # company_name 是用户在「身份验证」表单里填的**公司名称原文**（中文也合法）；
     # tenant_id 是它映射出的安全 ID（见 tenancy.company_id_from_name）。

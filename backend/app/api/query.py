@@ -149,14 +149,20 @@ async def _generate_sse(
     and, when *collection_id* is set, to one knowledge-base collection.
     """
     # ── 1+2. Conversation setup (owner + tenant scoped) ───────────────────────
-    from app.services.tenancy import content_scope, home_tenant_id
+    from app.services.tenancy import home_tenant_id
+    from app.services.security_scope import request_security_scope
 
     # 对话是**内容消费**路径：检索 / 摘要 / 文档关联 / 对话内文档列表都必须
-    # 用 content_scope —— 它在 request_scope 基础上额外剔除测试公司（仅平台
-    # 管理员生效）。测试账号（其 owns_tenant_ids 恒为空）不受影响，照旧可见
-    # 本公司全部内容；管理/列表端点（GET /documents）仍用 request_scope，
-    # 以便 admin 继续"看到"测试公司文档进行管理。
-    scope = await content_scope(user)
+    # 用 content_scope 口径 —— ``request_security_scope`` 内部即用
+    # ``content_scope(user)`` 作 ``base``（在 request_scope 基础上额外剔除测试
+    # 公司，仅平台管理员生效），因此 ``user_scope.base`` 与旧 ``content_scope(user)``
+    # 逐字段一致。测试账号（其 owns_tenant_ids 恒为空）不受影响，照旧可见本公司
+    # 全部内容；管理/列表端点（GET /documents）仍用 request_scope。
+    #
+    # 【T3 决策 10-①】请求入口**一次性**签发请求级五维 ``UserScope``，注入 master
+    # graph / 文档列表；此后链路内不可变（frozen），且禁止在服务层重新签发。
+    user_scope = await request_security_scope(user)
+    scope = user_scope.base
     # 个人库归属**恒为本人**（含平台管理员）：owner_id 不再是"None = admin 全览"，
     # 因此这里必须是 user.id，否则管理员会连自己的个人库都检索不到。
     owner = scope.owner_id
@@ -193,6 +199,7 @@ async def _generate_sse(
             tenant_wide=scope.tenant_wide,
             owns_tenant_ids=scope.owns_tenant_ids,
             conversation_tenant_id=conversation_tenant,
+            user_scope=user_scope,
         )
     else:
         # 其余全部交给 master graph：
@@ -217,6 +224,7 @@ async def _generate_sse(
             tenant_wide=scope.tenant_wide,
             owns_tenant_ids=scope.owns_tenant_ids,
             conversation_tenant_id=conversation_tenant,
+            user_scope=user_scope,
         )
 
     try:

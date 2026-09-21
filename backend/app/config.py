@@ -3,6 +3,7 @@ Application configuration using pydantic-settings.
 All values are loaded from environment variables (or .env file).
 """
 
+import os
 from functools import lru_cache
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -21,6 +22,28 @@ class Settings(BaseSettings):
     ENVIRONMENT: str = "development"         # development | staging | production
     DEBUG: bool = False
     LOG_LEVEL: str = "INFO"
+
+    # ── 出网代理豁免（企业网络下必备）────────────────────────────────────────────
+    # 这里列出的主机在进程启动时被写进 ``NO_PROXY`` / ``no_proxy`` 环境变量。
+    #
+    # ⚠️ 为什么必须由代码写，而不能只在 .env 里写 NO_PROXY：
+    #   1. ``httpx``（Ollama / qdrant-client / Keycloak JWKS 都走它）**只认 NO_PROXY
+    #      环境变量**，不读 Windows 注册表的 ``ProxyOverride``。本机代理软件把
+    #      ``localhost;127.*`` 写进了注册表例外，``urllib.proxy_bypass()`` 也认，
+    #      但 httpx 认为不存在 → 发给本机/内网服务的请求全被送到代理，拿回
+    #      **502 空响应体**（表现为 ``responseError('')``、"服务不可用"、
+    #      "模型不稳定"，极难反查）。
+    #   2. pydantic-settings 读 .env 只填 Settings 对象，**不会**导出到
+    #      ``os.environ``；宿主机直接跑 uvicorn / pytest 时 .env 里的 NO_PROXY
+    #      等于没写。所以由 get_settings() 统一物化（见 apply_no_proxy_env）。
+    #
+    # 语义：**只增不减** —— 运维/CI 已显式设置的条目一律保留，本字段只做补充。
+    # 想整体关闭就把本字段设为空字符串。
+    HTTP_NO_PROXY: str = (
+        "localhost,127.0.0.1,::1,"
+        "host.docker.internal,"
+        "backend,postgres,qdrant,keycloak"
+    )
 
     # ── Ollama (chat / generation only) ───────────────────────────────────────
     OLLAMA_BASE_URL: str = "http://localhost:11434"
@@ -70,6 +93,11 @@ class Settings(BaseSettings):
     JWT_SECRET: str = "dev-insecure-secret-change-me-0123456789abcdef0123456789abcdef"
     JWT_ALGORITHM: str = "HS256"
     JWT_EXPIRE_MINUTES: int = 720                    # 12 h session lifetime
+    # FIX-B（T5 预发布）：弱密钥 escape 开关。默认 False —— 当 JWT_SECRET 是默认值 /
+    # 已知弱值 / 长度 < 32 时，启动**直接失败**（fail-closed，杜绝自签 admin token）。
+    # 仅在本地联调显式置 true（配合醒目 ERROR 日志）。生产部署应改用 ≥32 字符强密钥，
+    # 而非开启此开关。
+    ALLOW_INSECURE_JWT: bool = False
     ALLOW_SELF_REGISTRATION: bool = True             # first user always becomes admin
     PASSWORD_MIN_LENGTH: int = 8
 
@@ -423,14 +451,15 @@ class Settings(BaseSettings):
     # 会明确告知"只覆盖了最近 N 份"，绝不静默漏文档（问题：总结所有文档
     # 只总结了出现最多的那几份）。
     DOC_SUMMARY_MAX_DOCUMENTS: int = 20
-    # 逐份文档摘要是否开启 qwen3 的思考（reasoning）。实测（本机 qwen3:8b、
-    # 每份文档采样 1200 字符）：
-    #   True  → 每份约 40-45s，4 份文档 + 概览的整库总结约 3.5 分钟；
-    #   False → 每份约 10-15s，整库总结可压到 1 分钟内。
-    # 默认保持 True（数字/结论的取舍更稳，符合本项目的反幻觉取向）；
-    # 追求速度、且文档以叙述性内容为主时，置 False 是安全的。
+    # 逐份文档摘要是否开启 qwen3 的思考（reasoning）。
+    # 实测（本机 qwen3:8b、1696 字摘要输入、CPU、num_gpu=0）：
+    #   True  → 每份约 92s（thinking 占 563 字），4 份 + 概览的整库总结极易超时挂死；
+    #   False → 每份约 33s，输出内容完整（282 字，格式反而更规整）。
+    # 逐份摘要是"抽取/结构化"性质任务（挑数字、保口径），按本机约定**应当关
+    # 思考**；生成类节点（rag_graph / general_chat）才保留 reasoning=True。
+    # 默认 False（省 2.8× 时延，且避免逐个调用逼近 DOC_SUMMARY_TIMEOUT_SECONDS）。
     # 注意"总体概览"那次调用**恒定**不思考 —— 它的输入只是已写好的各节摘要。
-    DOC_SUMMARY_REASONING: bool = True
+    DOC_SUMMARY_REASONING: bool = False
 
     # ── General Chat（架构图 General Chat 分支）──────────────────────────────────
     GENERAL_CHAT_ENABLED: bool = True
@@ -515,7 +544,9 @@ class Settings(BaseSettings):
 
     # ── Embedded-image recognition (问题3 / 部分1+2) ────────────────────────────
     ENABLE_IMAGE_OCR: bool = True          # OCR images embedded inside PDF/DOCX/PPTX
-    MAX_IMAGES_PER_DOCUMENT: int = 20      # hard cap per document (guards runaway docs)
+    # 单文档图片上限。实测逐份 VLM 调用 ~50s/图，20 张 → 单文档入库可达 ~17 分钟
+    # （且 Ollama 单实例排队拖慢所有功能）。压到 8 张把上限压到 ~7 分钟。
+    MAX_IMAGES_PER_DOCUMENT: int = 8       # hard cap per document (guards runaway docs)
     MAX_IMAGES_PER_PAGE: int = 6           # per-page cap for PDFs
     MIN_IMAGE_DIMENSION: int = 60          # icon guard: reject when BOTH sides are smaller (px)
     # 任一边小于该值即视为退化条带（1-2px 的边框/分隔线），直接丢弃。
@@ -544,8 +575,21 @@ class Settings(BaseSettings):
     # 图片仍可被检索与回显，仅"视觉理解/看图问答"被跳过。
     VISION_ENABLED: bool = True
     OLLAMA_VISION_MODEL: str = "qwen2.5vl:7b"   # 空字符串 = 显式放弃 vision
-    VISION_TIMEOUT_SECONDS: float = 60.0
+    # 入库期单图推理超时阈值。实测本机 qwen2.5vl:3b（CPU, num_gpu=0）单图
+    # 43-54s，首次调用还含约 6.7s 模型加载 —— 60s 余量仅 6-17s，系统稍忙即触发
+    # httpx 超时 → 静默降级为纯 OCR 却仍标 route="vision"（见 pipeline 修复）。
+    # 提到 120s，给尾延迟留足余量。
+    VISION_TIMEOUT_SECONDS: float = 120.0
     VISION_CAPTION_MAX_CHARS: int = 400         # 入库期 caption 截断长度
+
+    # ── 无文字图片的处理（实施手册 3.3.1：图片不得在分块阶段被直接跳过）─────────
+    # True  = 图内**一个字都没读出来**时（OCR / 结构化引擎 / Vision 转写全空），
+    #         再花一次多模态推理，让模型输出「图注 + 关键要素 + 数值信息」三段式
+    #         描述作为这张图自己的检索文本 —— 图片因此能生成独立 image chunk，
+    #         而不是在分块阶段消失。
+    # False = 保持旧行为（无文字图片不建块，只在磁盘留一份原图）。
+    # 只在"完全没有文字"时才触发：有文字的图不会多花这次推理。
+    IMAGE_SUMMARY_WHEN_TEXTLESS: bool = True
 
     # ── 图片类型判断（Image Classification）──────────────────────────────────────
     # 文档里的图片落到磁盘之后不是"一律 OCR"，而是先判类型再分流：
@@ -692,6 +736,27 @@ class Settings(BaseSettings):
     GATEWAY_ENFORCE_ORIGIN: bool = False              # set true in production
     TRUSTED_PROXY_IPS: list[str] = []                 # only these may set X-Forwarded-For
 
+    # ── 五维安全隔离（密级 / 项目）—— 见 docs/system_design_security_isolation.md ──
+    # 严格模式：密级字段**缺失**时按最高档（3）处理，而不是按默认档（1）。
+    # 默认关闭 —— 存量文档全部未标注，开严格模式会让它们一夜之间全部不可见
+    # （那是不可退化基线的直接击穿）。只在回填脚本跑完、确认没有 NULL 之后再开。
+    SECURITY_STRICT_MODE: bool = False
+    # 存量/缺失密级的默认档位（已裁决 Q2 = 1 内部）。
+    # ⚠️ 必须与 app.db.security_models.DEFAULT_SECURITY_LEVEL 一致 ——
+    #    test_security_schema.py 有一条断言盯着这两处不漂移。
+    DEFAULT_SECURITY_LEVEL: int = 1
+    # 密级前置过滤形态：
+    #   false（默认）→ deny-list（老向量缺字段不排除 → fail-open，交 PG 终判）
+    #   true          → 白名单（must: lte=clearance）—— **只允许在回填完成后开启**
+    ACL_SECURITY_PREFILTER_STRICT: bool = False
+    # 项目维度总开关（关掉时 project_ids / visibility_mode 一律按 tier 处理）
+    PROJECT_ENABLED: bool = True
+    # ── ACL 双写一致性（PG 权威 → Qdrant 副本异步追平）─────────────────────────
+    # stale 重试次数上限，超过则升级为 logger.error 并计入指标
+    ACL_SYNC_STALE_MAX_RETRIES: int = 3
+    # 单次异步推送的批大小
+    ACL_SYNC_PUSH_BATCH: int = 256
+
     # ── CORS ───────────────────────────────────────────────────────────────────
     # Never use "*" in production. Configure the exact frontend origin(s).
     CORS_ORIGINS: list[str] = ["*"]
@@ -715,7 +780,148 @@ class Settings(BaseSettings):
 RERANK_MIN_SCORE_RATIO_CEILING: float = 0.07
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 出网代理豁免：把 HTTP_NO_PROXY 物化成真实的 NO_PROXY / no_proxy 环境变量
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# 背景见 Settings.HTTP_NO_PROXY 的注释。这里只做一件小事：**只增不减**地合并。
+#
+# 为什么是"只增"：NO_PROXY 是运维会用的东西（CI 里可能已经列了内网镜像站、
+# 数据库域名、堡垒机）。若应用启动时把它整体覆盖成自己那份清单，就会把运维的
+# 配置**静默吃掉** —— 那是比原问题更难查的故障。反向也成立：运维已写好完整
+# 清单时，应用再补一遍是无害的（去重后结果不变）。
+#
+# 两个变量都要写：``no_proxy`` 是 ``NO_PROXY`` 的小写别名，不同库读的不是同一个
+# 名字（requests / urllib 读 ``no_proxy``，httpx 读 ``NO_PROXY``）—— 只写一个会
+# 让"另一条链路仍然走代理"这种问题继续存在。
+_NO_PROXY_ENV_KEYS: tuple[str, ...] = ("NO_PROXY", "no_proxy")
+
+
+def _split_no_proxy(raw: str | None) -> list[str]:
+    """把 NO_PROXY 串切成条目列表：去空白、去空项、按大小写不敏感去重（保序）。
+
+    分隔符同时接受逗号和分号 —— 注册表 ``ProxyOverride`` 惯用分号，运维从那儿
+    复制过来时很容易带分号；不拆的话会得到一个永远匹配不上的怪条目。
+    """
+    items: list[str] = []
+    seen: set[str] = set()
+    for chunk in (raw or "").replace(";", ",").split(","):
+        host = chunk.strip()
+        if not host:
+            continue
+        key = host.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        items.append(host)
+    return items
+
+
+def merge_no_proxy(existing: str | None, required: str | None) -> str:
+    """把 ``required`` 并入 ``existing``，返回合并后的逗号串。
+
+    **只增不减**：``existing`` 的条目全部保留且排在前，重复项（大小写不敏感）
+    只保留先出现的那份。两边都为空时返回 ``""``。
+    """
+    merged = _split_no_proxy(existing)
+    lowered = {host.lower() for host in merged}
+    for host in _split_no_proxy(required):
+        if host.lower() not in lowered:
+            merged.append(host)
+            lowered.add(host.lower())
+    return ",".join(merged)
+
+
+def apply_no_proxy_env(settings: Settings) -> str:
+    """把 ``settings.HTTP_NO_PROXY`` 写进 ``NO_PROXY`` / ``no_proxy`` 环境变量。
+
+    幂等：重复调用结果不变。**绝不删除**已存在的条目。
+    返回最终生效值（便于启动日志打印与测试断言）；无内容可写时返回 ``""``。
+    """
+    required = getattr(settings, "HTTP_NO_PROXY", "") or ""
+    final = ""
+    for key in _NO_PROXY_ENV_KEYS:
+        current = os.environ.get(key)
+        merged = merge_no_proxy(current, required)
+        if not merged:
+            continue
+        final = merged
+        if merged != current:
+            os.environ[key] = merged
+    return final
+
+
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     """Return a cached singleton of Settings."""
-    return Settings()  # type: ignore[call-arg]
+    settings = Settings()  # type: ignore[call-arg]
+    # 出网代理豁免：httpx 只认 NO_PROXY 环境变量，不读 Windows 注册表的
+    # ProxyOverride（详见 HTTP_NO_PROXY 字段的注释）。放在这里是因为
+    # app.config 一定早于任何 httpx 客户端被导入。
+    apply_no_proxy_env(settings)
+    return settings
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FIX-B（T5 预发布）：JWT 弱密钥判定
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# 判定口径（fail-closed，仅在**真正使用弱/默认值**时阻断启动）：
+#   1. 密钥为空 / 仅空白                          → 弱
+#   2. 长度 < 32                                  → 弱（HS256 最低安全要求）
+#   3. 命中已知弱值白名单（精确匹配，大小写不敏感）→ 弱
+#      —— 含本项目开发默认值强前缀 ``dev-insecure-secret-change-me``
+#      （用户未改默认值即命中，但显式提供一个 ≥32 字符的强密钥不会命中）
+#
+# ⚠️ 白名单用**精确匹配**，不用子串匹配：避免误伤恰好包含 "secret" 的强密钥
+# （如运维生成的 ``prod-secret-<64hex>``）。需要拦的是"值本身就是弱口令"，
+# 不是"值里出现了某词"。
+_KNOWN_WEAK_JWT_SECRETS: frozenset[str] = frozenset(
+    {
+        "changeme",
+        "change-me",
+        "secret",
+        "your-secret-key",
+        "your_secret_key",
+        "insecure",
+        "password",
+        "123456",
+        "test",
+        "default",
+        "dev-insecure-secret-change-me-0123456789abcdef0123456789abcdef",
+    }
+)
+
+
+def is_jwt_secret_weak(secret: str | None) -> bool:
+    """返回 True 表示 JWT_SECRET 必须被拒绝（fail-closed 启动）。
+
+    显式提供了一个 ≥32 字符、且不在已知弱值白名单里的密钥 ⇒ 返回 False（照常启动）。
+    """
+    if not secret or not str(secret).strip():
+        return True
+    s = str(secret).strip()
+    if len(s) < 32:
+        return True
+    low = s.lower()
+    if low in _KNOWN_WEAK_JWT_SECRETS:
+        return True
+    # 开发默认值强前缀：用户未改默认即命中（显式提供强密钥不会命中）
+    if low.startswith("dev-insecure-secret-change-me"):
+        return True
+    return False
+
+
+def jwt_secret_must_fail_startup(
+    secret: str | None, *, allow_insecure_jwt: bool = False, debug: bool = False
+) -> bool:
+    """启动决策（fail-closed）：True ⇒ 必须终止启动。
+
+    仅当密钥**确实弱**且未显式开启 escape 开关（``ALLOW_INSECURE_JWT`` /
+    ``DEBUG``）时才返回 True。显式提供强密钥 ⇒ False（照常启动）。
+    """
+    if not is_jwt_secret_weak(secret):
+        return False
+    if allow_insecure_jwt or debug:
+        return False
+    return True

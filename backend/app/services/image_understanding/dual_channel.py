@@ -151,8 +151,9 @@ def dual_channel_enabled(image_type: str) -> bool:
     """
     这张图要不要跑双通道.
 
-    三个条件都要满足：总开关打开、类型在白名单里、VLM 当前可用。
-    可用性由调用方通过 *vision_available* 传入（避免这里重复探测）。
+    两个条件都要满足：总开关打开、类型在白名单里。VLM 是否可用由调用方
+    （pipeline 的 ``_run_vlm_channel``）在真正调用前探测，不可用时会写
+    ``result.meta["vlm_channel_skipped"]``，这里不做可用性探测。
     """
     settings = get_settings()
     if not getattr(settings, "IMAGE_DUAL_CHANNEL_ENABLED", True):

@@ -18,6 +18,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    SmallInteger,
     String,
     Text,
     UniqueConstraint,
@@ -54,6 +55,15 @@ class Document(Base):
     # 判重按用户范围：同一文件不同用户各自独立索引（全局唯一会误伤多用户场景）
     __table_args__ = (
         UniqueConstraint("owner_id", "file_hash", name="uq_documents_owner_hash"),
+        # ── 五维安全隔离新增索引（T1；列与索引都在迁移 q2k3l4m5n6o7 里同步建）──
+        # 密级 / 项目 / ACL 都要进 SQL 过滤（第 7 环关键词腿与第 11 环复核），
+        # 没有索引会退化成"全表扫描后再筛" —— 与当初给 tenant_id 建索引同理。
+        Index("ix_documents_security_level", "security_level"),
+        Index("ix_documents_visibility_mode", "visibility_mode"),
+        Index("ix_documents_acl_sync_state", "acl_sync_state"),
+        Index("ix_documents_project_ids", "project_ids", postgresql_using="gin"),
+        Index("ix_documents_acl_allow", "acl_allow", postgresql_using="gin"),
+        Index("ix_documents_acl_deny", "acl_deny", postgresql_using="gin"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -110,6 +120,48 @@ class Document(Base):
     department_id: Mapped[str | None] = mapped_column(
         String(64), nullable=True, index=True,
     )
+
+    # ── 五维安全隔离新增列（T1，**全部带 server_default ⇒ 存量行为零变化**）──────
+    # 设计依据：docs/system_design_security_isolation.md §4.2。
+    # ⚠️ access_level 三值（private/department/tenant）是**可见范围**语义，
+    #    本次一个都不动；密级（security_level）与项目（visibility_mode +
+    #    project_ids）是**新增的另外两个维度**，与它正交。
+    #
+    # security_level      密级档位 0..3；存量默认 1（内部）—— 已裁决 Q2。
+    # visibility_mode     tier（走既有三层）/ project（走项目成员）；默认 tier
+    #                     ⇒ 存量文档完全不受项目维度影响 —— 已裁决 Q3。
+    # project_ids         横向项目维度（JSONB 数组，与仓库既有 JSONB 风格一致）
+    # acl_allow/acl_deny  need-to-know 主体 / 一票否决主体（物化副本，权威源
+    #                     是 acl_grants 表）
+    # acl_expires_at      对象级兜底有效期（取所有 grant 里**最早**的那个）
+    # acl_sync_state      PG ↔ Qdrant payload 副本的一致性水位
+    # share_status        对齐 ShareRequest.status（none/pending/approved/...）
+    # share_grant_scope   共享授予的范围（department|tenant|project）
+    security_level: Mapped[int] = mapped_column(
+        SmallInteger, default=1, server_default="1", nullable=False,
+    )
+    visibility_mode: Mapped[str] = mapped_column(
+        String(16), default="tier", server_default="tier", nullable=False,
+    )
+    project_ids: Mapped[list] = mapped_column(
+        JSONB, default=list, server_default=sa_text("'[]'::jsonb"), nullable=False,
+    )
+    acl_allow: Mapped[list] = mapped_column(
+        JSONB, default=list, server_default=sa_text("'[]'::jsonb"), nullable=False,
+    )
+    acl_deny: Mapped[list] = mapped_column(
+        JSONB, default=list, server_default=sa_text("'[]'::jsonb"), nullable=False,
+    )
+    acl_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    acl_sync_state: Mapped[str] = mapped_column(
+        String(16), default="synced", server_default="synced", nullable=False,
+    )
+    share_status: Mapped[str] = mapped_column(
+        String(16), default="none", server_default="none", nullable=False,
+    )
+    share_grant_scope: Mapped[str | None] = mapped_column(String(16), nullable=True)
 
     # New Multi-Format & OCR Metadata
     file_type: Mapped[str] = mapped_column(String(32), default="pdf", server_default="pdf", nullable=False)
@@ -254,6 +306,15 @@ class ChunkParent(Base):
         String(20), default="private", server_default="private", nullable=False,
     )
     department_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # 【T1 补齐】归属人。父块原先只有 tenant/access_level/department —— 缺了
+    # owner_id 就**做不了用户级过滤**：个人库父块（private）无法判定"是不是我的"，
+    # 只能要么全放行要么全排除。补齐后父块与子块、documents 行的口径一致。
+    # nullable=True：历史行没有归属信息，按"不认领"处理（由文档级 ACL 兜住）。
+    owner_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
 
     level: Mapped[str] = mapped_column(
         String(16), nullable=False, index=True,   # parent | section

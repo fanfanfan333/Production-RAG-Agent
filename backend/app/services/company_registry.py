@@ -42,7 +42,10 @@ MSG_NAME_TOO_LONG = "公司名称过长（最多 128 个字符）"
 
 # 回填脚本 / 一次性迁移用：把历史租户裁定为注册表行。
 # 表结构：tenant_id → (display_name, created_by_username 或 None, is_test)。
-# 说明：A公司 / B公司 的 created_by = NULL（对 admin 恒不可见，满足 P0-6）；
+# 说明：A公司 / B公司 的 created_by = NULL —— 它们**不在 admin 的文档可见范围内**
+#       （P0-6：admin 只看得到自己创建的测试公司的文档）；但会出现在 admin 的
+#       **公司管理清单**中（可见其存在与成员数，并可由平台管理员改名）。改名只改
+#       展示名，**不回填 created_by**。
 #       bjld8 / 1z5pp 的 created_by = admin（admin 的自建测试公司）。
 DEFAULT_BACKFILL_ASSIGNMENTS: tuple[dict, ...] = (
     {"tenant_id": "c8111de986583", "display_name": "测试公司1", "created_by": "admin", "is_test": True},
@@ -261,18 +264,69 @@ async def assert_admin_owns(actor: User | None, tenant_id: str) -> None:
         raise CompanyError(MSG_NOT_OWNS, status_code=403)
 
 
+async def can_platform_admin_rename(actor: User | None, tenant_id: str) -> bool:
+    """
+    平台管理员能否给 ``tenant_id`` 这家公司改名（**仅用于改名判定**）.
+
+    为什么不复用 :func:`assert_admin_owns`：``assert_admin_owns`` 是「严格自建」原语，
+    其判定集合（``created_by == actor.id``）正是 ``owns_tenant_ids`` 的**唯一来源**，
+    直接决定**文档可见范围**（P0-6：admin 只看得到自己创建的测试公司的文档）。
+    而「改名」属于**公司管理面板的展示层**操作，需要额外放行 ``created_by IS NULL``
+    的历史无主公司（如 A公司 / B公司）—— 它们不在任何 admin 的文档可见范围内，但
+    平台管理员应当能接管改名。若为此去改 ``created_by``，会让这些公司进入
+    ``owns_tenant_ids`` → 直接击穿 P0-6。因此这里**新增一个只读判定**，
+    **绝不写 ``created_by``**、也绝不复用/改写文档作用域逻辑。
+
+    规则：
+        * 非平台管理员（``actor`` 为 ``None`` 或 ``is_admin`` 为假）→ ``False``；
+        * 公司不存在 → ``False``；
+        * ``created_by is None``（无主历史公司）→ ``True``；
+        * ``created_by == actor.id``（自建）→ ``True``；
+        * 其他管理员创建的公司 → ``False``。
+    """
+    if actor is None or not getattr(actor, "is_admin", False):
+        return False
+    company = await get_company(tenant_id)
+    if company is None:
+        return False
+    if company.created_by is None:
+        return True
+    return company.created_by == actor.id
+
+
+async def assert_admin_can_rename(actor: User | None, tenant_id: str) -> None:
+    """
+    改名权限闸（:func:`rename_company` 专用）.
+
+    与 :func:`assert_admin_owns` 的区别：本函数额外放行 ``created_by IS NULL`` 的
+    无主历史公司（见 :func:`can_platform_admin_rename` 的设计说明）。它**只读**，
+    不改任何数据，尤其不写 ``created_by``。
+
+    失败时（文案沿用既有常量，不新造）：
+        * 非平台管理员 → :class:`CompanyError`（``MSG_NEED_ADMIN``，403）；
+        * 平台管理员但公司不存在 / 由其他管理员创建 → :class:`CompanyError`
+          （``MSG_NOT_OWNS``，403）。
+    """
+    if actor is None or not getattr(actor, "is_admin", False):
+        raise CompanyError(MSG_NEED_ADMIN, status_code=403)
+    if not await can_platform_admin_rename(actor, tenant_id):
+        raise CompanyError(MSG_NOT_OWNS, status_code=403)
+
+
 async def rename_company(actor: User | None, tenant_id: str, new_name: str) -> Company:
     """
-    改公司展示名（平台管理员、且须自建）.
+    改公司展示名（平台管理员、且须自建或无主）.
 
     - **``tenant_id`` 不变**：成员归属、文档归属、向量数据零迁移。
     - 只改 ``companies.display_name / name_key`` + 同步 ``users.company_name``
-      （展示副本，供历史回溯与个人主页显示）。
+      （展示副本，供历史回溯与个人主页显示）。**绝不写 ``created_by``** —— 否则会
+      把无主历史公司拉进 admin 的 ``owns_tenant_ids``，击穿 P0-6 文档隔离。
     - 写 ``audit_logs(action="company.rename")``（旧名→新名 / 时间 / 操作者）。
     - 重名（与其他公司）→ 409。
+    - 权限放宽为「平台管理员且需自建或无主」：见 :func:`assert_admin_can_rename`。
     """
     name, key = _clean_name(new_name)
-    await assert_admin_owns(actor, tenant_id)
+    await assert_admin_can_rename(actor, tenant_id)
 
     old_name = ""
     async with get_db_session() as session:

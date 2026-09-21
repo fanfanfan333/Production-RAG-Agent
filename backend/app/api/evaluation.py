@@ -53,7 +53,7 @@ from app.services.evaluation import (
 )
 from app.services.monitoring_service import metrics_snapshot
 from app.services.permissions import require_permission
-from app.services.retrieval_service import retrieve_chunks
+from app.services.retrieval_service import retrieve_chunks_scoped
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -150,11 +150,15 @@ async def run_evaluation(
     )
 
     # 检索作用域跟随调用者：普通用户只评自己可见的知识库，避免评测变成
-    # 一条越权读取他人文档的旁路。三层隔离下锁定公司集合 + 部门 ACL，
-    # 平台管理员在**自建测试公司集合**内评测但**不含**他人的个人库。
-    from app.services.tenancy import home_tenant_id, request_scope
+    # 一条越权读取他人文档的旁路。**V-01 修复**：评测必须走**五维** UserScope，
+    # 与知识问答同一条权限链路（含密级 / 项目 / deny / excluded / 对象级复核），
+    # 否则评测会成为绕过第 7/11/12 环的越权读取旁路。三层隔离下锁定公司集合 +
+    # 部门 ACL，平台管理员在**自建测试公司集合**内评测但**不含**他人的个人库。
+    from app.services.tenancy import home_tenant_id
+    from app.services.security_scope import request_security_scope
 
-    scope = await request_scope(user)
+    user_scope = await request_security_scope(user)
+    scope = user_scope.base
     owner_id = str(scope.owner_id) if scope.owner_id else None
     # 评测记录（第三层归属键）另用单一公司标识：admin 无归属公司 → None
     tenant_id = home_tenant_id(user)
@@ -162,15 +166,13 @@ async def run_evaluation(
     collection_id = payload.collection_id
 
     async def _retrieve(query: str):
-        chunks = await retrieve_chunks(
+        # 五维 Scope 透传：retrieve_chunks_scoped 内部用同一份 to_qdrant/to_sql/
+        # allows 下推与复核，评测与线上共用一条权限链路。
+        chunks = await retrieve_chunks_scoped(
             query=query,
             top_k=top_k,
-            owner_id=owner_id,
+            scope=user_scope,
             collection_id=collection_id,
-            tenant_ids=scope.tenant_ids,
-            user_department_id=department_id,
-            tenant_wide=scope.tenant_wide,
-            owns_tenant_ids=scope.owns_tenant_ids,
         )
         return [item_from_chunk(c) for c in chunks]
 

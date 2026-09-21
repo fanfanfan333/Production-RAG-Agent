@@ -960,6 +960,50 @@ async def _run_ingestion(
                 filename, doc_id_str,
             )
 
+        # ── 5.6【T4】对象级权限物化（必须在标记 COMPLETED 之前）───────────────────
+        # 为这份文档的五种对象（doc / text_chunk / table / code / image）写
+        # `document_objects` 权威行，并把权限字段冗余推给 Qdrant payload。
+        # 位置与 resync_document_acl_payload 同理：此刻"所有向量点必定已 upsert
+        # 完成"，是唯一能保证派生对象与源文档权限一致的时点（§7.1 写入时机）。
+        # OCR 派生块（image_id 非空）的 parent_object_id 指向**源图片对象**，
+        # 有效密级取 max(文档, 源图) —— 堵住"图看不了但字还能搜到"的破口（决策 12）。
+        # 失败只告警：权限副本可异步追平，不该让整份文档判失败（PG 仍是权威源）。
+        try:
+            from sqlalchemy import select as _select
+
+            from app.services.security_cascade import materialize_document_objects
+
+            async with get_db_session() as _sess:
+                fresh_doc = (
+                    await _sess.execute(
+                        _select(Document).where(Document.id == doc.id)
+                    )
+                ).scalar_one_or_none()
+            acl_points = [
+                {
+                    "id": pid,
+                    "payload": {
+                        "image_id": c.image_id,
+                        "image_path": c.image_path,
+                        "content_type": c.content_type,
+                        "chunk_index": c.chunk_index,
+                        "page_number": c.page_number,
+                    },
+                }
+                for pid, c in chunk_map.items()
+            ]
+            acl_stats = await materialize_document_objects(fresh_doc or doc, acl_points)
+            logger.info(
+                "Document '%s' (id=%s): materialized %s object ACL rows",
+                filename, doc_id_str, acl_stats,
+            )
+        except Exception:      # noqa: BLE001 — 物化失败不阻断入库收尾
+            logger.exception(
+                "Document '%s' (id=%s): document_objects materialization failed — "
+                "PostgreSQL stays authoritative, object-level ACL may be incomplete",
+                filename, doc_id_str,
+            )
+
         # ── 6. Mark COMPLETED ─────────────────────────────────────────────────
         await _update_document(
             doc.id,

@@ -1,6 +1,73 @@
 from dataclasses import dataclass, field
 import abc
 
+from app.utils.logging import get_logger
+
+logger = get_logger(__name__)
+
+
+# 解码失败字符（U+FFFD）占比超过该阈值即认为"解码彻底失败"，直接拒收——
+# 与其把一坨乱码写进向量库，不如报错让用户换编码 / 转 .docx。
+# 与 doc_parser._MAX_REPLACEMENT_RATIO 同一口径（0.05）。
+_MAX_REPLACEMENT_RATIO = 0.05
+
+# 编码回退链：先试带 BOM 的 UTF-8（Windows 记事本默认），再试中文最常遇到的
+# GBK/GB18030，再试繁体 Big5，最后才用 UTF-8 + replace（replace 会把解码不了的
+# 字节变成 U+FFFD，全篇中文会变成一堆不可见方块，比直接报错更糟）。
+_TEXT_FALLBACK_ENCODINGS = ("utf-8-sig", "gb18030", "big5")
+
+
+def decode_text_with_fallback(content: bytes, *, filename: str = "") -> str:
+    """
+    把文件字节解码成文本，按回退链尝试常见中文编码.
+
+    返回解码后的文本。命中非 UTF-8 编码时打 warning（可见的降级），若最终
+    U+FFFD 占比超过阈值则抛 ``ValueError`` 拒收，避免静默乱码入库。
+
+    旧实现直接 ``content.decode("utf-8", errors="replace")``：GBK 中文会被整篇
+    替换成 U+FFFD 且**不报错不告警**，是"看着成功了其实坏了"的典型。
+    """
+    # 先试 utf-8（是否带 BOM 都覆盖），用 replace 以便统计失败字符占比
+    text, _ = _try_decode(content, "utf-8", errors="replace")
+    if "\ufffd" not in text:
+        return text
+
+    # UTF-8 含替换字符 → 依次试带 BOM / GBK / Big5（strict：失败即换下一个）
+    for enc in _TEXT_FALLBACK_ENCODINGS:
+        candidate, _ = _try_decode(content, enc, errors="strict")
+        if candidate is not None:
+            logger.warning(
+                "文本 '%s' 非 UTF-8，已按 %s 解码（UTF-8 解码含替换字符）",
+                filename, enc,
+            )
+            return candidate
+
+    # 回退链都失败：用 utf-8 + replace 兜底，但检查乱码占比，过高直接拒收
+    replacement_ratio = text.count("\ufffd") / max(1, len(text))
+    if replacement_ratio > _MAX_REPLACEMENT_RATIO:
+        raise ValueError(
+            f"文件「{filename}」解码失败（U+FFFD 占比 {replacement_ratio:.0%} 超过 "
+            f"{_MAX_REPLACEMENT_RATIO:.0%}）：可能是非 UTF-8 编码或非文本文件，"
+            f"请转成 UTF-8 后重新上传。"
+        )
+    logger.warning(
+        "文本 '%s' 按 UTF-8(replace) 解码，含 %.0f%% 替换字符，可能部分乱码",
+        filename, replacement_ratio * 100,
+    )
+    return text
+
+
+def _try_decode(content: bytes, encoding: str, *, errors: str) -> tuple[str | None, str | None]:
+    """
+    尝试用 *encoding* 解码；errors="strict" 失败时返回 (None, None)，
+    errors="replace" 总是成功并顺带返回是否含替换字符。
+    """
+    try:
+        return content.decode(encoding, errors=errors), encoding
+    except (UnicodeDecodeError, LookupError):
+        return None, encoding
+
+
 @dataclass
 class ExtractedPage:
     """Text content and position metadata for a single page or section."""

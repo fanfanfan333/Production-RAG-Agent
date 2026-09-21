@@ -1,6 +1,15 @@
 "use client";
 
-import { memo, useCallback, useEffect, useRef, useState } from "react";
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type TouchEvent as ReactTouchEvent,
+  type WheelEvent as ReactWheelEvent,
+} from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
@@ -58,10 +67,16 @@ function createId() {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
 }
 
-// 距底部多少像素以内算"贴底"。给一点余量，避免用户只微调一点位置就被判定为
-// "已离开底部"，导致吸底莫名其妙地停掉。放在模块作用域：它是个纯常量，
-// 放进组件体内会让 useCallback([]) 的依赖检查报警。
-const BOTTOM_THRESHOLD = 80;
+// 距底部多少像素以内算"贴底"。放在模块作用域：它们是纯常量，放进组件体内会让
+// useCallback([]) 的依赖检查报警。
+//
+// 两个阈值刻意**不对称**（迟滞）：离开底部用大阈值、滚回底部用小阈值。用同一个
+// 值会在临界点反复横跳 —— 用户向上滚一点点 → 判定已离开 → 内容又长了一点把他
+// 顶回阈值内 → 判定又贴底 → 又被拽下去，表现就是"滚不动"。
+// 旧实现的 80px 单阈值则太大：用户明明已经上滑了七八十像素，仍被判定为贴底
+// 而当场被拽回去。
+const LEAVE_BOTTOM_PX = 24; // 距底部超过这么多 → 用户已离开底部，停止跟随
+const BACK_TO_BOTTOM_PX = 12; // 回到距底部这么多以内 → 用户滚回了底部，恢复跟随
 
 // 问题1修复: 把后端真实的 intent（或前端本地预设的 mode）映射成可读徽章。
 // 顺序：服务端 intent > 前端预设 mode > 兜底 RAG。
@@ -238,13 +253,23 @@ export function ChatInterface() {
   const [lastQuery, setLastQuery] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
-  const bottomRef = useRef<HTMLDivElement>(null);
   // 真正的滚动容器。自动吸底必须操作**它**，不能用 scrollIntoView ——
   // scrollIntoView 会连带滚动所有祖先容器，在嵌套布局里会把整页顶走。
   const scrollRef = useRef<HTMLDivElement>(null);
   // "是否贴底"。用 ref 而不是只靠 state：吸底判断发生在 effect 里，需要读到
   // 最新值却不想因此重新订阅 effect（否则每次滚动都会重跑吸底逻辑）。
   const pinnedRef = useRef(true);
+  // 上一次"自动吸底"落到的 scrollTop。**这是判断"用户有没有自己滚过"最可靠的
+  // 信号**：内容变长只改 scrollHeight、不改 scrollTop，所以只要这个值没变，就
+  // 一定不是用户滚的 —— 哪怕某一次渲染让内容一次性长高了 300px（一次性渲染出
+  // 引用来源列表时就会），也不该把忠实贴底的用户误判成"已离开底部"。
+  const autoScrollTopRef = useRef<number | null>(null);
+  // "回到最新"的平滑滚动进行中。这段时间里 scroll 事件会持续上报"离底部还很远"，
+  // 不能让它把刚点亮的 pinnedRef 又刷成 false（否则点完按钮反被判定成"用户滚
+  // 上去了"）。
+  const smoothScrollingRef = useRef(false);
+  // 触摸起点 Y：手指下滑（clientY 变大）= 想看上面的历史。
+  const touchStartYRef = useRef<number | null>(null);
   const [showJumpToLatest, setShowJumpToLatest] = useState(false);
   // 上一次的消息条数：用来区分"新增了一条消息"和"同一条消息在流式增长"。
   const prevCountRef = useRef(0);
@@ -306,36 +331,136 @@ export function ChatInterface() {
     toast.success("对话已导出为 Markdown");
   };
 
+  // 用户主动往上滚（滚轮 / 触摸 / 方向键）→ **同步**解除吸底。
+  //
+  // 只靠 onScroll 不够 —— 这正是本 BUG 的根因：滚轮与触控板的滚动是浏览器在随后
+  // 几帧里陆续应用的，scroll 事件因此晚于用户输入；而流式回答时 token 每几十毫秒
+  // 就来一次，吸底 effect 跑得比 scroll 事件还勤。于是 effect 常常赶在 scroll 事件
+  // 送达之前，拿着"还没来得及变 false 的 pinnedRef"把 scrollTop 拉回底部 —— 用户
+  // 那一次向上滚当场被抹掉，pinnedRef 也就永远等不到变 false 的机会，表现就是
+  // "AI 回答时鼠标完全滚不动"。wheel / touchmove / keydown 都是同步派发的输入事件，
+  // 在这里立刻解除吸底，才能在下一个 token 到达前把状态定下来。
+  //
+  // ⚠️ 这里**不能**用"当前是否贴底"当守卫。曾经写成
+  // `if (scrollHeight - scrollTop - clientHeight <= BACK_TO_BOTTOM_PX) return;`，
+  // 看着像"已经贴底就别解除，省得『回到最新』按钮在底部反复闪"，其实与自身存在
+  // 的理由直接矛盾：wheel 是**同步**派发的，事件到达的那一刻这一帧的滚动还没落地，
+  // DOM 依然读得出"贴底"。于是用户从底部开始上滑的第一下必然命中这个 return ——
+  // 守卫恰好把自己唯一该留下来的那次给挡掉了，同步解除从未发生，BUG 原样复现。
+  // 判据必须是**输入**（用户做了什么），不能是**结果位置**（DOM 现在读起来怎样）。
+  // 抖动过滤因此上移到调用方，按输入幅度阈值做，而不是在这里按位置做。
+  const releasePin = useCallback(() => {
+    // 用户一旦有输入，就不再处于"回到最新"的平滑滚动中
+    smoothScrollingRef.current = false;
+    pinnedRef.current = false;
+    setShowJumpToLatest(true);
+  }, []);
+
+  const handleWheel = useCallback(
+    (event: ReactWheelEvent<HTMLDivElement>) => {
+      // 抖动过滤在这里做（按**输入幅度**，理由见 releasePin 的注释）：
+      // deltaY < 0 = 向上滚（看历史）；触控板惯性回弹会吐出 -1~-7 的噪声，
+      // 不值得为它解除吸底。
+      if (event.deltaY <= -8) releasePin();
+    },
+    [releasePin]
+  );
+
+  const handleTouchStart = useCallback(
+    (event: ReactTouchEvent<HTMLDivElement>) => {
+      const touch = event.touches[0];
+      if (!touch) return;
+      touchStartYRef.current = touch.clientY;
+    },
+    []
+  );
+
+  const handleTouchMove = useCallback(
+    (event: ReactTouchEvent<HTMLDivElement>) => {
+      const start = touchStartYRef.current;
+      const touch = event.touches[0];
+      if (start === null || !touch) return;
+      // 手指下滑（clientY 变大）= 想看上面的历史。同样按输入幅度过滤：
+      // 位移 > 8px 才解除，抹掉手指微抖。
+      if (touch.clientY - start > 8) releasePin();
+    },
+    [releasePin]
+  );
+
+  const handleKeyDown = useCallback(
+    (event: ReactKeyboardEvent<HTMLDivElement>) => {
+      // 容器里有可聚焦元素（引用锚点、按钮），方向键 / PageUp / Home 会滚动它
+      if (
+        event.key === "ArrowUp" ||
+        event.key === "PageUp" ||
+        event.key === "Home"
+      ) {
+        // 方向键 / PageUp / Home 本身就是明确的离散输入，不需要抖动阈值，
+        // 一次按键 = 一次明确意图，无条件解除。
+        releasePin();
+      }
+    },
+    [releasePin]
+  );
+
   const handleScroll = useCallback(() => {
     const el = scrollRef.current;
     if (!el) return;
     const distance = el.scrollHeight - el.scrollTop - el.clientHeight;
-    const pinned = distance <= BOTTOM_THRESHOLD;
-    pinnedRef.current = pinned;
-    // 用户自己滚回底部时，立刻收起"回到最新"按钮
-    if (pinned) setShowJumpToLatest(false);
+
+    // 我们自己发起的平滑滚动（点"回到最新"）途中不做"离开底部"判定，
+    // 否则动画期间持续上报的大距离会把刚点亮的 pinnedRef 又刷成 false。
+    if (smoothScrollingRef.current) {
+      if (distance <= BACK_TO_BOTTOM_PX) smoothScrollingRef.current = false;
+      autoScrollTopRef.current = el.scrollTop;
+      return;
+    }
+
+    // 迟滞：离开用大阈值、回来用小阈值，中间地带保持原状态不横跳。
+    if (distance > LEAVE_BOTTOM_PX) {
+      pinnedRef.current = false;
+      setShowJumpToLatest(true);
+    } else if (distance <= BACK_TO_BOTTOM_PX) {
+      pinnedRef.current = true;
+      // 用户自己滚回底部时，立刻收起"回到最新"按钮
+      setShowJumpToLatest(false);
+    }
+    // 记住当前位置：下一次吸底 effect 用它判断"是不是用户滚的"
+    autoScrollTopRef.current = el.scrollTop;
   }, []);
 
   const jumpToLatest = useCallback(() => {
     const el = scrollRef.current;
     if (!el) return;
     pinnedRef.current = true;
+    smoothScrollingRef.current = true;
     setShowJumpToLatest(false);
+    // 只有**用户点击**这条路径用 smooth：流式跟随是 instant 的（见下面吸底 effect
+    // 的第 3 条），token 一到，effect 的 instant 定位会当场把正在跑的 smooth 动画
+    // 打断 —— 用户看到的是直接瞬移到底，而不是剩下的那半段缓动。所以 smooth 在
+    // 流式期间事实上无效，别指望它。
     el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
   }, []);
 
   // 自动吸底。
   //
-  // 旧写法是 `bottomRef.current?.scrollIntoView({behavior:"smooth"})`，依赖数组
+  // 旧写法是 `scrollIntoView({behavior:"smooth"})`，依赖数组
   // 是 [messages] —— 而流式回答时 messages **每个 token 都会变**，于是每个 token
   // 都触发一次平滑滚动，把视口强行拽到底部。用户往上滚就被立刻拉回去，
-  // 表现就是"AI 回答时鼠标滚不动"。这里做三件事修掉它：
+  // 表现就是"AI 回答时鼠标滚不动"。这里做四件事修掉它：
   //
   // 1. **只在用户本就贴底时才跟随**（pinnedRef）。用户滚上去读历史 → 不打扰，
   //    改为显示"回到最新"按钮让他自己决定什么时候回去。
   // 2. **直接设 scrollTop**，不用 scrollIntoView —— 后者会连带滚动祖先容器。
-  // 3. **流式增长用即时滚动**（scrollTop 赋值），不用 smooth：smooth 动画会被
-  //    高频 token 不断打断重来，既追不上也费性能。
+  // 3. **流式增长用即时滚动**：用 behavior:"instant" 而不是 "auto"，因为 "auto"
+  //    会去读 CSS scroll-behavior，一旦哪天被设成 smooth，高频 token 就会不断
+  //    打断重启动画，既追不上也费性能。
+  // 4. **现场比对 scrollTop，不迷信"上一次 scroll 事件"留下的 pinnedRef**。这是
+  //    本 BUG 的真正根因：滚轮 / 触控板的滚动由浏览器在随后几帧里陆续应用，scroll
+  //    事件晚于用户输入；而 token 每几十毫秒来一次，effect 跑得比 scroll 事件还勤，
+  //    于是它常常拿着"还没来得及变 false 的 pinnedRef"把 scrollTop 拉回底部，用户
+  //    那一次向上滚当场被抹掉。现在先比对 autoScrollTopRef（我们上次吸底落在哪儿）
+  //    确认"不是用户滚的"，再决定跟随。
   //
   // 例外：消息**条数增加**（用户提问 / 新一轮回答开始）时无条件回到底部 ——
   // 刚发出的消息必须可见，哪怕此前在翻历史。
@@ -346,14 +471,28 @@ export function ChatInterface() {
     const grew = messages.length > prevCountRef.current;
     prevCountRef.current = messages.length;
 
-    if (grew || pinnedRef.current) {
-      el.scrollTop = el.scrollHeight;
+    // 用户自己滚过吗？内容变长不会动 scrollTop，所以它一变，就一定是人滚的。
+    const userScrolled =
+      autoScrollTopRef.current !== null &&
+      Math.abs(el.scrollTop - autoScrollTopRef.current) > 1;
+
+    if (grew || (pinnedRef.current && !userScrolled)) {
+      // 这里的 scrollTo 是 instant：它会无条件打断上一次「回到最新」那次
+      // smooth（scrollTo 到同一个位置时更是直接变成空操作，连一个 scroll 事件
+      // 都不会发）。若不在这里把标记清掉，smoothScrollingRef 会永久卡在 true，
+      // 之后每个 scroll 事件都走"平滑滚动中"的早退分支，pinnedRef 再也不会被
+      // 刷新 —— 表现为整个会话里都被强制吸底。
+      smoothScrollingRef.current = false;
+      el.scrollTo({ top: el.scrollHeight, behavior: "instant" });
       pinnedRef.current = true;
+      autoScrollTopRef.current = el.scrollTop;
       setShowJumpToLatest(false);
       return;
     }
 
     // 内容在长、但用户已经滚上去看历史 → 不抢他的滚动位置
+    pinnedRef.current = false;
+    autoScrollTopRef.current = el.scrollTop;
     setShowJumpToLatest(true);
   }, [messages]);
 
@@ -756,6 +895,15 @@ export function ChatInterface() {
           <div
             ref={scrollRef}
             onScroll={handleScroll}
+            onWheel={handleWheel}
+            onTouchStart={handleTouchStart}
+            onTouchMove={handleTouchMove}
+            onKeyDown={handleKeyDown}
+            // tabIndex={-1}：让这个滚动容器**可聚焦**（点击容器空白处即可），但
+            // 不把它塞进 Tab 键序里打扰键盘用户。缺了它，onKeyDown 只在容器内
+            // 的可聚焦元素（引用锚点、按钮）拿到焦点时才收得到事件，其余区域按
+            // 方向键就是"没反应"，解吸底也就跟着失效。
+            tabIndex={-1}
             className="min-h-0 flex-1 overflow-y-auto px-4 py-4 sm:px-6"
           >
             {messages.length === 0 ? (
@@ -1051,7 +1199,6 @@ export function ChatInterface() {
                     )}
                   </div>
                 ))}
-                <div ref={bottomRef} />
               </div>
             )}
 

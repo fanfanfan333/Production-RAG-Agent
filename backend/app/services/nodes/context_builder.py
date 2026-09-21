@@ -21,6 +21,7 @@ Context Builder（架构图 Context Builder 节点）.
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 from app.config import get_settings
@@ -98,6 +99,43 @@ class BuiltContext:
     masked_count: int         # 被安全过滤命中的片段数
     expanded_count: int       # 被 small-to-big 父块回填的片段数
     compressed_count: int = 0  # 被 Context Compression 裁剪的片段数
+    # ── 【T4】第 12 环对象级校验的产物（未传 pred 时恒为「无剔除」）────────────
+    dropped_count: int = 0     # 被对象级 ACL 剔除的片段数
+    acl_status: str = "clean"  # clean | partial | all_dropped
+
+
+def _schedule_acl_drop_audit(
+    outcome,
+    pred,
+    *,
+    user_id: str | None = None,
+    username: str | None = None,
+) -> None:
+    """
+    同步装配路径的第 12 环审计调度（**best-effort**）.
+
+    ``build_context`` 是同步函数，而 ``audit_acl_drops`` 是协程。两种做法：
+    (a) 把 ``build_context`` 改成 async —— 会波及 master_graph 两处调用点与
+    现有单测；(b) 在当前事件循环上派一个任务。选 (b)：审计是旁路副作用，
+    不该改变装配函数的同步契约。
+
+    无运行中的事件循环（同步脚本 / 单测环境）时**静默放弃**审计：审计永远
+    不能成为回答路径的失败点（与 ``audit_acl_drops`` 的 best-effort 口径一致）。
+    """
+    try:
+        import asyncio
+
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    try:
+        from app.services.nodes.final_check_node import audit_acl_drops
+
+        loop.create_task(
+            audit_acl_drops(outcome, pred, user_id=user_id, username=username)
+        )
+    except Exception:      # noqa: BLE001 — 调度失败同样不打断装配
+        logger.warning("build_context: acl drop audit scheduling failed", exc_info=True)
 
 
 def build_context(
@@ -106,6 +144,11 @@ def build_context(
     snippet_chars: int = 300,
     expand_parent: bool | None = None,
     query: str | None = None,
+    pred=None,
+    view_index=None,
+    materialized: bool | Mapping[str, bool] = True,
+    user_id: str | None = None,
+    username: str | None = None,
 ) -> BuiltContext:
     """
     把 *chunks* 组装成编号上下文.
@@ -118,6 +161,16 @@ def build_context(
         query:           用户问题（改写后的自包含问题最佳）。提供且
                          CONTEXT_COMPRESSION_ENABLED 时启用查询感知压缩；
                          None 时退化为按句子边界截断，行为向后兼容。
+        pred:            【T4】**可选**的 :class:`ScopePredicate`。给出时逐块走
+                         :func:`allows` 过滤（第 12 环），并给每条引用附
+                         ``permission_snapshot``；不给出时行为与改动前**逐字一致**。
+        view_index:      ``{document_id: {chunk_key: ObjectACLView}}``（见
+                         :func:`security_cascade.load_document_view_index`）。仅在
+                         给出 ``pred`` 时生效。
+        materialized:    对象权限行是否已物化；``False`` 时缺行回退允许（存量
+                         未回填文档不因新逻辑集体不可见）。亦可传
+                         ``{document_id: bool}``（``security_cascade.load_view_indexes``
+                         的逐文档结论）—— 缺失的文档按 ``False`` 处理。
 
     Returns:
         BuiltContext —— context 为空字符串表示没有任何证据
@@ -126,6 +179,36 @@ def build_context(
     # 图片 URL 口径与 multimodal 分支共用同一函数，避免两处各拼一遍（漂移）。
     # 惰性导入：仅在本函数被调用时解析，规避模块级循环导入。
     from app.services.nodes.multimodal_context_node import image_url_for
+
+    # ── 【T4】第 12 环对象级最终校验（未给 pred 时整段跳过，零行为变化）────────
+    acl_status = "clean"
+    dropped_count = 0
+    if pred is not None and view_index is not None:
+        from app.services.nodes.final_check_node import filter_chunks_by_acl
+
+        doc_ids = {str(getattr(c, "document_id", "") or "") for c in chunks}
+        # 【T4-批量】``materialized`` 既接受 ``bool``（广播给所有文档，向后兼容），
+        # 也接受 ``{document_id: bool}``（``load_view_indexes`` 的逐文档结论）。
+        # Mapping 里**缺失**的文档按 ``False``（未物化 ⇒ 缺行回退允许）处理。
+        if isinstance(materialized, Mapping):
+            mat_map = {
+                doc_id: bool(materialized.get(doc_id, False))
+                for doc_id in doc_ids if doc_id
+            }
+        else:
+            mat_map = {doc_id: bool(materialized) for doc_id in doc_ids if doc_id}
+        outcome = filter_chunks_by_acl(
+            chunks, pred, view_index, materialized=mat_map
+        )
+        # 【T5 上线前修复】第 12 环剔除必须留痕 —— 见 _schedule_acl_drop_audit。
+        if outcome.dropped:
+            _schedule_acl_drop_audit(
+                outcome, pred, user_id=user_id, username=username
+            )
+        chunks = list(outcome.allowed)
+        dropped_count = outcome.dropped_count
+        acl_status = outcome.status
+
     use_parent = (
         settings.HIERARCHICAL_RAG_ENABLED if expand_parent is None else expand_parent
     )
@@ -142,6 +225,8 @@ def build_context(
             masked_count=0,
             expanded_count=0,
             compressed_count=0,
+            dropped_count=dropped_count,
+            acl_status=acl_status,
         )
 
     parts: list[str] = []
@@ -236,6 +321,28 @@ def build_context(
             "manual_review": bool(chunk.manual_review),
         })
 
+        # ── 【T4】引用权限快照（决策 16）：只存指纹，不存明文权限属性 ──────────
+        if pred is not None:
+            from app.services.nodes.final_check_node import (
+                SNAPSHOT_KEY,
+                build_permission_snapshot,
+                chunk_key as _chunk_key,
+                derive_parent_object_id,
+                object_type_of_chunk,
+            )
+
+            doc_key = str(chunk.document_id)
+            _view = (view_index or {}).get(doc_key, {}).get(_chunk_key(chunk))
+            sources[-1][SNAPSHOT_KEY] = build_permission_snapshot(
+                _view,
+                pred,
+                object_id=str(_view.object_id) if _view is not None else _chunk_key(chunk),
+                object_type=object_type_of_chunk(chunk.content_type, chunk.image_id),
+                parent_object_id=derive_parent_object_id(
+                    doc_key, chunk.content_type, chunk.image_id
+                ),
+            )
+
     if masked:
         logger.warning(
             "Context builder masked %d document chunk(s) before generation", masked
@@ -257,6 +364,8 @@ def build_context(
         masked_count=masked,
         expanded_count=expanded,
         compressed_count=compressed,
+        dropped_count=dropped_count,
+        acl_status=acl_status,
     )
 
 

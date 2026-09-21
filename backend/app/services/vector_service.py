@@ -227,6 +227,22 @@ async def _ensure_payload_indexes(collection_name: str) -> None:
         # ── Parent-Child：按父块/章节聚合（同父去重、章节级回填）──────────────
         ("parent_id", qmodels.PayloadSchemaType.KEYWORD),
         ("section_id", qmodels.PayloadSchemaType.KEYWORD),
+        # ── FIX-E（T5 预发布）：五维隔离过滤字段索引（Deny-4/5/6 前置剪枝用）────
+        # 这 9 个字段是 Qdrant 侧密级 / 项目 / deny / 剔除过滤的输入。不建索引时
+        # 过滤退化成全量扫描（性能问题 + 可被放大量候选池拖垮的 DoS 面）。
+        # 类型：数值用 INTEGER/FLOAT，字符串用 KEYWORD，数组用 KEYWORD（Qdrant
+        # 自动按数组处理）。保持本函数**幂等**（已存在的索引异常被忽略）。
+        ("security_level", qmodels.PayloadSchemaType.INTEGER),
+        ("parent_security_level", qmodels.PayloadSchemaType.INTEGER),
+        ("effective_security_level", qmodels.PayloadSchemaType.INTEGER),
+        ("visibility_mode", qmodels.PayloadSchemaType.KEYWORD),
+        ("project_ids", qmodels.PayloadSchemaType.KEYWORD),
+        ("acl_allow", qmodels.PayloadSchemaType.KEYWORD),
+        ("acl_deny", qmodels.PayloadSchemaType.KEYWORD),
+        ("excluded", qmodels.PayloadSchemaType.BOOL),
+        # acl_expires_at_ts：Qdrant 无法对 keyword 时间字段做比较，过期判定必须
+        # 走数值（与 security_policy.P_ACL_EXPIRES_AT_TS 同义）。
+        ("acl_expires_at_ts", qmodels.PayloadSchemaType.FLOAT),
     ]
     for field_name, schema in indexes:
         try:

@@ -235,6 +235,8 @@ export async function getStaffCompanies(): Promise<CompanyOption[]> {
     companyId: String(raw.company_id ?? ""),
     companyName: String(raw.company_name ?? raw.company_id ?? ""),
     memberCount: Number(raw.member_count ?? 0),
+    isTest: Boolean(raw.is_test ?? false),
+    canRename: Boolean(raw.can_rename ?? false),
   }));
 }
 

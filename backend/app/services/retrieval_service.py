@@ -21,8 +21,19 @@ from app.db.qdrant import get_qdrant_client
 from app.services.embedding_service import embed_batch_with_retry
 from app.services.evidence_trust import apply_trust_weighting, compute_trust
 from app.services.hybrid_search import BM25Index, rrf_fuse
+from app.services.audit_service import record_audit
 from app.services.metadata import MetadataFilter, matches_payload
 from app.services.pg_keyword_search import keyword_search
+from app.services.security_policy import (
+    Decision,
+    ObjectACLView,
+    ScopeCompileError,
+    ScopePredicate,
+    allows,
+    to_qdrant,
+    to_sql,
+)
+from app.services.security_scope import UserScope, cache_key_for_scope
 from app.services.tenancy import (
     DEFAULT_TENANT_ID,
     document_scope_clause,
@@ -410,6 +421,7 @@ async def _scroll_corpus(
     collection_id: str | None,
     max_points: int,
     tenant_ids: frozenset[str] | None = None,
+    pred: ScopePredicate | None = None,
 ) -> list[RetrievedChunk]:
     """
     Scroll the whole Qdrant collection (payload only, no vectors).
@@ -419,8 +431,30 @@ async def _scroll_corpus(
 
     ``tenant_ids`` 语义与 ``tenant_clause`` 三分支一致：空集 → fail-closed
     返回空语料；``None``（诊断）→ 不加租户条件；非空 → ``MatchAny``。
+
+    *pred*（【T3】）：给了五维 ``ScopePredicate`` 时，语料过滤改用**与向量腿
+    同一份** ``to_qdrant(pred)``（含 Deny-4/5/6），``tenant_ids`` 参数随之忽略。
+    这样内存 BM25 与向量腿的可见集合同源，不会出现"一条腿看得见、另一条看不见"。
     """
     from qdrant_client.http import models as qmodels
+
+    if pred is not None:
+        # 五维同源：语料在向量库侧就按 clearance / 项目 / deny 裁剪。
+        # collection_id 仍是业务知识库范围（与向量腿的 must 叠加口径一致）。
+        base = to_qdrant(pred)
+        must = []
+        if collection_id:
+            must.append(
+                qmodels.FieldCondition(
+                    key="collection_id",
+                    match=qmodels.MatchValue(value=collection_id),
+                )
+            )
+        must_not = list(getattr(base, "must_not", None) or [])
+        scroll_filter = qmodels.Filter(
+            must=must or None, must_not=must_not or None,
+        )
+        return await _scroll_pages(client, collection_name, scroll_filter, max_points)
 
     if tenant_ids is not None and not tenant_ids:
         # fail-closed：空集没有任何租户，语料为空（绝不退化成"不限制"）
@@ -452,6 +486,16 @@ async def _scroll_corpus(
         )
     scroll_filter = qmodels.Filter(must=must) if must else None
 
+    return await _scroll_pages(client, collection_name, scroll_filter, max_points)
+
+
+async def _scroll_pages(
+    client,
+    collection_name: str,
+    scroll_filter,
+    max_points: int,
+) -> list[RetrievedChunk]:
+    """实际的分页 scroll（含 payload → RetrievedChunk 的字段映射）."""
     corpus: list[RetrievedChunk] = []
     offset = None
     while len(corpus) < max_points:
@@ -506,6 +550,8 @@ async def _bm25_candidates(
     client,
     tenant_ids: frozenset[str] | None = None,
     perm_context: str = "anonymous",
+    scope: "UserScope | None" = None,
+    pred: "ScopePredicate | None" = None,
 ) -> list[RetrievedChunk]:
     """
     Keyword (BM25) leg of the hybrid search.
@@ -518,25 +564,40 @@ async def _bm25_candidates(
 
     缓存键 = tenant_id + 权限上下文 + collection 范围（第三层：缓存隔离），
     租户/权限视图不同的请求不会命中同一份语料索引。
+
+    【T3】*scope* 给了五维 ``UserScope`` 时：
+      · 缓存键经 ``cache_key_for_scope(scope, raw)``（决策 9：按指纹分区）；
+      · 语料 scroll 用**同一份** ``to_qdrant(pred)``（与向量腿同源）。
     """
     settings = get_settings()
-    cache_key = scoped_cache_key(
-        tenant_ids,
-        perm_context,
-        f"bm25::{collection_id or '__all__'}::{owner_id or '__admin__'}",
-    )
+    if scope is not None:
+        cache_key = cache_key_for_scope(
+            scope, f"bm25::{collection_id or '__all__'}::{owner_id or '__admin__'}"
+        )
+    else:
+        cache_key = scoped_cache_key(
+            tenant_ids,
+            perm_context,
+            f"bm25::{collection_id or '__all__'}::{owner_id or '__admin__'}",
+        )
 
     now = time.monotonic()
     cached = _bm25_cache_get(cache_key, settings.HYBRID_CACHE_TTL_SECONDS)
     if cached is not None:
         _, visible, index = cached
     else:
+        # 【T3 同一 pred 只构造一次（决策 6.1）】入口已编译好的 ``pred`` 直接复用
+        # —— 与向量腿 ``to_qdrant(pred)``、PG 关键词腿 ``to_sql(pred)`` 共用**同一个**
+        # ScopePredicate 实例。仅当未提供 pred 时才从 scope 现编（兼容旧调用点）。
+        if pred is None and scope is not None:
+            pred = scope.predicate()
         corpus = await _scroll_corpus(
             client,
             collection_name,
             collection_id,
             settings.HYBRID_MAX_CORPUS_POINTS,
             tenant_ids=tenant_ids,
+            pred=pred,
         )
         # 截断**必须告警**。旧实现静默截断到 10000 条 —— 1000 份文档时关键词腿
         # 只看得到前 5% 的语料，其余永远召不回来，而且没有任何日志。用户得到
@@ -581,6 +642,8 @@ async def _pg_keyword_candidates(
     owns_tenant_ids: frozenset[str],
     unrestricted: bool,
     metadata_filter: MetadataFilter | None = None,
+    scope: "UserScope | None" = None,
+    pred: "ScopePredicate | None" = None,
 ) -> list[tuple[str, int, str]]:
     """
     关键词腿的 PostgreSQL 实现（上千文档时的默认后端）.
@@ -597,6 +660,10 @@ async def _pg_keyword_candidates(
     返回 ``[(document_id, chunk_index, point_id), ...]``（按 ts_rank_cd 降序）。
     point_id 用于把命中点的 payload 取回来（``_fetch_by_point_ids``）——
     关键词腿否则无法给出"只有它命中的 chunk"的正文。
+
+    【T3 双路同源】*scope* 给了五维 ``UserScope`` 时透传给 ``keyword_search``，
+    由它用 ``to_sql(scope.predicate(), Document)`` 下推 —— 与向量腿的
+    ``to_qdrant(pred)`` 由**同一个** ``ScopePredicate`` 编译（决策 6.1）。
     """
     from app.db.postgres import get_db_session
 
@@ -614,6 +681,11 @@ async def _pg_keyword_candidates(
                 collection_id=collection_id,
                 unrestricted=unrestricted,
                 metadata_filter=metadata_filter,
+                scope=scope,
+                # 【T3 双路同源】把入口编译好的**同一个** pred 透传给 keyword_search，
+                # 由它 to_sql(pred, Document) 下推 —— 与向量腿 to_qdrant(pred)
+                # 用的是同一个 ScopePredicate 实例（决策 6.1，不再是各腿各自现编）。
+                pred=pred,
             )
     except Exception:
         logger.exception("PG keyword leg failed — falling back to vector-only")
@@ -1175,6 +1247,179 @@ def _search_query_sets(
     return both, vector_only
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Query ⇄ Scope 绑定体（决策 15-1：文本可变、Scope 不可变）
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@dataclass(frozen=True)
+class ScopedQuery:
+    """一条"待检索查询"与其 Scope 的**绑定体**（决策 15-1）.
+
+    ``text`` 可换（改写 / 变体 / 子问题 / HyDE），``scope`` **恒为同一实例**：
+    :meth:`with_text` 用 ``dataclasses.replace(self, text=...)`` 只替换文本，
+    ``scope`` 字段**不出现在参数表里** —— 想换也换不了。
+
+    这是"改写只能改 query 文本、不能改 Scope"的**结构保证**（不靠约定、也不靠
+    code review）。本类刻意放在检索层（而非权限模块）：它是"检索入口"的输入
+    契约，与 :func:`retrieve_chunks_scoped` 同处一层。
+    """
+
+    text: str
+    scope: UserScope                 # frozen；同一请求内是**同一个对象**
+    kind: str = "main"               # main | variant | subquery | hyde（日志用）
+
+    def with_text(self, new_text: str) -> "ScopedQuery":
+        """**唯一**允许改写入口：只换 ``text``，``scope`` 原样透传。"""
+        return replace(self, text=new_text)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 第 11 环：对象级复核 + 越权审计（决策 10 的第 11 环）
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+async def _record_acl_drop(
+    decision: Decision,
+    *,
+    object_id: str,
+    document_id: str,
+    stage: str,
+    scope_fingerprint: str | None,
+) -> None:
+    """
+    记录一次"因权限被剔除"的审计（共享知识 13：``acl.drop.<stage>``）.
+
+    复用 :func:`audit_service.record_audit` 现有能力（不新增函数）；``AuditLog``
+    的 ``resource_id`` 是 ``String(64)``、``detail`` 截断 2000 字符 —— 这里对
+    ``object_id`` 主动截断，避免超长写崩。
+    """
+    try:
+        await record_audit(
+            f"acl.drop.{stage}",
+            resource_type="document_object",
+            resource_id=str(object_id or document_id or "")[:64] or None,
+            detail=(
+                f"stage={stage}; reason={decision.reason}; gate={decision.gate}; "
+                f"document_id={document_id}; scope_fp={scope_fingerprint or '-'}"
+            ),
+        )
+    except Exception:      # noqa: BLE001 — 审计是旁路，坏掉不能影响检索
+        logger.exception("acl.drop audit failed (stage=%s, doc=%s)", stage, document_id)
+
+
+async def _object_level_filter(
+    chunks: list[RetrievedChunk],
+    payloads: dict[tuple[str, int], dict],
+    pred: ScopePredicate,
+    *,
+    stage: str,
+    scope_fingerprint: str | None,
+) -> tuple[list[RetrievedChunk], int]:
+    """
+    出参前的**对象级**复核（第 11 环）::
+
+        对每个候选：``allows(pred, ObjectACLView.from_payload(payload))``。
+        被剔除的对象 → 写审计（``acl.drop.<stage>``）并丢弃。
+
+    为什么必须是**对象级**而不是文档级：文档级只能判"这份文档我能不能看"，
+    无法表达"这张图 / 这个表格被单独提级或剔除"。图片/表格/代码块的对象级
+    收紧只有在这一层才生效（PRD P0-6）。
+
+    取不到 payload 的候选（例如内存 BM25 腿只给了 ``RetrievedChunk``）：**保留**，
+    交由文档级 ``valid_docs`` 与前置过滤共同兜底 —— 不因为"拿不到对象视图"就
+    凭空丢弃证据（那会把可用召回也一起杀掉）。
+
+    Returns:
+        ``(保留的 chunks, 被剔除计数)``
+    """
+    kept: list[RetrievedChunk] = []
+    dropped = 0
+    for chunk in chunks:
+        payload = payloads.get(_chunk_key(chunk))
+        if payload is None:
+            kept.append(chunk)
+            continue
+        decision = allows(pred, ObjectACLView.from_payload(payload))
+        if decision.allowed:
+            kept.append(chunk)
+            continue
+        dropped += 1
+        await _record_acl_drop(
+            decision,
+            object_id=str(payload.get("object_id") or ""),
+            document_id=chunk.document_id,
+            stage=stage,
+            scope_fingerprint=scope_fingerprint,
+        )
+    return kept, dropped
+
+
+async def retrieve_chunks_scoped(
+    query: str,
+    *,
+    scope: UserScope,
+    top_k: int = 5,
+    score_threshold: float = 0.0,
+    collection_name: str | None = None,
+    collection_id: str | None = None,
+    extra_queries: list[str] | None = None,
+    extra_vector_queries: list[str] | None = None,
+    enable_hierarchical: bool | None = None,
+    metadata_filter: MetadataFilter | None = None,
+) -> list[RetrievedChunk]:
+    """
+    **唯一推荐**的用户请求检索入口（决策 10-①：签名强制）.
+
+    四层"Query 必须绑定 Scope"的结构保证，本函数是第①层的落点：
+
+      ① 签名强制 —— ``scope`` 是**必填关键字参数**；入口只有一个，任何用户请求
+         都必须把 ``UserScope`` 带进来（由 ``app/api/query.py`` 一次性签发）。
+      ② 运行时不可变 —— ``UserScope`` / ``ScopePredicate`` 均 ``frozen=True``，
+         集合字段一律 ``frozenset``；链路内任何"补权限"的写法都会
+         ``FrozenInstanceError``，而不是悄悄生效。
+      ③ CI 静态门禁（AST）—— ``tests/test_no_unscoped_retrieval.py`` 扫描所有
+         ``retrieve_chunks`` / ``keyword_search`` / ``client.search`` /
+         ``client.scroll`` 调用点，断言必须带 ``scope=``（或 ``unrestricted=``）
+         或位于显式白名单 —— "漏传"在合并前就被拦下，而不是等线上发现。
+      ④ 禁止链路内重新签发 —— 这里**只消费**传入的 ``scope``，绝不调用
+         ``scope_for`` / ``request_security_scope``（同一门禁强制）。
+
+    兼容性：既有 :func:`retrieve_chunks` **保留不动**。它的既有 fail-closed
+    （无任何权限上下文时 ``return []``）继续生效，因此"漏传 scope"的后果是
+    **空结果**，不是全库。
+
+    Args:
+        scope: 请求级五维权限（``UserScope``，frozen）。
+        query / top_k / ...: 见 :func:`retrieve_chunks`。
+
+    Returns:
+        ``list[RetrievedChunk]``，best first；``scope`` 为 ``None`` 时 fail-closed 返回 ``[]``。
+    """
+    if scope is None:
+        logger.error(
+            "retrieve_chunks_scoped called without a UserScope — refused (fail-closed)"
+        )
+        return []
+    return await retrieve_chunks(
+        query=query,
+        top_k=top_k,
+        score_threshold=score_threshold,
+        collection_name=collection_name,
+        owner_id=str(scope.base.owner_id) if scope.base.owner_id else None,
+        collection_id=collection_id,
+        extra_queries=extra_queries,
+        extra_vector_queries=extra_vector_queries,
+        enable_hierarchical=enable_hierarchical,
+        tenant_ids=scope.base.tenant_ids,
+        user_department_id=scope.base.department_id,
+        tenant_wide=scope.base.tenant_wide,
+        owns_tenant_ids=scope.base.owns_tenant_ids,
+        metadata_filter=metadata_filter,
+        scope=scope,
+    )
+
+
 @timed_stage("retrieval")
 async def retrieve_chunks(
     query: str,
@@ -1192,6 +1437,7 @@ async def retrieve_chunks(
     owns_tenant_ids: frozenset[str] = frozenset(),
     unrestricted: bool = False,
     metadata_filter: MetadataFilter | None = None,
+    scope: "UserScope | None" = None,
 ) -> list[RetrievedChunk]:
     """
     两阶段检索：粗排（召回+融合）→ 精排（cross-encoder rerank）.
@@ -1221,6 +1467,13 @@ async def retrieve_chunks(
         owns_tenant_ids   「可见他人 private」的租户集合（仅 admin = 自建测试公司）。
         unrestricted      **仅供后端诊断脚本 / 系统内部调用**：完全不做权限过滤。
                           任何用户请求路径都不允许传它。
+        scope             请求级五维 ``UserScope``（**推荐入口**
+                          :func:`retrieve_chunks_scoped` 透传）。给了它时：
+                          ① 五维条件由**同一份** ``to_qdrant(pred)`` 下推（第 7 环
+                          向量腿 + 内存 BM25 scroll），PG 关键词腿走 ``to_sql(pred)``；
+                          ② 出参前做**对象级** ``allows(pred, obj)`` 复核（第 11 环）；
+                          ③ 权限相关缓存键按 ``scope_fingerprint`` 分区。
+                          ``None``（兼容旧调用点）时退回既有三维标量行为。
 
     注意：``private / NULL`` 层级只按 ``owner_id == 我`` 判定、**不参与租户过滤**；
     ``department / tenant`` 层级才受 ``tenant_ids`` 约束。``tenant_wide`` 只放宽
@@ -1251,7 +1504,24 @@ async def retrieve_chunks(
     client = get_qdrant_client()
     coll = collection_name or settings.QDRANT_COLLECTION
 
-    if not unrestricted and not (
+    # ── 五维 Scope 编译（唯一 IR 输入；同一次请求只编译一次）─────────────────
+    # ``scope`` 给了 → 三个编译器（to_qdrant / to_sql / allows）共用这**同一个**
+    # frozen ``ScopePredicate`` 实例（决策 6.1「同一 pred 只构造一次」）。
+    # 任何编译失败都**不得降级为不过滤** —— fail-closed 返回空（共享知识 7）。
+    pred: ScopePredicate | None = None
+    scope_fingerprint: str | None = None
+    if scope is not None and not unrestricted:
+        try:
+            pred = scope.predicate()
+        except ScopeCompileError:
+            logger.exception("retrieve_chunks: scope.predicate() 编译失败 — fail-closed 返回空")
+            return []
+        except Exception:      # noqa: BLE001
+            logger.exception("retrieve_chunks: 无法编译 ScopePredicate — fail-closed 返回空")
+            return []
+        scope_fingerprint = scope.scope_fingerprint
+
+    if not unrestricted and pred is None and not (
         owner_id is not None
         or tenant_ids is not None          # 空集也算"给了范围"（fail-closed）
         or tenant_wide
@@ -1259,6 +1529,8 @@ async def retrieve_chunks(
     ):
         # fail-closed：调用方没有给出任何权限上下文时**不检索**，而不是"默认全开"。
         # 历史实现里"什么都不传 = admin 全览"，任何一处漏传权限参数都会静默越权。
+        # 传了 ``scope`` 即视为"给了权限上下文"（哪怕五维全空 —— 那也由编译器
+        # 的 fail-closed 分支兜住，而不是在这里退化成"不限制"）。
         logger.error(
             "retrieve_chunks called without any permission scope — refused (fail-closed). "
             "Pass owner_id/tenant_ids from tenancy.request_scope(), or unrestricted=True "
@@ -1327,11 +1599,38 @@ async def retrieve_chunks(
                     _summarize_metadata_filter(metadata_filter),
                 )
 
-    # 可见性前置过滤（个人库 / 部门库）—— 与 tenant / metadata 过滤**同层**，
-    # 都在 ANN 之前。不下推的话，同公司内别人的私库向量会占满候选名额，再被
-    # PG 侧 ACL 丢掉，用户自己的文档可能一份都进不了候选池（见
+    # 可见性前置过滤（个人库 / 部门库 / 密级 / 项目 / deny）—— 与 tenant / metadata
+    # 过滤**同层**，都在 ANN 之前。不下推的话，同公司内别人的私库向量会占满候选
+    # 名额，再被 PG 侧 ACL 丢掉，用户自己的文档可能一份都进不了候选池（见
     # _visibility_conditions 的详细说明）。
-    if not unrestricted and getattr(settings, "ACL_PREFILTER_ENABLED", True):
+    #
+    # 【T3 双路同源下推（决策 6）】
+    #   * 有 ``pred``（推荐入口）→ 用**同一份** ``to_qdrant(pred)``：它内部已复用
+    #     既有 Deny-1/2/3，并追加 Deny-4 密级 / Deny-5 项目 / Deny-6 剔除·deny。
+    #     此时**不再叠加** ``_visibility_conditions`` —— 后者与 to_qdrant 的 Deny-3
+    #     有已知分歧（前者不豁免 owner/project），叠加会把已对齐的例外又排除掉。
+    #   * 无 ``pred``（旧调用点）→ 保持既有三维行为，一行不改。
+    if not unrestricted and pred is not None:
+        try:
+            scope_filter = to_qdrant(pred)
+        except ScopeCompileError:
+            logger.exception("retrieve_chunks: to_qdrant(pred) 编译失败 — fail-closed 返回空")
+            return []
+        acl_conds = list(getattr(scope_filter, "must_not", None) or [])
+        if acl_conds:
+            from qdrant_client.http import models as qmodels
+
+            if search_filter is None:
+                search_filter = qmodels.Filter(must_not=list(acl_conds))
+            else:
+                search_filter.must_not = (
+                    list(search_filter.must_not or []) + list(acl_conds)
+                )
+        logger.info(
+            "scope pre-filter active: fp=%s (to_qdrant, 五维同源)",
+            scope_fingerprint,
+        )
+    elif not unrestricted and getattr(settings, "ACL_PREFILTER_ENABLED", True):
         acl_conds = _visibility_conditions(
             owner_id=owner_id,
             department_id=user_department_id,
@@ -1433,6 +1732,19 @@ async def retrieve_chunks(
             if unrestricted:
                 # 仅供诊断脚本：不做任何权限过滤（与升级前的"admin 全览"等价）
                 pass
+            elif pred is not None:
+                # 【T3 双路同源（决策 6.1 / 第 11 环）】文档级兜底校验与两条检索腿
+                # 同源：**同一个** ``pred`` → ``to_sql(pred, Document)``。它内部复用
+                # 既有 ``document_scope_clause`` 并追加密级 / 项目 / deny / excluded，
+                # 可见集合与向量腿 ``to_qdrant(pred)``、PG 腿 ``to_sql(pred)`` 完全
+                # 一致。编译失败必须 fail-closed（返回空），绝不降级为"不过滤"。
+                try:
+                    q = q.where(to_sql(pred, Document))
+                except ScopeCompileError:
+                    logger.exception(
+                        "retrieve_chunks: to_sql(pred, Document) 编译失败 — fail-closed 返回空"
+                    )
+                    return []
             else:
                 # 三层隔离的唯一 SQL 组装点：公司边界 ∪ 自己个人库。
                 # 向量层已做前置过滤，这里是纵深防御 —— Qdrant 里可能残留
@@ -1442,7 +1754,7 @@ async def retrieve_chunks(
                 # 「private 与租户无关」的口径封装好，手拼必然与列表/关键词腿分叉。
                 q = q.where(
                     document_scope_clause(
-                        owner_id=uuid.UUID(owner_id) if owner_id else None,
+                        owner_id=uuid.UUID(str(owner_id)) if owner_id else None,
                         department_id=user_department_id,
                         tenant_ids=tenant_ids,
                         owns_tenant_ids=owns_tenant_ids,
@@ -1458,6 +1770,8 @@ async def retrieve_chunks(
 
     # First gather all valid chunks (excluding orphans), keyed for fusion
     merged: dict[tuple[str, int], RetrievedChunk] = {}
+    # 第 11 环所需的"对象视图"来源：payload 里才有密级 / 项目 / ACL / excluded。
+    object_payloads: dict[tuple[str, int], dict] = {}
     meta_skipped = 0
     acl_dropped: set[str] = set()
     for (doc_id_str, _ci), (score, payload) in all_results.items():
@@ -1468,12 +1782,29 @@ async def retrieve_chunks(
             # 会刷 8 行噪音，这里收敛成按文档去重、循环后汇总一条。
             acl_dropped.add(doc_id_str)
             continue
+        # ── 第 11 环：**对象级**复核（决策 10 / PRD P0-6）─────────────────────
+        # 文档级通过（valid_docs）≠ 对象级通过：图片 / 表格 / 代码块可以被单独
+        # 提级或剔除，只有逐对象 ``allows(pred, obj)`` 才拦得住。pred 为 None
+        # （旧调用点）时跳过，保持既有行为零变化。
+        if pred is not None:
+            decision = allows(pred, ObjectACLView.from_payload(payload))
+            if not decision.allowed:
+                await _record_acl_drop(
+                    decision,
+                    object_id=str(payload.get("object_id") or ""),
+                    document_id=doc_id_str,
+                    stage="postcheck",
+                    scope_fingerprint=scope_fingerprint,
+                )
+                acl_dropped.add(doc_id_str)
+                continue
         # 元数据纵深防御：前置过滤在 Qdrant 侧已生效，这里只拦"字段存在且冲突"
         # 的漏网项（旧向量缺字段时放行 —— 见 metadata.matches_payload 的说明）。
         if meta_conds and not matches_payload(metadata_filter, payload):
             meta_skipped += 1
             continue
         key = (doc_id_str, _ci)
+        object_payloads[key] = payload
         merged[key] = RetrievedChunk(
                 document_id=doc_id_str,
                 filename=payload.get("filename", "unknown"),
@@ -1518,14 +1849,21 @@ async def retrieve_chunks(
     ]
 
     # ── 关键词腿：每路查询各一条 ───────────────────────────────────────────
-    # 权限上下文指纹（第三层缓存隔离）：owner + department + 宽口径标志任一不同
-    # 即不同键；绝不与非本人/非本部门/非同权限视图共享语料缓存。
-    perm_ctx = (
-        f"{owner_id or '__none__'}:{user_department_id or '-'}"
-        f":{'TW' if tenant_wide else '-'}"
-        f":{tenant_scope_fingerprint(tenant_ids)}"
-        f":{tenant_scope_fingerprint(owns_tenant_ids)}"
-    )
+    # 权限上下文指纹（第三层缓存隔离，决策 9）：owner + department + 宽口径标志
+    # 任一不同即不同键；绝不与非本人/非本部门/非同权限视图共享语料缓存。
+    #
+    # 【T3】有 ``scope`` 时，取值来源换成 ``scope.scope_fingerprint``（五维指纹，
+    # 含 clearance / project_ids / principals）—— 比旧三维串更细，天然按 Scope
+    # 分区。变量 ``perm_ctx`` 本身**保留**：它被 ``_bm25_candidates`` 的形参消费。
+    if scope_fingerprint is not None:
+        perm_ctx = scope_fingerprint
+    else:
+        perm_ctx = (
+            f"{owner_id or '__none__'}:{user_department_id or '-'}"
+            f":{'TW' if tenant_wide else '-'}"
+            f":{tenant_scope_fingerprint(tenant_ids)}"
+            f":{tenant_scope_fingerprint(owns_tenant_ids)}"
+        )
     backend = str(getattr(settings, "HYBRID_KEYWORD_BACKEND", "postgres") or "postgres").strip().lower()
     keyword_rank_lists: list[list[tuple[str, int]]] = []
     floor = settings.RETRIEVAL_MIN_SCORE
@@ -1550,6 +1888,11 @@ async def retrieve_chunks(
                 owns_tenant_ids=owns_tenant_ids,
                 unrestricted=unrestricted,
                 metadata_filter=metadata_filter,
+                # 【T3 双路同源】同一个 UserScope → 关键词腿 SQL 走 to_sql(pred)，
+                # 与向量腿的 to_qdrant(pred) 由**同一个** ScopePredicate 编译。
+                scope=scope,
+                # 入口已编译的 pred 直接透传，PG 腿不再 scope.predicate() 现编。
+                pred=pred,
             )
             for q in queries
         ))
@@ -1582,10 +1925,24 @@ async def retrieve_chunks(
                     # 取不回 payload 就不能构造证据（正文/文件名/位置全在 payload 里）。
                     # 宁缺：一条没有正文的"命中"进上下文只会污染答案。
                     continue
+                # ── 第 11 环：对象级复核（与向量腿同一份 allows(pred, obj)）─────
+                if pred is not None:
+                    decision = allows(pred, ObjectACLView.from_payload(payload))
+                    if not decision.allowed:
+                        await _record_acl_drop(
+                            decision,
+                            object_id=str(payload.get("object_id") or ""),
+                            document_id=doc_id_str,
+                            stage="postcheck",
+                            scope_fingerprint=scope_fingerprint,
+                        )
+                        acl_dropped.add(doc_id_str)
+                        continue
                 if meta_conds and not matches_payload(metadata_filter, payload):
                     meta_skipped += 1
                     continue
                 rank_list.append(key)
+                object_payloads.setdefault(key, payload)
                 if key not in merged:
                     merged[key] = RetrievedChunk(
                         document_id=doc_id_str,
@@ -1622,6 +1979,11 @@ async def retrieve_chunks(
                     client=client,
                     tenant_ids=tenant_ids,
                     perm_context=perm_ctx,
+                    # 【T3 双路同源】语料 scroll 用**同一份** to_qdrant(pred)；
+                    # user_scope 用于 cache_key_for_scope 缓存分区（决策 9），
+                    # pred 为入口编译好的**同一个**实例（决策 6.1）。
+                    scope=scope,
+                    pred=pred,
                 )
                 rows: list[tuple[str, int]] = []
                 for c in bm25_ranked:
@@ -1838,9 +2200,27 @@ async def retrieve_chunks(
                 "前置过滤存在漏洞，请排查", before - len(chunks),
             )
 
+    # ── 【T3 追加】对象级最终复核（第 11 环的收尾一跳）──────────────────────
+    # 上面是**文档级**权威集合；这里再补一道**对象级** ``allows(pred, obj)``：
+    # 文档级可见 ≠ 对象级可见（图片 / 表格 / 代码块可被单独提级或剔除）。
+    # 保留上面的文档级检查（不删），只在其后**追加**对象级 —— 纵深防御。
+    if pred is not None and chunks:
+        chunks, obj_dropped = await _object_level_filter(
+            chunks,
+            object_payloads,
+            pred,
+            stage="postcheck",
+            scope_fingerprint=scope_fingerprint,
+        )
+        if obj_dropped:
+            logger.error(
+                "Object-level Permission Check dropped %d chunk(s) that passed the "
+                "document-level set — 前置对象级过滤存在漏洞，请排查", obj_dropped,
+            )
+
     logger.info(
         "Retrieved %d chunks (floor=%.3f gap=%.3f hybrid=%s backend=%s rerank=%s "
-        "queries=%d vector_only=%d top_k=%d hierarchical=%s meta=%s tenant=%s)",
+        "queries=%d vector_only=%d top_k=%d hierarchical=%s meta=%s tenant=%s scope_fp=%s)",
         len(chunks),
         settings.RETRIEVAL_MIN_SCORE,
         settings.RETRIEVAL_MAX_GAP,
@@ -1853,5 +2233,6 @@ async def retrieve_chunks(
         use_hier,
         _summarize_metadata_filter(metadata_filter),
         tenant_scope_fingerprint(tenant_ids),
+        scope_fingerprint or "-",
     )
     return chunks

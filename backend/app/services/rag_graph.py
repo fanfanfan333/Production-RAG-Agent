@@ -50,10 +50,21 @@ from app.services.relation_service import (
     digest_sources,
 )
 from app.services.prompt_security import sanitize_document_context
-from app.services.retrieval_service import RetrievedChunk, retrieve_chunks
+from app.services.retrieval_service import (
+    RetrievedChunk,
+    ScopedQuery,
+    retrieve_chunks_scoped,
+)
+from app.services.security_scope import UserScope
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+# ── 检索入口的唯一名字（决策 10-①；与 master_graph 同构）──────────────────────
+# 把唯一推荐入口 ``retrieve_chunks_scoped`` 绑定在既有名字 ``retrieve_chunks`` 上：
+# 历史 patch / 探针仍然拦得到检索入口，且 ``_retrieve_node`` 的调用点天然带
+# ``scope=``（AST 门禁）。漏传 scope 的后果是**空结果**（fail-closed），不是全库。
+retrieve_chunks = retrieve_chunks_scoped
 
 
 # ── RAG system prompt（中文版）─────────────────────────────────────────────────
@@ -172,10 +183,14 @@ class RAGState(TypedDict):
     owns_tenant_ids: frozenset[str]
     department_id: str | None
     tenant_wide: bool
+    # 【T3】请求级五维权限（入口签发一次，链路内不可变；检索节点只消费）。
+    user_scope: UserScope
     rewritten_query: str           # 指代消解后的自包含检索查询
     query_variants: list[str]      # 多查询扩展变体（多路召回）
     query_extra: list[str]         # 子问题 + 变体，进向量腿与关键词腿
     query_hyde: str | None         # 假设答案段落，只进向量腿
+    # 【T3 决策 15-1】改写产物的 Scope 绑定镜像（文本可换、Scope 不可换）。
+    scoped_queries: list[ScopedQuery]
     chunks: list[RetrievedChunk]
     sources: list[dict]            # serialisable dicts ready for SSE
     answer: str
@@ -290,11 +305,23 @@ async def _rewrite_node(state: RAGState) -> dict:
             state["query"][:60], rewritten[:60], len(variants),
             len(result.subqueries), len(result.hyde or ""),
         )
+    # 【T3 决策 15】镜像出 Scope 绑定体，与 master_graph._rewrite_node 同构。
+    scope = state.get("user_scope")
+    scoped_queries: list[ScopedQuery] = []
+    if scope is not None:
+        main_query = ScopedQuery(text=rewritten, scope=scope, kind="main")
+        scoped_queries.append(main_query)
+        for item in extra:
+            scoped_queries.append(main_query.with_text(item))
+        if result.hyde:
+            scoped_queries.append(ScopedQuery(text=result.hyde, scope=scope, kind="hyde"))
+
     return {
         "rewritten_query": rewritten,
         "query_variants": variants,
         "query_extra": extra,
         "query_hyde": result.hyde,
+        "scoped_queries": scoped_queries,
     }
 
 
@@ -310,17 +337,14 @@ async def _retrieve_node(state: RAGState) -> dict:
         chunks  — list[RetrievedChunk] for the generate/refuse routing
         sources — serialisable list[dict] emitted in the SSE sources event
     """
+    # 【T3 决策 10-①】唯一推荐入口：Query 一进检索器就绑定请求级 UserScope。
+    # 三层隔离（公司集合 + 部门 ACL + 密级/项目）由该 scope 一处承载；漏传 scope
+    # 的后果是**空结果**（retrieve_chunks_scoped fail-closed），不是全库。
     chunks = await retrieve_chunks(
         query=state.get("rewritten_query") or state["query"],
+        scope=state.get("user_scope"),
         top_k=state["top_k"],
-        owner_id=state.get("owner_id"),
         collection_id=state.get("collection_id"),
-        # 三层隔离：第一层公司集合 + 第二层部门 ACL（与 master_graph 同规则）。
-        # tenant_ids=None（漏传）会被 retrieve_chunks fail-closed 拒绝，绝不越权。
-        tenant_ids=state.get("tenant_ids"),
-        user_department_id=state.get("department_id"),
-        tenant_wide=bool(state.get("tenant_wide")),
-        owns_tenant_ids=state.get("owns_tenant_ids") or frozenset(),
         extra_queries=state.get("query_extra") or state.get("query_variants"),
         extra_vector_queries=(
             [state["query_hyde"]] if state.get("query_hyde") else None
@@ -495,6 +519,10 @@ async def _collect_digests_node(state: RelationState) -> dict:
         user_department_id=state.get("department_id"),
         tenant_wide=bool(state.get("tenant_wide")),
         owns_tenant_ids=state.get("owns_tenant_ids") or frozenset(),
+        # FIX-A（T5 预发布）：与 master_graph._collect_digests_node 同口径 ——
+        # 摘要采样是"把正文拼进 prompt"，必须走五维（密级 / 项目 / deny /
+        # excluded），只给三维等于这些维度在摘要路径上全部失效。
+        security_scope=state.get("user_scope"),
     )
     logger.info(
         "collect_digests_node: %d document digests for query=%r",
@@ -839,6 +867,7 @@ async def stream_document_list(
     tenant_wide: bool = False,
     owns_tenant_ids: frozenset[str] = frozenset(),
     conversation_tenant_id: str | None = None,
+    user_scope: UserScope | None = None,
 ) -> AsyncGenerator[dict, None]:
     """
     Answer "知识库里有哪些文档" questions deterministically — no LLM, no
@@ -850,7 +879,18 @@ async def stream_document_list(
 
     ``tenant_ids`` / ``owns_tenant_ids`` 是文档可见性口径（第一层 + 个人库）；
     ``conversation_tenant_id`` 只是第三层会话归属键（与可见性解耦）。
+
+    【T3】``user_scope`` 由入口一次性签发后注入（本直读路径不检索，仅承载
+    请求级权限上下文，供后续可能的对象级收紧复用）。给出时其 ``base`` 的
+    三维口径优先，保证与检索链路同源。
     """
+    if user_scope is not None:
+        # 与检索链路同源：列表口径取 scope.base（含 content_scope 的测试公司剔除）。
+        owner_id = str(user_scope.base.owner_id) if user_scope.base.owner_id else owner_id
+        tenant_ids = user_scope.base.tenant_ids
+        user_department_id = user_scope.base.department_id
+        tenant_wide = user_scope.base.tenant_wide
+        owns_tenant_ids = user_scope.base.owns_tenant_ids
     try:
         docs = await _list_completed_documents(
             owner_id, collection_id,
@@ -921,6 +961,7 @@ async def stream_rag(
     owns_tenant_ids: frozenset[str] = frozenset(),
     department_id: str | None = None,
     tenant_wide: bool = False,
+    user_scope: UserScope | None = None,
 ) -> AsyncGenerator[dict, None]:
     """
     Execute the RAG graph and yield typed event dicts for the SSE layer.
@@ -955,10 +996,13 @@ async def stream_rag(
         "owns_tenant_ids": owns_tenant_ids,
         "department_id": department_id,
         "tenant_wide": tenant_wide,
+        # 【T3】请求级五维权限：入口签发一次，节点只消费、不重新签发。
+        "user_scope": user_scope,
         "rewritten_query": "",
         "query_variants": [],
         "query_extra": [],
         "query_hyde": None,
+        "scoped_queries": [],
         "chunks": [],
         "sources": [],
         "answer": "",

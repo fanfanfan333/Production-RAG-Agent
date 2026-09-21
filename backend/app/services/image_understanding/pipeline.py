@@ -198,6 +198,11 @@ class ImageUnderstanding:
             "table": self.table.to_dict() if self.table else None,
             "attempts": list(self.attempts),
             "degraded": self.degraded,
+            # 交付可见性：多模态是否可用 / 路由是否因缺模型降级 / 进人工复核的原因
+            "vision_unavailable": bool(self.meta.get("vision_unavailable")),
+            "vision_error": self.meta.get("vision_error"),
+            "route_downgraded": bool(self.meta.get("route_downgraded")),
+            "manual_review_reason": self.meta.get("manual_review_reason"),
         }
 
 
@@ -300,7 +305,7 @@ def understand_image(
     # 下 primary 就是通道 B，不能再调一次模型（白花钱且结果一样）。
     ocr_side, vlm_side = _build_channels(
         classification.image_type, route, primary, ocr_out, ocr_text, work, png,
-        filename=filename,
+        filename=filename, result=result,
     )
     channels = [c for c in (ocr_side, vlm_side) if c is not None]
 
@@ -357,6 +362,24 @@ def understand_image(
             skip_vision=vlm_side is not None,
         )
 
+    # ── 5.5 无文字图片：不要直接丢掉这张图（实施手册 3.3.1）──────────────────
+    # 手册把"图片在分块阶段被直接跳过"列为最典型的丢信息问题，处置办法是
+    # "为每张图片生成结构化的文本描述"。这里就是那个分支：一条文字都没产出时，
+    # 换一个**描述型**提示词再问一次多模态模型，让这张图拿到自己的检索文本。
+    _summarize_if_textless(
+        work, png, result, page_number=page_number, filename=filename,
+    )
+
+    # ── 6. 如实反映"图意是否真的用 Vision 读过"──────────────────────────────
+    # vision 不可用时，chart/diagram/screenshot 的"专用引擎"就是 Vision ——
+    # 拿不到就只能退成纯 OCR。此时把 route 从 vision 降级为 ocr 并记
+    # route_downgraded，避免结果里出现"route=vision 却是 OCR 产出"的错位：
+    # 用户/QA 一眼就能看出"是缺多模态模型"，而不是以为图意已被解读。
+    if result.meta.get("vision_unavailable") and result.route == ROUTE_VISION:
+        result.meta["original_route"] = ROUTE_VISION
+        result.route = ROUTE_OCR
+        result.meta["route_downgraded"] = True
+
     logger.info(
         "Image pipeline%s: type=%s route=%s mode=%s engine=%s conf=%.2f decision=%s "
         "quality=%.2f noise=%s",
@@ -383,6 +406,7 @@ def _build_channels(
     png,
     *,
     filename: str,
+    result: ImageUnderstanding,
 ) -> tuple[ChannelResult | None, ChannelResult | None]:
     """
     组装双通道.
@@ -425,7 +449,7 @@ def _build_channels(
     if not dual_channel_enabled(image_type):
         return ocr_side, None
     return ocr_side, _run_vlm_channel(
-        work, png, image_type, ocr_out, ocr_text, filename=filename,
+        work, png, image_type, ocr_out, ocr_text, filename=filename, result=result,
     )
 
 
@@ -437,6 +461,7 @@ def _run_vlm_channel(
     ocr_text: str,
     *,
     filename: str,
+    result: ImageUnderstanding | None = None,
 ) -> ChannelResult | None:
     """
     通道 B：主动跑一次 VLM（**不是**"失败才兜底"）.
@@ -446,9 +471,18 @@ def _run_vlm_channel(
     ``!=`` 读成 ``=``、把缩进丢了，仍给出 0.9 的置信度，门控直接 Accept。
 
     现在按图片类型**主动**跑一遍，产出与通道 A 交叉校验（见 dual_channel）。
+
+    VLM **不可用**时不再静默 ``return None``：在 ``result.meta`` 上留下
+    ``vlm_channel_skipped`` 标记，便于排查"这张图为什么没走双通道"。
     """
     vision = VisionEngine()
     if not vision.is_available():
+        if result is not None:
+            result.meta.setdefault("vlm_channel_skipped", "vision-unavailable")
+        logger.info(
+            "VLM channel skipped for '%s' (type=%s): vision engine unavailable",
+            filename, image_type,
+        )
         return None
     try:
         out = vision.process(image, png_bytes=png(), image_type=image_type, role="primary")
@@ -543,12 +577,18 @@ def _dispatch(
         out = vision.process(image, png_bytes=png(), image_type=image_type, role="primary")
         if out.ok:
             return out
+        # 模型在、但本轮没拿到可用结果（超时 / 异常 / 空输出）—— 与"模型缺失"
+        # 同对待：路由降级为 ocr，避免下游把 route 写成 "vision" 却装着 OCR 文本
+        # （用户最在意的"功能开着其实没跑"）。超时是这里最高频的情形：
+        # VISION_TIMEOUT_SECONDS 已提到 120s，但系统忙 / 首调加载仍可能超时。
         result.meta["vision_error"] = out.error
-    # 记下"不是这张图有问题，是这台机器没有多模态模型"—— 图表/流程图的语义
-    # （节点、连线方向、趋势）只能靠 Vision 拿到，OCR 只能捡回图里的文字。
-    # 不写这个标记的话，下游只能看到一个笼统的 manual_review，无从判断
-    # 该去补模型还是去改图。
-    result.meta["vision_unavailable"] = not vision.is_available()
+        result.meta["vision_unavailable"] = True
+    else:
+        # 记下"不是这张图有问题，是这台机器没有多模态模型"—— 图表/流程图的语义
+        # （节点、连线方向、趋势）只能靠 Vision 拿到，OCR 只能捡回图里的文字。
+        # 不写这个标记的话，下游只能看到一个笼统的 manual_review，无从判断
+        # 该去补模型还是去改图。
+        result.meta["vision_unavailable"] = True
     return EngineOutput(engine="vision", ok=False, error="Vision 不可用")
 
 
@@ -573,6 +613,17 @@ def _table_primary(
             out = engine.process(image, ocr_fn=ocr_fn)
             if out.ok:
                 result.meta["table_engine"] = "table-transformer"
+                # TT 成功也要把结构赋给 result.table：否则 Accept 路径下
+                # to_dict()["table"] 为 None，且 _run_fallback 的规则兜底
+                # （仅 fallback 路径执行）拿不到结构做交叉校验。
+                result.table = TableStructure(
+                    markdown=out.text or "",
+                    rows=int(out.meta.get("rows", 0) or 0),
+                    cols=int(out.meta.get("cols", 0) or 0),
+                    method="table-transformer",
+                    engine="table-transformer",
+                    meta=dict(out.meta or {}),
+                )
                 return out
             logger.info("Table Transformer produced nothing — falling back to rules")
 
@@ -589,6 +640,9 @@ def _table_primary(
             lines=ocr_out.lines,
             meta={"table_method": structure.method},
         )
+    # 结构还原失败：把"是结构问题、不是没模型"如实记下来，供人工复核原因区分。
+    result.meta["table_structure_failed"] = True
+    result.meta["table_failure_reason"] = str(structure.meta.get("reason") or "unknown")
     return EngineOutput(
         engine="table-parser", ok=False,
         error=str(structure.meta.get("reason") or "结构还原失败"),
@@ -661,7 +715,7 @@ def _run_fallback(
 
     # ── 路径 A：Vision LLM（通用转写提示词）────────────────────────────────
     vision = VisionEngine()
-    if not skip_vision and vision.is_available():
+    if not skip_vision and not result.meta.get("vision_unavailable") and vision.is_available():
         out = vision.process(image, png_bytes=png(), image_type=image_type, role="fallback")
         if out.ok:
             candidates.append(out)
@@ -710,6 +764,10 @@ def _run_fallback(
         result.confidence = 0.0
         result.analyze_engine = "ocr-degraded"
         result.meta["fallback_failed"] = True
+        reason = _manual_review_reason(result)
+        result.meta["manual_review_reason"] = reason
+        # 同时写进质检结论（analyze_quality 会落库），前端/排查可直接读到
+        result.quality.setdefault("manual_review_reason", reason)
         _keep_ocr_text(result, ocr_out)
         return
 
@@ -728,6 +786,9 @@ def _run_fallback(
 
     if decision == DECISION_MANUAL:
         result.manual_review = True
+        reason = _manual_review_reason(result)
+        result.meta["manual_review_reason"] = reason
+        result.quality["manual_review_reason"] = reason
         # 校验不合格时仍保留 OCR 文本兜底，避免"图彻底变空"
         _keep_ocr_text(result, ocr_out)
         if result.meta.get("vision_unavailable"):
@@ -801,28 +862,173 @@ def _invert_for_ocr(image: Image.Image) -> Image.Image:
     return invert_for_ocr(image)
 
 
+def _is_vision_engine(engine: str | None) -> bool:
+    """该产出是否真的来自多模态模型（VisionEngine.name == "vision"）."""
+    name = (engine or "").strip().lower()
+    return name == "vision" or name.startswith("vision")
+
+
 def _apply_output(result: ImageUnderstanding, out: EngineOutput) -> None:
-    """把引擎产出落到统一的结构化字段上."""
+    """
+    把引擎产出落到统一的结构化字段上.
+
+    ⚠️ **只有真正的 Vision 产出才能写 ``vision_caption``**（2026-09 修）。历史
+    上这里对"描述型"图片（chart/diagram/screenshot/photo）无条件写 vision_caption，
+    于是当 Vision 不可用、兜底 second-OCR 当选时，结果里出现
+    ``route=vision`` + ``vision_caption=<OCR 原文>`` —— 下游/前端会误以为这是
+    "模型对图意的解读"，而其实模型根本没跑。修复后非 Vision 引擎的文本只当
+    OCR 文本保留（不冒充图意描述）。
+    """
     text = (out.text or "").strip()
     if not text:
         return
-    if result.image_type == IMAGE_TYPE_TABLE:
+    if result.image_type in (IMAGE_TYPE_TABLE, IMAGE_TYPE_CODE, IMAGE_TYPE_FORMULA):
         result.structured_content = text
-    elif result.image_type in (IMAGE_TYPE_CODE, IMAGE_TYPE_FORMULA):
-        result.structured_content = text
-    else:
+    elif _is_vision_engine(out.engine):
         result.vision_caption = text
+    elif not (result.ocr_text or "").strip():
+        # 非 vision 引擎 + 描述型图片：只补充 OCR 文本，绝不写 vision_caption
+        result.ocr_text = text
 
 
 def _keep_ocr_text(result: ImageUnderstanding, ocr_out: EngineOutput) -> None:
-    """人工复核/彻底失败时，至少把 OCR 文本留下来（不让图变空）."""
+    """
+    人工复核/彻底失败时的兜底：**OCR 文本只留在 ``ocr_text``**.
+
+    历史实现会把 OCR 文本写进 ``vision_caption``（非表格类型），制造
+    "route=vision + caption=OCR"的错位。现在 OCR 文本仅作 ``ocr_text`` 保留
+    （``ExtractedImage.searchable_text`` 在没有 caption 时会回退到它），
+    表格类型则保持 ``structured_content=None``（content_type 仍是 image）。
+    """
     text = (ocr_out.text or "").strip()
-    if not text or result.structured_content or result.vision_caption:
-        return
+    if text and not (result.ocr_text or "").strip():
+        result.ocr_text = text
     if result.image_type == IMAGE_TYPE_TABLE:
         result.structured_content = None
-    else:
-        result.vision_caption = text
+
+
+def _has_any_text(result: ImageUnderstanding) -> bool:
+    """该图是否已经拿到任何可检索文本（结构化 / OCR / 图意描述三选一）."""
+    return bool(
+        (result.structured_content or "").strip()
+        or (result.ocr_text or "").strip()
+        or (result.vision_caption or "").strip()
+    )
+
+
+def _summarize_if_textless(
+    image: Image.Image,
+    png,
+    result: ImageUnderstanding,
+    *,
+    page_number: int,
+    filename: str,
+) -> bool:
+    """
+    图内**一个字都没读出来**时，用多模态模型做一次"图意总结"（实施手册 3.3.1）.
+
+    为什么要有这一步：整条管线跑完仍无任何文字时，这张图在
+    ``build_image_chunks`` 里会被跳过（没有语义信号可索引），也就是手册说的
+    "图片在分块阶段被直接跳过"。但"图里没有字"不等于"图没有信息"——照片、
+    示意图、无标注的界面截图都属于这一类。手册的处置是给每张图生成
+    「图注 + 关键要素 + 数值信息」三段式描述并**作为独立分块写入索引**。
+
+    实现口径（三条，都是为了不制造新的错位）：
+
+    1. **只在真的一个字都没有时才跑** —— 有文字的图不多花这次推理，
+       这条分支对正常文档的成本是 0。
+    2. **总结只写 ``vision_caption``，绝不写 ``structured_content``** ——
+       后者是"可核对的结构"（Markdown 表格 / 代码 / LaTeX），把一段散文塞进去
+       会让 ``content_type`` 被误标成 table，污染表格检索通道。
+    3. **如实改 route** —— 文本确实来自多模态模型时把 route 记成 vision
+       （与 vision 不可用时降级为 ocr 同一条原则：route 必须反映真实产出），
+       并把原 route 留在 ``meta["original_route"]``，``analyze_engine`` 记
+       ``vision:summary``，前端/排查一眼能看出"这段描述是总结出来的"。
+
+    :return: 是否成功产出总结文本。
+    """
+    settings = get_settings()
+
+    if not getattr(settings, "IMAGE_SUMMARY_WHEN_TEXTLESS", True):
+        # 显式关闭 → 保持旧行为（无文字图片不建块）
+        return False
+    if _has_any_text(result):
+        return False
+    if result.meta.get("vision_unavailable"):
+        # 多模态模型不可用 → 无法总结。如实留痕，行为与改动前一致。
+        result.meta["textless_summary_skipped"] = "vision-unavailable"
+        return False
+
+    vision = VisionEngine()
+    if not vision.is_available():
+        result.meta["textless_summary_skipped"] = "vision-unavailable"
+        return False
+
+    out = vision.process(
+        image, png_bytes=png(), image_type=result.image_type, role="summarize",
+    )
+    _record(result, out)
+    if not out.ok or not (out.text or "").strip():
+        result.meta["textless_summary_failed"] = out.error or "空结果"
+        logger.info(
+            "Image pipeline%s: 无文字图片的图意总结未产出（%s）",
+            f" [{filename}]" if filename else "", out.error,
+        )
+        return False
+
+    text = (out.text or "").strip()
+    # ① 只写 vision_caption：它是"图意描述"，不属于结构化内容
+    result.vision_caption = text
+    result.meta["textless_summary"] = True
+    result.meta["textless_summary_chars"] = len(text)
+    # ② 如实反映产出方与路由（route 必须与真实产出一致）
+    result.analyze_engine = "vision:summary"
+    if result.route != ROUTE_VISION:
+        result.meta["original_route"] = result.route
+        result.route = ROUTE_VISION
+    result.confidence = round(float(out.confidence or 0.0), 4)
+    result.decision = DECISION_PASS
+    # 之前可能因"所有引擎都没产出"被标成人工复核；现在有产出了，撤掉该标记，
+    # 否则每一张无文字图片都会在前端/筛选中被标成"待复核"，等于噪声。
+    result.manual_review = False
+    result.meta.pop("manual_review_reason", None)
+    result.meta.pop("fallback_failed", None)
+    # ③ 质检里留一句可机读的说明：这段文字是"总结"，不是"识别"出来的
+    # 注意这里是**替换**而不是追加：走到这一步时 quality 里往往是"没有可评估的
+    # 产出 / no_engine_output"这类**已经过期**的结论（那是对"没有任何产出"的
+    # 判定），留着会让前端引用卡片显示一句与事实相反的话。
+    if isinstance(result.quality, dict):
+        result.quality.pop("manual_review_reason", None)
+        result.quality["reasons"] = [
+            f"图内未识别出任何文字，已由多模态模型生成图意总结（{len(text)} 字，"
+            "未经结构校验）——实施手册 3.3.1：图片不得在分块阶段被跳过"
+        ]
+        result.quality["summary_generated"] = True
+    logger.info(
+        "Image pipeline%s: 无文字图片已生成图意总结 type=%s chars=%d engine=%s",
+        f" [{filename}]" if filename else "", result.image_type, len(text),
+        out.engine,
+    )
+    return True
+
+
+def _manual_review_reason(result: ImageUnderstanding) -> str:
+    """
+    给"为什么进人工复核"一个可机读的原因（区分"没模型" vs "结构还原失败"）.
+
+    取值：
+        table_structure_failed —— 表格结构（框线/对齐）还原失败且无合格兜底
+        vision_unavailable     —— 图表/流程图/截图需要多模态模型但当前不可用
+        no_engine_output       —— 所有引擎都没有产出
+        validation_failed      —— 有产出但结构校验/质检未通过
+    """
+    if result.image_type == IMAGE_TYPE_TABLE and result.meta.get("table_structure_failed"):
+        return "table_structure_failed"
+    if result.meta.get("vision_unavailable"):
+        return "vision_unavailable"
+    if result.meta.get("fallback_failed"):
+        return "no_engine_output"
+    return "validation_failed"
 
 
 def _record(result: ImageUnderstanding, out: EngineOutput) -> None:
@@ -857,6 +1063,9 @@ __all__ = [
     "understand_image",
     "resolve_route",
     "fallback_understanding",
+    # 无文字图片的图意总结（实施手册 3.3.1）
+    "_summarize_if_textless",
+    "_has_any_text",
     "ROUTE_TABLE",
     "ROUTE_FORMULA",
     "ROUTE_CODE",

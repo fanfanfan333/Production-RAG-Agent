@@ -105,6 +105,16 @@ _KB_ADMIN_PERMISSIONS = _DEPT_MANAGER_PERMISSIONS | frozenset(
         # 全公司历史指标的权力属于过度授权。可见性归 audit.read，重置归
         # audit.write，二者分层的意义正在于此。
         "audit.write",
+        # ── 五维安全隔离：密级 / 项目 / need-to-know 的管理动作（T2 新增）────────
+        # 只放"能授予别人"这一层：``security.grant`` = 申请/授予 need-to-know；
+        # ``security.review.grant`` = 审批别人的授予（**禁自我授予**由服务端校验，
+        # 不靠权限点）；``security.escalate`` = 文档/图片提级与剔除。
+        # 刻意**不放**在部门负责人层：密级是跨部门的横向维度，部门负责人只应
+        # 覆盖本部门范围（与 document.delete.department 的分层同理）。
+        # ⚠️ 这三个点目前没有任何端点消费（T5 才接），因此**零行为变化**。
+        "security.grant",
+        "security.review.grant",
+        "security.escalate",
     }
 )
 

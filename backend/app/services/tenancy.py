@@ -140,6 +140,26 @@ def normalize_tenant_id(tenant_id: str | None) -> str:
     return value
 
 
+def is_valid_tenant_id(tenant_id: str | None) -> bool:
+    """
+    调用方**显式给出**的 tenant_id 是否合法（不归一化、不回落）.
+
+    为什么必须和 ``normalize_tenant_id`` 并存（T5 上线前修复）：``normalize_tenant_id``
+    是**容错归一化**——非空但非法的输入会被静默改成 ``DEFAULT_TENANT_ID``。这在
+    存储路径上是对的（防目录穿越、历史脏数据兜底），但用在"有没有选择归属公司"
+    这类**授权判定**上就是漏洞：
+
+        admin 传 company_id="@@@随便@@@" → 归一化得 "default"
+        → 与 upload_tenant_id("default") 相等 → 被判成"选了自己"
+        → 400「请选择归属公司」与 403「只能上传到你创建的测试公司」双双失效，
+          文档静默落到 default 租户。
+
+    所以授权路径必须先用本函数确认"给的是不是合法标识"，再允许进入归一化比较。
+    """
+    value = (tenant_id or "").strip()
+    return bool(value) and bool(_TENANT_ID_RE.match(value))
+
+
 def company_id_from_name(name: str | None) -> str:
     """
     公司**名称** → 稳定的 tenant_id.
@@ -299,6 +319,20 @@ class DocumentScope:
             "user_department_id": self.department_id,
             "tenant_wide": self.tenant_wide,
         }
+
+    def security_kwargs(self) -> dict:
+        """
+        **转发** :meth:`acl_kwargs` —— 三维部分在五维 scope 里仍然是同一份。
+
+        为什么要在 ``DocumentScope`` 上再加一个名字：五维化之后调用点会同时看到
+        ``UserScope.security_kwargs()``（五维）与 ``DocumentScope.security_kwargs()``
+        （三维转发）。刻意保留这个名字而不是让调用点直接写 ``acl_kwargs()``，
+        是为了让"这一处仍是三维口径、没有密级与项目"在调用点**可读** ——
+        一旦有人误以为它带密级，就是一个静默越权口子。
+
+        ⚠️ 本方法**不新增任何键**：老调用点拿到的 dict 一个字节都不变。
+        """
+        return self.acl_kwargs()
 
 
 def scope_for(
@@ -774,6 +808,9 @@ def permission_context(
     owner_id: uuid.UUID | None = None,
     tenant_ids: frozenset[str] | None = None,
     owns_tenant_ids: frozenset[str] | None = None,
+    clearance: int | None = None,
+    project_ids: frozenset[str] | None = None,
+    principals: frozenset[str] | None = None,
 ) -> str:
     """
     用户权限上下文的稳定指纹（缓存键的一部分）.
@@ -781,6 +818,14 @@ def permission_context(
     ``T=`` / ``O=`` 双指纹：租户集合同样参与 —— 「同 owner、异租户集合」必然
     不同键；换租户集合（新建/删除测试公司）→ 指纹变 → 旧缓存自然失效；而
     **改名不改 tenant_ids ⇒ 指纹不变 ⇒ 缓存不失效**（正确）。
+
+    【T2 增量】可选追加 ``clearance`` / ``project_ids`` / ``principals`` 三段
+    五维指纹。**不传 → 输出与改造前逐字节一致**（既有调用点零影响）；
+    传入后不同密级/项目/主体的用户不再共用缓存（PRD 4.2 硬要求）。
+
+    ⚠️ 新代码请优先用 ``security_scope.cache_key_for_scope(scope, raw_key)`` ——
+    那里的五维指纹是**唯一实现**；这里的参数只是给尚未接入 ``UserScope`` 的
+    老调用点留的过渡通道（``project_ids`` 的 ``None``/空集三态同样互异）。
     """
     if user is None:
         return "anonymous"
@@ -792,6 +837,12 @@ def permission_context(
         "T=" + tenant_scope_fingerprint(tenant_ids),
         "O=" + tenant_scope_fingerprint(frozenset(owns_tenant_ids or ())),
     ]
+    if clearance is not None:
+        parts.append(f"C={int(clearance)}")
+    if project_ids is not None:
+        parts.append("P=" + tenant_scope_fingerprint(frozenset(project_ids)))
+    if principals is not None:
+        parts.append("A=" + tenant_scope_fingerprint(frozenset(principals)))
     return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:16]
 
 

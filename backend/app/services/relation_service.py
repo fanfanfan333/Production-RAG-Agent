@@ -19,6 +19,7 @@ relates to the others, without pulling entire documents into context.
 
 import uuid
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from qdrant_client.http import models as qmodels
 from sqlalchemy import select
@@ -28,6 +29,9 @@ from app.db.models import Document, DocumentStatus
 from app.db.postgres import get_db_session
 from app.db.qdrant import get_qdrant_client
 from app.utils.logging import get_logger
+
+if TYPE_CHECKING:  # pragma: no cover - 仅类型，避免与 security_scope 循环导入
+    from app.services.security_scope import UserScope
 
 logger = get_logger(__name__)
 
@@ -75,6 +79,8 @@ async def list_accessible_documents(
     user_department_id: str | None = None,
     tenant_wide: bool = False,
     document_ids: list[str] | None = None,
+    security_scope: "UserScope | None" = None,
+    pred: "ScopePredicate | None" = None,
 ) -> list[tuple]:
     """
     列出**当前用户有权访问**的已完成文档（(id, filename, page_count,
@@ -108,7 +114,32 @@ async def list_accessible_documents(
     elif limit:
         query = query.limit(limit)
 
-    if owner_id is not None or tenant_ids is not None or tenant_wide or owns_tenant_ids:
+    if security_scope is not None:
+        # FIX-A（T5 预发布）：文档总结 / 关联路径**必须**走与检索链路同源的五维
+        # 权限判定。``security_scope`` 是请求入口一次性签发的 ``UserScope``，由上层
+        # （query.py → master graph）透传进来，**绝不在 service 层重新查库签发**。
+        # ``to_sql(pred, Document)`` 内部复用既有 ``document_scope_clause``（三维）
+        # 并追加密级 / 项目 / deny / excluded 四个条件 —— 与向量腿 ``to_qdrant``、
+        # PG 关键词腿 ``to_sql`` 是**同一个** ``ScopePredicate`` 的三个编译器，语义
+        # 一致。编译失败按 fail-closed 返回空（绝不降级为不过滤）。
+        from app.services.security_policy import ScopeCompileError, to_sql
+
+        try:
+            # 决策 6.1「同一 pred 只构造一次」：调用方已编译好就直接复用，
+            # 否则才从 scope 现编 —— 摘要采样（Qdrant scroll）与文档清单（SQL）
+            # 必须用**同一个** ScopePredicate 实例，否则两路的 ACL 过期判定
+            # 时刻不同（pred.now 不同）会出现"文档可见、其内对象却已过期"的分叉。
+            effective_pred = pred if pred is not None else security_scope.predicate()
+            query = query.where(to_sql(effective_pred, Document))
+        except ScopeCompileError as exc:
+            logger.error(
+                "list_accessible_documents: to_sql(pred) 编译失败 — fail-closed 返回空 (%s)",
+                exc,
+            )
+            return []
+    elif owner_id is not None or tenant_ids is not None or tenant_wide or owns_tenant_ids:
+        # 向后兼容：未透传 UserScope 的旧调用点（单元测试 / 其它入口）仍走三维
+        # ``document_scope_clause``，行为不变。
         query = query.where(
             document_scope_clause(
                 owner_id=uuid.UUID(owner_id) if owner_id else None,
@@ -134,6 +165,8 @@ async def collect_document_digests(
     user_department_id: str | None = None,
     tenant_wide: bool = False,
     document_ids: list[str] | None = None,
+    security_scope: "UserScope | None" = None,
+    pred: "ScopePredicate | None" = None,
 ) -> list[DocumentDigest]:
     """
     Build a content digest for every accessible completed document.
@@ -160,6 +193,17 @@ async def collect_document_digests(
     chunks_per_doc = chunks_per_doc or settings.RELATION_CHUNKS_PER_DOC
     digest_chars = digest_chars or settings.RELATION_DIGEST_CHARS
 
+    # ── 0. 本次请求**唯一**的 ScopePredicate（V-02-B 的关键）────────────────
+    # 文档级（SQL）与 chunk 级（Qdrant scroll）两条采样路必须共用**同一个**实例：
+    #   · 决策 6.1「同一 pred 只构造一次」——两处各编一次会得到不同的 pred.now，
+    #     于是"文档可见、其内某对象已过 ACL 有效期"会被判成不同结果；
+    #   · 也是这一处收敛让"采样摘要"不能绕过对象级权限（见下方 scroll_filter）。
+    effective_pred = (
+        pred
+        if pred is not None
+        else (security_scope.predicate() if security_scope is not None else None)
+    )
+
     # ── 1. Completed documents from PostgreSQL (most recent N) ────────────────
     rows = await list_accessible_documents(
         limit=max_documents,
@@ -169,6 +213,8 @@ async def collect_document_digests(
         user_department_id=user_department_id,
         tenant_wide=tenant_wide,
         document_ids=document_ids,
+        security_scope=security_scope,
+        pred=effective_pred,
     )
 
     if not rows:
@@ -180,6 +226,31 @@ async def collect_document_digests(
     # ── 2. Sample chunks per document from Qdrant ─────────────────────────────
     client = get_qdrant_client()
     collection = settings.QDRANT_COLLECTION
+
+    # ── 2-a. 对象级权限条件（V-02-B）—— **只构造一次**，循环内复用 ─────────────
+    # 为什么必须有这一段：本步是"给摘要采样 chunk 正文"，旧实现的 scroll filter
+    # **只有 document_id**，没有任何权限条件。于是即便第 1 步已用文档级
+    # ``to_sql(pred)`` 挡住了超密级文档，该文档**内部**被单独提级的图片块、
+    # ``excluded=true`` 下线的 chunk、被 ``acl_deny`` 拒绝的对象，仍会被原样
+    # scroll 出来拼进 digest 正文直接送进 LLM。
+    # 形态照抄 ``retrieval_service._scroll_corpus``：同一份 pred → ``to_qdrant(pred)``
+    # → 取 ``must_not``（Deny-1~6）并入 Filter —— 不在这里另写一套判定。
+    # 编译失败一律 **fail-closed**（不采样任何 chunk），绝不降级为"不过滤"。
+    scroll_must_not: list = []
+    if effective_pred is not None:
+        try:
+            from app.services.security_policy import to_qdrant
+
+            scroll_must_not = list(
+                getattr(to_qdrant(effective_pred), "must_not", None) or []
+            )
+        except Exception:      # noqa: BLE001
+            logger.exception(
+                "collect_document_digests: to_qdrant(pred) 编译失败 — fail-closed，"
+                "不采样任何 chunk（否则摘要会绕过对象级权限）"
+            )
+            return []
+
     digests: list[DocumentDigest] = []
 
     for position, (doc_id, filename, page_count, chunk_count, _created) in enumerate(
@@ -198,7 +269,9 @@ async def collect_document_digests(
                             key="document_id",
                             match=qmodels.MatchValue(value=doc_id_str),
                         )
-                    ]
+                    ],
+                    # V-02-B：对象级 ACL 与文档级同源同实例（effective_pred）
+                    must_not=scroll_must_not or None,
                 ),
                 limit=256,                     # generous; sorted + sampled below
                 with_payload=True,

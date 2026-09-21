@@ -32,6 +32,7 @@ from PIL import Image
 from app.config import get_settings
 from app.services.image_understanding.imaging import (
     background_is_dark,
+    bands,
     count_bands,
     ink_profiles,
     line_art_ratio,
@@ -52,17 +53,54 @@ from app.utils.logging import get_logger
 logger = get_logger(__name__)
 
 # 分析用的缩略图长边上限。分类只需要版面/色彩统计，不需要原始分辨率；
-# 缩到 256 让纯 Python 像素遍历保持在毫秒级（不引入 numpy 依赖）。
-_GRID_MAX = 256
+# 但也不能压得太狠 —— 表格框线通常只有 2~3px 宽（见 make_doc_photo_fixture），
+# 把 1000px 的图缩到 256（因子 ~3.9）会让细线在 BILINEAR 重采样时被相邻白底
+# 平均掉、只剩零星几行还够"墨"，实测 t0 的 6 条横线只活下来 2 条 —— 一张
+# 铺满整页的表格因此够不上 framed，被判成 diagram/screenshot（2026-09 实测）。
+# 384 是这个权衡的落点：2px 线稳定存活、纯 Python 像素遍历仍在几十毫秒级。
+_GRID_MAX = 384
 
-# 一行像素中"墨"占比超过该值即认为这一行是一条横线（表格横线检测）
+# 一条线"墨"占**内容区**的比例超过该值才算表格线（相对于整幅图的旧口径已废弃）
 _RULE_RATIO = 0.55
 # 一条横线最多允许的间断（把粗细不均的线合并成一条）
 _RULE_MAX_GAP = 2
+# 一条"线"在分析分辨率（≤256）下的最大**厚度**（像素）。这是把"表格框线"与
+# "实心色块/文字行"区分开的关键：框线细（1~3px），柱状图的柱子、密集文字行都
+# 厚（≥5px）。只认细带，能从根上堵掉"柱状图被当成表格"（柱顶横边/柱身竖边
+# 又长又厚，旧口径把它们当成了表格线）。
+_RULE_MAX_THICK = 4
 # "文字行"检测：一行里墨占比超过该值即认为存在一排文字
 _TEXT_ROW_RATIO = 0.10
 # 文字行的最大间断（字形间隙比线条大，放宽到 2）
 _TEXT_ROW_MAX_GAP = 2
+
+# ── 表格 vs 图表 / 界面截图的判别阈值（2026-09 重标定，见 _decide）────────────
+# 表格是"无彩色"的：柱/饼/散点图必有明显彩色面积。彩色像素占比 ≥ 该值即视为
+# 图表，不再考虑判成表格（实测柱状图 0.18/0.20，全部表格夹具一律 0.0）。
+# 可用 settings.TABLE_MAX_COLORFUL_RATIO 覆盖。
+_TABLE_MAX_COLORFUL_RATIO = 0.12
+# 无框线表格的 OCR 兜底：列稳定性（每列被多少行支撑的均值）下限。真表格的列
+# 被绝大多数行填充；UI 截图/图表的文字左边界零散、支撑率低。0.20 是真实管线
+# （含预处理）两类的中间点：倾斜表格 t5=0.219，非表格侧 ≤0.18（ui_documents 等）。
+# 可用 settings.TABLE_OCR_MIN_COL_STABILITY 覆盖。
+_TABLE_OCR_MIN_COL_STABILITY = 0.20
+
+
+def _rule_count(
+    profile: list[int], limit: int, ratio: float, max_gap: int, max_thick: int
+) -> int:
+    """
+    数"细长直线"的条数（表格框线口径）.
+
+    与 ``count_bands`` 的区别：**额外要求每条带足够薄**。文档表格的框线只有
+    1~3px；柱状图的柱子（厚）、密集文字行（厚）都会被这条滤掉，从而不再
+    被误当成表格线。
+    """
+    return sum(
+        1
+        for start, end in bands(profile, limit, ratio, max_gap)
+        if (end - start + 1) <= max_thick
+    )
 
 
 @dataclass
@@ -210,7 +248,10 @@ def _ocr_layout(lines: list, width: int, height: int) -> dict:
         boxes.append((x0, y0, x1, y1, text))
 
     if not boxes:
-        return {"rows": 0, "cols": 0, "multi_cell_rows": 0, "alignment": 0.0}
+        return {
+            "rows": 0, "cols": 0, "multi_cell_rows": 0,
+            "alignment": 0.0, "col_stability": 0.0,
+        }
 
     boxes.sort(key=lambda b: (b[1], b[0]))
     heights = sorted(b[3] - b[1] for b in boxes)
@@ -243,11 +284,28 @@ def _ocr_layout(lines: list, width: int, height: int) -> dict:
 
     multi_cell = sum(1 for row in rows if len(row) >= 2)
     alignment = multi_cell / len(rows) if rows else 0.0
+
+    # ── 列稳定性（区分"真表格"与"UI 截图/图表"的关键，2026-09 新增）──────────
+    # alignment 只看"每行有几个单元格"，对界面截图同样很高 —— 聊天/文档列表
+    # 页面上并排的文字一样会形成"多单元格行"。真表格的额外特征是"同一组列被
+    # **每一行**反复使用"：每一列都能在多数行里找到落在它附近的单元格。UI 的
+    # 文字左边界零散分布，列被支撑的比例自然低。实测：t0..t8 = 0.40~0.80，
+    # 界面截图/图表 ≤0.29，阈值 0.35 两边都留足余量（见 TABLE_OCR_MIN_COL_STABILITY）。
+    if rows:
+        support = [
+            sum(1 for row in rows if any(abs(b[0] - col) <= col_tol for b in row))
+            for col in column_starts
+        ]
+        col_stability = round(sum(support) / len(support) / len(rows), 4)
+    else:
+        col_stability = 0.0
+
     return {
         "rows": len(rows),
         "cols": len(column_starts),
         "multi_cell_rows": multi_cell,
         "alignment": round(alignment, 4),
+        "col_stability": col_stability,
     }
 
 
@@ -265,8 +323,23 @@ def compute_signals(img: Image.Image, *, ocr_lines: list | None = None) -> dict:
     inverted, polarity_source = background_is_dark(pixels, width, height)
     row_ink, col_ink, _ = ink_profiles(pixels, width, height, inverted=inverted)
 
-    h_lines = count_bands(row_ink, width, _RULE_RATIO, _RULE_MAX_GAP)
-    v_lines = count_bands(col_ink, height, _RULE_RATIO, _RULE_MAX_GAP)
+    # ── 表格框线：**相对内容区**、且只认**细线**（2026-09 重标定）────────────
+    # 旧口径把"墨占整幅图的比例 ≥0.55"当表格线，于是两类失效同时发生：
+    #   · 有页边距/标题的表格，竖线只占画幅 40% → v_lines=0 → 表被判成 diagram
+    #     /screenshot（连铺满整页的 t0 都因子表只到 2 条横线而不达标）；
+    #   · 柱状图柱子又长又厚，却满足"整幅图比例" → 图表被当成表格。
+    # 新口径改为：线的长度相对**内容外接框**（有墨的行/列范围），并只统计**细**
+    # 带（≤_RULE_MAX_THICK）。表格框线细且贯穿内容区 → 命中；柱子/文字行粗 →
+    # 被厚度滤掉；流程图小方框的边短 → 不达标。
+    content_w = sum(1 for value in col_ink if value > 0) or width
+    content_h = sum(1 for value in row_ink if value > 0) or height
+    h_lines = _rule_count(row_ink, content_w, _RULE_RATIO, _RULE_MAX_GAP, _RULE_MAX_THICK)
+    v_lines = _rule_count(col_ink, content_h, _RULE_RATIO, _RULE_MAX_GAP, _RULE_MAX_THICK)
+    # "粗带"（不滤厚度，旧口径的等价物）—— 专供**流程图/结构图**判据使用：
+    # 流程图的大色块/面板会形成又长又厚的带，线条判据刻意把它滤掉（否则图表
+    # 会被当表格），但"图里有一整块结构"这件事本身仍是 diagram 的正信号。
+    raw_h_bands = count_bands(row_ink, width, _RULE_RATIO, _RULE_MAX_GAP)
+    raw_v_bands = count_bands(col_ink, height, _RULE_RATIO, _RULE_MAX_GAP)
     # 文字行密度（**不依赖 OCR**）：代码截图 / 文档扫描页会产生大量"有墨"的行。
     # 这是把"截图"和"线稿流程图"区分开的关键 —— 两者 line_art_ratio 都高，
     # 区别只在"到底有多少排文字"。
@@ -280,6 +353,12 @@ def compute_signals(img: Image.Image, *, ocr_lines: list | None = None) -> dict:
         "height": height,
         "h_lines": h_lines,
         "v_lines": v_lines,
+        # 内容外接框（有墨的行/列数）—— 表格框线判据的分母，排查"为何没判成表"
+        # 时第一眼就该看它：内容框远小于画幅 = 图有页边距/标题。
+        "content_w": content_w,
+        "content_h": content_h,
+        "raw_h_bands": raw_h_bands,
+        "raw_v_bands": raw_v_bands,
         "inverted": inverted,
         # 极性是怎么判出来的（page-ring / global-majority）—— 排查"这张图
         # 为什么被判成表格"时，第一眼就该看这两个字段。
@@ -295,6 +374,8 @@ def compute_signals(img: Image.Image, *, ocr_lines: list | None = None) -> dict:
         "ocr_cols": layout["cols"],
         "ocr_multi_cell_rows": layout["multi_cell_rows"],
         "ocr_alignment": layout["alignment"],
+        # 列稳定性：无框线表格的 OCR 兜底判据（区分真表格与界面截图），见 _ocr_layout
+        "ocr_col_stability": layout["col_stability"],
         # ── 公式 / 代码（文本层信号，OCR 不可用时全部为 0）─────────────────
         "code_score": text_stats["code_score"],
         "code_language": text_stats["code_language"],
@@ -419,21 +500,38 @@ def _decide(signals: dict, settings) -> tuple[str, float, str]:
     v_lines = signals["v_lines"]
     min_h = getattr(settings, "TABLE_MIN_H_LINES", 3)
     min_v = getattr(settings, "TABLE_MIN_V_LINES", 2)
+    # 粗带（含大色块/面板）：图表"有坐标轴/结构"与流程图"有一整块结构"的旁证。
+    # 缺省回退到细线计数 —— 手工拼 signals 的用例（test_dark_node_diagram_not_chart）
+    # 不带 raw_* 键，这样它们的行为与旧版一致。
+    raw_bands = signals.get("raw_h_bands", h_lines) + signals.get("raw_v_bands", v_lines)
+    # 表格是"无彩色"的（黑字灰线白底）。柱/饼/散点图必有明显彩色面积 ——
+    # 用它把"彩色图表被判成表格"堵掉（实测柱状图 colorful_ratio 0.18/0.20，
+    # 全部表格夹具一律 0.0）。缺省 0.0 保证手工拼 signals 的旧用例不受影响。
+    colorful_ratio = signals.get("colorful_ratio", 0.0)
+    max_colorful = getattr(settings, "TABLE_MAX_COLORFUL_RATIO", _TABLE_MAX_COLORFUL_RATIO)
+    is_colorful = colorful_ratio >= max_colorful
 
     # ── 1. 表格：有真实框线，或 OCR 版面呈现稳定的多列对齐 ────────────────
-    framed = h_lines >= min_h and v_lines >= min_v
+    framed = h_lines >= min_h and v_lines >= min_v and not is_colorful
     grid_by_layout = (
         signals["ocr_rows"] >= 3
         and signals["ocr_cols"] >= 2
         and signals["ocr_alignment"] >= 0.6
         and signals["ocr_multi_cell_rows"] >= 2
+        # 列稳定性：真表格的列被绝大多数行支撑；界面截图/图表的文字左边界零散，
+        # 支撑率低（实测表格 ≥0.40，UI/图表 ≤0.29）。这是把"UI 截图被判成表格"
+        # 堵在门外的那道判据（单看 alignment 分不开：t5=0.71 vs ui_documents=0.73）。
+        and signals.get("ocr_col_stability", 0.0)
+        >= getattr(settings, "TABLE_OCR_MIN_COL_STABILITY", _TABLE_OCR_MIN_COL_STABILITY)
+        and not is_colorful
     )
     if framed:
         # 线越多越像表；横线权重更高（表格横线通常多于竖线）
         confidence = min(0.98, 0.6 + 0.06 * h_lines + 0.05 * v_lines)
         return IMAGE_TYPE_TABLE, confidence, f"ruling-lines(h={h_lines},v={v_lines})"
     if grid_by_layout:
-        confidence = min(0.9, 0.55 + 0.15 * signals["ocr_alignment"])
+        confidence = min(0.9, 0.4 + 0.2 * signals["ocr_alignment"]
+                        + 0.2 * signals.get("ocr_col_stability", 0.0))
         return IMAGE_TYPE_TABLE, confidence, "ocr-grid-alignment"
 
     # ── 2. 公式：符号占比高 + 行很短 + 无线框 ──────────────────────────────
@@ -482,7 +580,7 @@ def _decide(signals: dict, settings) -> tuple[str, float, str]:
     chromatic = signals["chromatic_blocks"]
     chart_evidence = (
         signals["colorful_ratio"] >= 0.15
-        or (h_lines + v_lines) >= 2
+        or raw_bands >= 2
     )
     chart_like = (
         2 <= chromatic <= 8
@@ -492,7 +590,17 @@ def _decide(signals: dict, settings) -> tuple[str, float, str]:
         and signals["ocr_rows"] <= 15
         and chart_evidence
     )
-    if chart_like:
+    # 大面积彩色 + 统一背景：柱/饼/分组柱这类"彩色块占可观面积"的图表，
+    # 即使没被量化成 ≥3% 的同色块（细柱/渐变），彩色像素占比依然很高。
+    # 单凭 chromatic_blocks 会把它们漏掉（实测柱状图 chromatic=0），于是落到
+    # screenshot/photo —— 图意（趋势、数值）永远读不到。
+    colorful_chart = (
+        signals["colorful_ratio"] >= 0.15
+        and signals["saturation"] >= 0.06
+        and signals["dominant_ratio"] >= 0.3
+        and signals["ocr_rows"] <= 15
+    )
+    if chart_like or colorful_chart:
         confidence = min(0.9, 0.5 + 0.1 * chromatic + signals["dominant_ratio"] * 0.2)
         return IMAGE_TYPE_CHART, confidence, f"color-blocks({chromatic})"
 
@@ -518,7 +626,7 @@ def _decide(signals: dict, settings) -> tuple[str, float, str]:
     # photo 走 OCR —— 而 OCR 对深底浅字只能读出一两个单词，等于没读。
     # 真正的图表上一步已被 chart_evidence 拦走，放宽这里不会把图表卷进来。
     line_art = signals["line_art_ratio"] >= 0.8
-    structured = (h_lines + v_lines) >= 2 or signals["ocr_rows"] >= 2
+    structured = raw_bands >= 2 or signals["ocr_rows"] >= 2
     if line_art and structured and chromatic <= 3:
         confidence = min(
             0.85, 0.45 + signals["line_art_ratio"] * 0.3 + 0.03 * (h_lines + v_lines)

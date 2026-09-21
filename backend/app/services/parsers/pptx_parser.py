@@ -100,6 +100,8 @@ class PptxParser(DocumentParser):
         pages: list[ExtractedPage] = []
         cursor = 0
         total_pages = len(prs.slides)
+        has_tables = False
+        has_charts = False
 
         recognizer = EmbeddedImageRecognizer(filename, document_id=document_id, tenant_id=tenant_id)
         all_image_texts: list[str] = []
@@ -108,7 +110,21 @@ class PptxParser(DocumentParser):
             slide_number = i + 1
             slide_text = []
             for shape in slide.shapes:
-                if hasattr(shape, "text") and shape.text:
+                # 表格（GraphicFrame）没有 .text 属性，旧实现里整张表被静默跳过；
+                # 图表（内嵌 workbook 数据）同理。这里显式识别并转成可检索文本。
+                if shape.has_table:
+                    md = _pptx_table_to_markdown(shape.table)
+                    if md:
+                        slide_text.append(md)
+                        has_tables = True
+                    continue
+                if shape.has_chart:
+                    chart_text = _pptx_chart_to_text(shape.chart)
+                    if chart_text:
+                        slide_text.append(chart_text)
+                        has_charts = True
+                    continue
+                if shape.has_text_frame and shape.text:
                     slide_text.append(shape.text.strip())
 
             # ── Embedded pictures on this slide (部分1+2) ─────────────────────
@@ -157,6 +173,11 @@ class PptxParser(DocumentParser):
         extraction_method = "native"
         if recognizer.images:
             extraction_method = "native+image"
+        # 表格 / 图表内容已入库，在 extraction_method 上体现（旧实现整块丢失却仍报 native）。
+        if has_tables:
+            extraction_method += "+table"
+        if has_charts:
+            extraction_method += "+chart"
 
         if recognizer.images:
             logger.info(
@@ -186,3 +207,56 @@ def _iter_picture_blobs_for_slide(slide):
     """Walk every shape on a slide (including groups) and yield picture blobs."""
     for shape in slide.shapes:
         yield from _iter_picture_blobs(shape)
+
+
+def _pptx_table_to_markdown(table) -> str:
+    """
+    把 PPTX 里的表格（GraphicFrame）转成 Markdown 表格入库.
+
+    与 DOCX 同一思路：转 Markdown 才能让下游 chunker 识别为 content_type="table"，
+    支持表格检索，且 Document Agent 能把它还原成真正表格。旧实现只取
+    ``shape.text``，而 GraphicFrame 没有该属性 → 整张表被静默丢弃。
+    """
+    rows: list[list[str]] = []
+    for row in table.rows:
+        cells = [
+            cell.text.strip().replace("\n", " ").replace("|", "\\|")
+            for cell in row.cells
+        ]
+        if any(cells):
+            rows.append(cells)
+    if not rows:
+        return ""
+
+    width = max(len(r) for r in rows)
+    padded = [r + [""] * (width - len(r)) for r in rows]
+    lines = [
+        "| " + " | ".join(padded[0]) + " |",
+        "|" + "|".join(["---"] * width) + "|",
+    ]
+    for r in padded[1:]:
+        lines.append("| " + " | ".join(r) + " |")
+    return "\n".join(lines)
+
+
+def _pptx_chart_to_text(chart) -> str:
+    """
+    把 PPTX 里内嵌的图表（chart）导出为"系列名: 数值序列"文本.
+
+    图表的数据存在内嵌 workbook 里，旧实现取不到（同 GraphicFrame 问题）。
+    导出系列名 + 各点数值，至少让图里的数字能被检索到。
+    """
+    parts: list[str] = []
+    try:
+        for plot in chart.plots:
+            for series in plot.series:
+                name = (series.name or "").strip()
+                values = series.values
+                if not values:
+                    continue
+                vals = ", ".join(str(v) for v in values)
+                parts.append(f"{name}: {vals}" if name else vals)
+    except Exception as exc:      # noqa: BLE001
+        logger.debug("PPTX chart export skipped for '%s': %s", exc, exc)
+        return ""
+    return "\n".join(parts)

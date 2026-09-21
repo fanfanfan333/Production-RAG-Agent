@@ -33,6 +33,7 @@ Multimodal Context builder（部分5 + 部分6）.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 from app.config import get_settings
@@ -162,6 +163,9 @@ class MultimodalContext:
     vision_used: int = 0
     vision_available: bool = False
     masked_count: int = 0
+    # ── 【T4】第 12 环对象级校验的产物（未传 pred 时恒为「无剔除」）────────────
+    dropped_count: int = 0
+    acl_status: str = "clean"
 
     @property
     def has_evidence(self) -> bool:
@@ -207,6 +211,11 @@ async def build_multimodal_context(
     query: str,
     *,
     enable_images: bool | None = None,
+    pred=None,
+    view_index=None,
+    materialized: bool | Mapping[str, bool] = True,
+    user_id: str | None = None,
+    username: str | None = None,
 ) -> MultimodalContext:
     """
     把精排后的 chunks 组装成"图文并茂"的上下文.
@@ -216,11 +225,53 @@ async def build_multimodal_context(
         query:         用户问题（改写后的自包含问题最佳）—— Vision 看图时带着它
         enable_images: 是否启用图片视觉分析；None 跟随
                        settings.MULTIMODAL_CONTEXT_ENABLED
+        pred:          【T4】**可选**的 :class:`ScopePredicate`。给出时**在 Vision 之前**
+                       先逐块走 :func:`allows`（图片级 ACL），并给每条引用附
+                       ``permission_snapshot``；不给出时行为与改动前**逐字一致**。
+        view_index:    ``{document_id: {chunk_key: ObjectACLView}}``（仅在给出 pred 时生效）。
+        materialized:  对象权限行是否已物化；``False`` 时缺行回退允许。亦可传
+                       ``{document_id: bool}``（``security_cascade.load_view_indexes``
+                       的逐文档结论）—— 缺失的文档按 ``False`` 处理。
     """
     settings = get_settings()
+
+    # ── 【T4】第 12 环对象级最终校验：**必须先于 Vision**（图不能先被识别再被挡）──
+    acl_status = "clean"
+    dropped_count = 0
+    if pred is not None and view_index is not None:
+        from app.services.nodes.final_check_node import (
+            audit_acl_drops,
+            filter_chunks_by_acl,
+        )
+
+        doc_ids = {str(getattr(c, "document_id", "") or "") for c in chunks}
+        # 【T4-批量】``materialized`` 既接受 ``bool``（广播，向后兼容）也接受
+        # ``{document_id: bool}``（``load_view_indexes`` 的逐文档结论）；Mapping 中
+        # 缺失的文档按 ``False``（未物化 ⇒ 缺行回退允许）处理。
+        if isinstance(materialized, Mapping):
+            mat_map = {
+                doc_id: bool(materialized.get(doc_id, False))
+                for doc_id in doc_ids if doc_id
+            }
+        else:
+            mat_map = {doc_id: bool(materialized) for doc_id in doc_ids if doc_id}
+        outcome = filter_chunks_by_acl(chunks, pred, view_index, materialized=mat_map)
+        # 【T5 上线前修复】第 12 环剔除**必须留痕**：否则事后无法回答
+        # "这个用户为什么看不到这张图"（PRD P0-10）。audit_acl_drops 自带
+        # best-effort 保护，不会打断回答路径。
+        if outcome.dropped:
+            await audit_acl_drops(
+                outcome, pred, user_id=user_id, username=username
+            )
+        chunks = list(outcome.allowed)
+        dropped_count = outcome.dropped_count
+        acl_status = outcome.status
+
     if not chunks:
         return MultimodalContext(
-            context="No relevant documents were found in the knowledge base for this query."
+            context="No relevant documents were found in the knowledge base for this query.",
+            dropped_count=dropped_count,
+            acl_status=acl_status,
         )
 
     use_images = (
@@ -408,6 +459,28 @@ async def build_multimodal_context(
             }
         )
 
+        # ── 【T4】引用权限快照（决策 16）：只存指纹，不存明文权限属性 ──────────
+        if pred is not None:
+            from app.services.nodes.final_check_node import (
+                SNAPSHOT_KEY,
+                build_permission_snapshot,
+                chunk_key as _chunk_key,
+                derive_parent_object_id,
+                object_type_of_chunk,
+            )
+
+            doc_key = str(chunk.document_id)
+            _view = (view_index or {}).get(doc_key, {}).get(_chunk_key(chunk))
+            sources[-1][SNAPSHOT_KEY] = build_permission_snapshot(
+                _view,
+                pred,
+                object_id=str(_view.object_id) if _view is not None else _chunk_key(chunk),
+                object_type=object_type_of_chunk(chunk.content_type, chunk.image_id),
+                parent_object_id=derive_parent_object_id(
+                    doc_key, chunk.content_type, chunk.image_id
+                ),
+            )
+
     # ── 组装最终上下文文本 ────────────────────────────────────────────────────
     # kind 会把图片类型带给 LLM（"图表"/"流程图"…）—— 让模型知道这段证据
     # 是一张柱状图而不是一张照片，对"图里的数据是多少"这类问题很关键。
@@ -461,6 +534,8 @@ async def build_multimodal_context(
         vision_used=vision_used,
         vision_available=vision_available,
         masked_count=masked,
+        dropped_count=dropped_count,
+        acl_status=acl_status,
     )
 
 

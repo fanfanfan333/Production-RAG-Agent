@@ -26,8 +26,10 @@ from app.api.evaluation import router as evaluation_router
 from app.api.feedback import router as feedback_router
 from app.api.health import router as health_router
 from app.api.kb_collections import router as kb_collections_router
+from app.api.projects import router as projects_router
 from app.api.quality import router as quality_router
 from app.api.query import router as query_router
+from app.api.security import router as security_router
 from app.api.share_requests import router as share_requests_router
 from app.api.staff import router as staff_router
 from app.config import RERANK_MIN_SCORE_RATIO_CEILING, get_settings
@@ -42,6 +44,7 @@ from app.db import user_models  # noqa: F401 — registers users/collections/aud
 from app.db import share_models  # noqa: F401 — registers share_requests (三层知识库)
 from app.db import staff_models  # noqa: F401 — registers staff_requests (企业身份验证)
 from app.db import company_models  # noqa: F401 — registers companies (公司注册表)
+from app.db import security_models  # noqa: F401 — registers document_objects/projects/project_members/acl_grants (五维安全隔离)
 from app.db.postgres import dispose_engine, get_engine
 from app.db.postgres import Base
 from app.db.qdrant import close_qdrant_client
@@ -64,11 +67,34 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         _settings.ENVIRONMENT,
     )
 
-    if _settings.JWT_SECRET.startswith("dev-insecure-secret-change-me"):
-        logger.warning(
-            "JWT_SECRET is still the default development value — "
-            "SET A STRONG SECRET before any real deployment!"
+    # FIX-B（T5 预发布）：弱密钥 fail-closed。
+    # 仅在 JWT_SECRET **真正**是默认值/已知弱值/长度<32 且未显式开启 escape 开关时
+    # 才终止启动（杜绝自签 admin token）。环境变量显式提供了 ≥32 字符强密钥则照常启动。
+    from app.config import (
+        ALLOW_INSECURE_JWT,
+        is_jwt_secret_weak,
+        jwt_secret_must_fail_startup,
+    )
+
+    if jwt_secret_must_fail_startup(
+        _settings.JWT_SECRET,
+        allow_insecure_jwt=_settings.ALLOW_INSECURE_JWT,
+        debug=_settings.DEBUG,
+    ):
+        raise RuntimeError(
+            "JWT_SECRET 是弱密钥（默认值/已知弱值/长度<32）。"
+            "为阻断自签 admin token，启动已终止。请设置 ≥32 字符的强密钥；"
+            "本地联调可临时设置 ALLOW_INSECURE_JWT=true 或 DEBUG=true。"
         )
+    elif is_jwt_secret_weak(_settings.JWT_SECRET):
+        # 命中 escape 开关（ALLOW_INSECURE_JWT / DEBUG）：放行但打醒目 ERROR。
+        logger.error(
+            "SECURITY ALERT: JWT_SECRET 为弱密钥（默认值/弱值/长度<32），"
+            "但因 ALLOW_INSECURE_JWT=true 或 DEBUG=true 放行 —— 生产部署必须设置 "
+            "≥32 字符的强密钥（openssl rand -hex 32），切勿长期开启此开关！"
+        )
+    else:
+        logger.info("JWT_SECRET 校验通过：已使用强密钥，JWT 签发安全。")
     if _settings.ENVIRONMENT == "production":
         if "*" in _settings.CORS_ORIGINS:
             logger.error("Production CORS_ORIGINS must not contain '*'")
@@ -220,6 +246,8 @@ def create_app() -> FastAPI:
     app.include_router(share_requests_router)    # 三层知识库 — 申请共享 / 查看申请 / 审核
     app.include_router(staff_router)             # 企业身份 — 身份验证申请 / 层级审核 / 成员管理
     app.include_router(companies_router)         # 公司注册表 — /companies 清单 / 创建 / 改名 / 可访问
+    app.include_router(projects_router)          # 五维隔离 — /projects 项目维度 + 成员（含临时成员）
+    app.include_router(security_router)          # 五维隔离 — /security need-to-know + 密级管理面
 
     return app
 

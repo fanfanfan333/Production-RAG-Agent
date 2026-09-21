@@ -274,6 +274,8 @@ async def keyword_search(
     collection_id: str | None = None,
     unrestricted: bool = False,
     metadata_filter=None,
+    scope=None,
+    pred=None,
 ) -> list[tuple[str, int, str, float]]:
     """
     关键词检索，返回 ``[(document_id, chunk_index, point_id, rank), ...]``.
@@ -291,6 +293,12 @@ async def keyword_search(
     向量腿被年份收窄而关键词腿没有的话，关键词腿会把别的年份的精确词命中送进
     RRF，恰好把被排除的段落又拉回候选池，"过滤"就形同虚设。
 
+    【T3 双路同源】``scope``（``UserScope``）给了时，权限条件改用
+    ``to_sql(scope.predicate(), Document)``：它与向量腿的 ``to_qdrant(pred)``
+    由**同一个** ``ScopePredicate`` 编译，并在此之上追加密级 / 项目 / deny /
+    excluded（决策 6.1「同一 pred 只构造一次」）。``scope`` 为 ``None`` 时退回
+    既有 ``document_scope_clause`` 三维行为（旧调用点零变化）。
+
     全部过滤在 SQL 侧完成（索引 + join），不把候选拉进进程再筛。
     """
     from app.db.models import Document, DocumentChunkTerm, DocumentStatus
@@ -299,7 +307,7 @@ async def keyword_search(
     tsquery = build_tsquery(query)
     if not is_query_usable(tsquery) or limit <= 0:
         return []
-    if not unrestricted and not (
+    if not unrestricted and scope is None and pred is None and not (
         owner_id is not None or tenant_ids is not None
         or tenant_wide or bool(owns_tenant_ids)
     ):
@@ -335,7 +343,38 @@ async def keyword_search(
     if collection_id:
         stmt = stmt.where(DocumentChunkTerm.collection_id == collection_id)
 
-    if not unrestricted:
+    if not unrestricted and pred is not None:
+        # 【T3 双路同源（决策 6.1）】入口（retrieve_chunks）已编译好的**同一个**
+        # ScopePredicate 直接下推：与向量腿 ``to_qdrant(pred)`` 用的是同一个实例，
+        # 本腿不再 ``scope.predicate()`` 现编（否则会得到另一个实例，破坏同源）。
+        # to_sql 内部**复用**既有 document_scope_clause（三维一行不改），并追加
+        # 密级/项目/deny/excluded。编译失败必须 fail-closed（返回空）。
+        from app.services.security_policy import ScopeCompileError, to_sql
+
+        try:
+            stmt = stmt.where(to_sql(pred, Document))
+        except ScopeCompileError:
+            logger.error("keyword_search: to_sql(pred) 编译失败 — fail-closed 返回空")
+            return []
+        except Exception:      # noqa: BLE001
+            logger.exception("keyword_search: to_sql(pred) 意外失败 — fail-closed 返回空")
+            return []
+    elif not unrestricted and scope is not None:
+        # 兼容旧调用点：只给了 UserScope 时，本腿自行现编一个 pred（这会得到与
+        # 向量腿**不同**的实例）—— 仅用于不在 T3 主链路上的历史调用；主链路
+        # 一律经 ``pred=`` 传入同一实例。
+        from app.services.security_policy import ScopeCompileError, to_sql
+
+        try:
+            compiled = scope.predicate()
+            stmt = stmt.where(to_sql(compiled, Document))
+        except ScopeCompileError:
+            logger.error("keyword_search: to_sql(pred) 编译失败 — fail-closed 返回空")
+            return []
+        except Exception:      # noqa: BLE001
+            logger.exception("keyword_search: 编译 ScopePredicate 失败 — fail-closed 返回空")
+            return []
+    elif not unrestricted:
         # 三层隔离的唯一 SQL 组装点：公司边界 ∪ 自己个人库（private 与租户无关）。
         # 与向量腿用**同一个** `document_scope_clause` —— 两条腿可见集合不一致时，
         # RRF 融合出的结果会包含某一条腿看不到的文档。

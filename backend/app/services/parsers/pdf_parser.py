@@ -78,6 +78,7 @@ class PDFParser(DocumentParser):
         recognizer = EmbeddedImageRecognizer(filename, document_id=document_id, tenant_id=tenant_id)
         seen_xrefs: set[int] = set()   # same image reused across pages → once
         max_images_per_page = settings.MAX_IMAGES_PER_PAGE
+        image_only_lost = 0   # 纯图片页（无文字且无可用图片文本）被跳过的计数
 
         for page_index in range(total_pages):
             page: fitz.Page = doc[page_index]
@@ -163,6 +164,11 @@ class PDFParser(DocumentParser):
                     page_text = f"{page_text}\n\n[图片识别内容]\n{page_image_block}".strip()
 
             if not page_text:
+                # 纯图片页：有图但没抽出任何文字 → 整页内容静默消失（已知缺陷 B11）。
+                # 至少计数告警，便于排查"页数 vs 实际内容"不一致。
+                had_images = (len(recognizer.texts) > image_texts_before) or page_needed_page_ocr
+                if had_images:
+                    image_only_lost += 1
                 continue
 
             start = cursor
@@ -178,6 +184,15 @@ class PDFParser(DocumentParser):
             cursor = end + 2
 
         doc.close()
+
+        if image_only_lost:
+            # 纯图片页有图无文、整页被跳过：内容未入库但 page_count 仍按总页数报，
+            # 页数 vs 实际内容会不一致。告警让该现象可见（B11）。
+            logger.warning(
+                "PDF '%s': %d 个纯图片页无可用文字被跳过（仅保留独立图片对象，"
+                "正文未入库）；page_count 仍为总页数 %d 而非实际页数 %d",
+                filename, image_only_lost, total_pages, len(pages),
+            )
 
         if not pages:
             raise ValueError(f"PDF '{filename}' contains no extractable text even after OCR.")

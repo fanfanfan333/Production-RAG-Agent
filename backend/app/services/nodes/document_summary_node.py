@@ -18,6 +18,7 @@ Document Summary 节点（架构图 Document Summary 分支）.
 from __future__ import annotations
 
 import re
+from typing import TYPE_CHECKING
 
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langchain_ollama import ChatOllama
@@ -28,6 +29,9 @@ from app.services.relation_service import (
     digest_sources,
 )
 from app.utils.logging import get_logger
+
+if TYPE_CHECKING:  # pragma: no cover - 仅类型，避免与 security_scope 循环导入
+    from app.services.security_scope import UserScope
 
 logger = get_logger(__name__)
 
@@ -88,6 +92,7 @@ async def collect_summary_digests(
     user_department_id: str | None = None,
     tenant_wide: bool = False,
     document_ids: list[str] | None = None,
+    security_scope: "UserScope | None" = None,
 ) -> list[dict]:
     """
     拉取全库文档摘要（供 Document Summary 分支使用）.
@@ -97,6 +102,10 @@ async def collect_summary_digests(
     第一、二层过滤（摘要同样不能跨公司泄漏）；tenant_wide 把管理员的宽口径
     范围原样传下去，owns_tenant_ids 表达 admin 自建测试公司集合（可见其中
     他人私库），**个人库始终只有本人（+ admin 自建集合例外）**。
+
+    FIX-A（T5 预发布）：``security_scope`` 透传请求级五维 ``UserScope``，让
+    文档摘要采样与检索链路**同源**走五维判定（密级 / 项目 / deny / excluded）。
+    未透传时退回三维 ``document_scope_clause``，保证旧调用点行为不变。
 
     document_ids 非空时只采样这几份文档（用户在提问里点名了）。
     整库总结的文档数上限用 DOC_SUMMARY_MAX_DOCUMENTS（map-reduce 的等待
@@ -117,6 +126,7 @@ async def collect_summary_digests(
         user_department_id=user_department_id,
         tenant_wide=tenant_wide,
         document_ids=document_ids,
+        security_scope=security_scope,
     )
     logger.info(
         "document_summary: collected %d document digests (scoped=%s)",

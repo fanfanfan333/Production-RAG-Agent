@@ -42,12 +42,18 @@ from app.services.tenancy import (
     effective_tenant_id,
     request_scope,
 )
+from app.services.security_scope import request_security_scope
 from app.utils.errors import clean_message
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
 router = APIRouter(tags=["Document Management"])
+
+# 【T4 / 决策 16】"文档不存在或无权访问"的**唯一常量**：
+# 文本来源、图片来源、以及任何对象级剔除，都必须返回**逐字一致**的 404 文案 ——
+# 任何措辞差异都等于确认"该文档 / 图片确实存在"，可被批量探测利用。
+_DOCUMENT_404_DETAIL = "文档不存在或无权访问"
 
 
 # ── GET /documents ─────────────────────────────────────────────────────────────
@@ -97,27 +103,32 @@ async def list_documents_endpoint(
         ),
     ] = None,
 ) -> DocumentListResponse:
-    # 可见范围由 tenancy.request_scope 一处组装（平台管理员 = 自建测试公司集合，
-    # 仍看不到别公司文档与他人个人库；其他人 = 本公司内个人 + 本部门 + 公司库）。
-    scope = await request_scope(user)
+    # 可见范围由安全 Scope 一处组装（五维：租户 + 层级 + 个人库 + 密级 + 项目）。
+    # 平台管理员 = 自建测试公司集合，仍看不到别公司文档与他人个人库；其他人 =
+    # 本公司内个人 + 本部门 + 公司库；V-03 修复：列表元数据现在同样受密级 /
+    # 项目 / deny / excluded 约束，不再泄露高密级 / 项目外文档。
+    scope = await request_security_scope(user)
 
     return await list_documents(
         page=page,
         limit=limit,
         status=status,
-        owner_id=scope.owner_id,
+        owner_id=scope.base.owner_id,
         collection_id=collection_id,
         # 三层隔离：列表与检索同规则（公司集合 + ACL），共享文档按层级可见
-        tenant_ids=scope.tenant_ids,
-        user_department_id=scope.department_id,
+        tenant_ids=scope.base.tenant_ids,
+        user_department_id=scope.base.department_id,
         # 企业/知识库管理员可读本公司全部部门库（审核共享申请需要）
-        tenant_wide=scope.tenant_wide,
-        owns_tenant_ids=scope.owns_tenant_ids,
+        tenant_wide=scope.base.tenant_wide,
+        owns_tenant_ids=scope.base.owns_tenant_ids,
         # 文档页公司筛选：只保留归属该公司的文档（仍受可见范围上限约束）
         company_id=company_id,
         # 逐条算出 is_owner / can_delete / 发布能力，前端按钮与后端校验同源
         viewer=user,
         access_level=access_level,
+        # V-03：五维 Scope 下推（密级 / 项目 / deny / excluded），优先于上面的
+        # 三维标量参数（当 scope 非 None 时内层改用 to_sql(pred, Document)）。
+        scope=scope,
     )
 
 
@@ -238,7 +249,12 @@ async def get_document_chunks_endpoint(
     document_id: uuid.UUID,
     user: Annotated[User, Depends(require_permission("document.read"))],
 ) -> dict:
+    # 【T4 / 决策 16】两件事都做：
+    #   ① 沿用 request_scope 的三维 kwargs（保持既有 SQL 组装点不变）；
+    #   ② 额外**重新签发** UserScope 并取 predicate()，供逐 chunk 对象级再校验。
+    # 重新签发发生在新的一次 HTTP 请求入口（api/**），符合决策 10-④。
     scope = await request_scope(user)
+    sec = await request_security_scope(user)
     try:
         return await get_document_chunks(
             document_id,
@@ -247,6 +263,7 @@ async def get_document_chunks_endpoint(
             owns_tenant_ids=scope.owns_tenant_ids,
             user_department_id=scope.department_id,
             tenant_wide=scope.tenant_wide,
+            pred=sec.predicate(),
         )
     except KeyError as exc:
         raise HTTPException(
@@ -599,6 +616,9 @@ async def get_document_image_endpoint(
 
     from app.db.models import Document
     from app.db.postgres import get_db_session
+    from app.services.security_policy import ObjectACLView, allows
+    from app.services.security_cascade import document_view
+    from app.services.security_scope import request_security_scope
     from app.services.storage import resolve_image_path
     from app.services.storage.image_store import IMAGES_SUBDIR
 
@@ -617,8 +637,47 @@ async def get_document_image_endpoint(
     ):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="文档不存在或无权访问",
+            detail=_DOCUMENT_404_DETAIL,
         )
+
+    # ── 【T4 / 决策 16】图片级对象校验（不能只凭"文档可见"就放行任意一张图）──────
+    pred = (await request_security_scope(user)).predicate()
+    # ① 文档级五维判定（密级 / 项目 / deny / excluded）
+    if not allows(pred, document_view(doc)).allowed:
+        await _audit_citation_open_drop(user, str(document_id), str(document_id), "document_level", "security")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=_DOCUMENT_404_DETAIL,
+        )
+    # ② 图片对象级判定：由 image_name 反查图片对象行再 allows()
+    from app.services.image_security import resolve_image_object_id
+    from app.services.security_cascade import document_is_materialized
+
+    info = await resolve_image_object_id(document_id, image_name)
+    if info is None:
+        # 反查不到行：
+        #   - 文档**已物化** → fail-closed 404（对象权限是权威且完整的，没有行就是不该有）
+        #   - 文档**从未物化**（回填未覆盖的存量文档）→ 回退文档级判定（已在上面通过），
+        #     仅继续校验文件是否存在，避免存量文档的图片集体变 404（功能退化）。
+        if await document_is_materialized(document_id):
+            await _audit_citation_open_drop(
+                user, str(document_id), f"{document_id}::{image_name}",
+                "image_object_not_found", "tenant",
+            )
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=_DOCUMENT_404_DETAIL,
+            )
+    else:
+        decision = allows(pred, ObjectACLView.from_row(info))
+        if not decision.allowed:
+            await _audit_citation_open_drop(
+                user, str(document_id), info.get("object_id"), decision.reason, decision.gate,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=_DOCUMENT_404_DETAIL,
+            )
 
     resolved = resolve_image_path(
         str(document_id), f"{IMAGES_SUBDIR}/{image_name}",
@@ -638,30 +697,76 @@ async def get_document_image_endpoint(
     )
 
 
+async def _audit_citation_open_drop(
+    user: User,
+    document_id: str,
+    object_id: str | None,
+    reason: str | None,
+    gate: str | None,
+) -> None:
+    """引用点击回源被对象级 ACL 剔除时的审计（best-effort，绝不阻断请求）."""
+    try:
+        from app.services.audit_service import record_acl_drop
+
+        await record_acl_drop(
+            "citation_open",
+            object_id=object_id,
+            document_id=document_id,
+            reason=reason,
+            gate=gate,
+            user_id=getattr(user, "id", None),
+            username=getattr(user, "username", None),
+        )
+    except Exception:      # noqa: BLE001
+        logger.warning("citation_open audit failed (doc=%s)", document_id, exc_info=True)
+
+
 # ── GET /documents/generated/{filename} ───────────────────────────────────────
 #
 # Document Agent 生成的 Word 下载入口。文件名由服务端生成（时间戳 + 随机后缀），
 # 不接受用户输入作为路径，因此天然免疫目录穿越。
+#
+# ⚠️ 仅靠"文件名不可猜"是不够的：产物内含 N 条来源片段与原始图片，一旦落到
+# 别人手里，检索前租户过滤 / 检索后 ACL / LLM 输入前校验整条隔离链路都被绕过。
+# 因此这里做了**归属 + 权限**双重判定（document_agent_service.authorize_
+# generated_file）：调用者必须是产物所有者，或者对产物引用的**全部**源文档都
+# 可访问；归属无法确定时 fail-closed。
+
+# 未授权与"文件不存在"必须返回**逐字一致**的响应 —— 「无权访问」会确认
+# "该文件存在"，本身即信息泄露，且可被批量探测。两者共用这一个常量，杜绝漂移。
+_GENERATED_404_DETAIL = "文件不存在或已过期"
+
 
 @router.get(
     "/documents/generated/{filename}",
     summary="Download a generated Word document (Document Agent 产物)",
     description=(
-        "Downloads a .docx produced by the Document Agent. Any authenticated "
-        "user may download a generated document; file names are server-generated."
+        "Downloads a .docx produced by the Document Agent. Access is granted "
+        "only when the caller is the artifact's owner, or can access **every** "
+        "source document cited by the artifact. File names are server-generated. "
+        "Unauthorized requests are indistinguishable from a missing file."
     ),
 )
 async def download_generated_document_endpoint(
     filename: str,
     user: Annotated[User, Depends(get_current_user_media)],
 ) -> FileResponse:
-    from app.services.document_agent_service import resolve_generated_file
+    # 注意：Authorization 头与 ?token= 两条通道都收敛到 get_current_user_media
+    # → _resolve_user，拿到的是同一个 user 对象；归属判定只依赖这个 user，因此
+    # 两条通道同源，不存在"带 token 就绕过"。
+    from app.services.document_agent_service import authorize_generated_file
 
-    resolved = resolve_generated_file(filename)
+    resolved, decision = await authorize_generated_file(filename, user)
     if resolved is None:
+        logger.warning(
+            "Generated download denied: file=%s user=%s reason=%s",
+            filename,
+            getattr(user, "username", None),
+            decision,
+        )
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="文件不存在或已过期",
+            detail=_GENERATED_404_DETAIL,
         )
 
     media_type = (

@@ -44,6 +44,7 @@ rag_graph.py 里已经跑通的流式、历史落库、错误中文化、文档�
 
 from __future__ import annotations
 
+import asyncio
 import time
 import uuid
 from typing import Any, AsyncGenerator, TypedDict
@@ -108,8 +109,13 @@ from app.services.relation_service import (
     digest_sources,
     list_accessible_documents,
 )
-from app.services.retrieval_service import RetrievedChunk, retrieve_chunks
+from app.services.retrieval_service import (
+    RetrievedChunk,
+    ScopedQuery,
+    retrieve_chunks_scoped,
+)
 from app.services.routers.query_router import route_query
+from app.services.security_scope import UserScope
 from app.services.stream_channel import bind_sink, emit_text, reset_sink
 from app.services.stream_filter import (
     INTERNAL_LLM_NODES,
@@ -120,6 +126,17 @@ from app.services.stream_filter import (
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+# ── 检索入口的唯一名字（决策 10-①）────────────────────────────────────────────
+# 历史测试与探针 patch 的是 ``master_graph.retrieve_chunks``（既有名字）。T3 把
+# 唯一推荐入口收敛为 :func:`retrieve_chunks_scoped`（签名强制 ``scope``）。这里把
+# 入口**绑定在该名字上**，于是：
+#   · 既有 ``patch.object(mg, "retrieve_chunks", fake)`` 仍然拦得到检索入口；
+#   · ``_retrieve_node`` 的 ``retrieve_chunks(...)`` 调用点天然带上 ``scope=``，
+#     满足 AST 门禁（tests/test_no_unscoped_retrieval.py）。
+# 旧名字不删除，只改变其指向 —— 行为由 ``retrieve_chunks_scoped`` 决定，漏传
+# scope 的后果是**空结果**（fail-closed），不是全库。
+retrieve_chunks = retrieve_chunks_scoped
 
 
 # ── LLM 节点分类：谁的输出能给用户看 ────────────────────────────────────────
@@ -160,6 +177,9 @@ class MasterState(TypedDict):
     department_id: str | None
     tenant_wide: bool
     owns_tenant_ids: frozenset[str]
+    # 【T3】请求级五维权限（入口签发一次，链路内不可变）。检索节点只消费它，
+    # **不再**由链路内重新签发 —— 由 AST 门禁强制（决策 10-④ / 15-2③）。
+    user_scope: UserScope
     # 第三层（会话/消息归属）用的**单一**租户键：普通用户 = 其所属公司；
     # 平台管理员 = None（无归属公司）。它**不参与**文档可见性过滤。
     conversation_tenant_id: str | None
@@ -176,6 +196,11 @@ class MasterState(TypedDict):
     query_variants: list[str]     # 语义等价改写变体（进两条腿）
     query_extra: list[str]        # 子问题 + 变体，进**两条**检索腿
     query_hyde: str | None        # 假设答案段落，**只**进向量腿
+    # 【T3 决策 15-1】改写产物的 Scope 绑定镜像：main / variant / subquery / hyde。
+    # 三个 ``str`` 字段保留不动（兼容既有拓扑与日志），本字段是"文本可换、Scope
+    # 不可换"的结构保证载体 —— 子查询**合并成 extra_queries 一次性**传入检索，
+    # fan-out 在 retrieve_chunks 内部发生，三腿闭包共用同一个 frozen scope。
+    scoped_queries: list[ScopedQuery]
     chunks: list[RetrievedChunk]
     sources: list[dict]
     grade_good: bool
@@ -309,11 +334,28 @@ async def _rewrite_node(state: MasterState) -> dict:
             len(extra), len(result.hyde or ""), result.source,
         )
 
+    # 【T3 决策 15-1 / 15-5】把改写产物镜像成 Scope 绑定体：一条主查询 + 每条
+    # extra（子问题 + 变体）+ HyDE，**全部绑定同一个 frozen scope 实例**。
+    # ``with_text()`` 只换文本，``scope`` 想换也换不了（参数表里没有它）。
+    # 它**不是**"每个子查询各发一次检索"的入口 —— 检索仍由 _retrieve_node 把
+    # extra 合并成 ``extra_queries`` **一次性**传入，fan-out 在 retrieve_chunks
+    # 内部发生，三条腿的闭包按引用捕获同一个 ``scope``。
+    scope = state.get("user_scope")
+    scoped_queries: list[ScopedQuery] = []
+    if scope is not None:
+        main_query = ScopedQuery(text=rewritten, scope=scope, kind="main")
+        scoped_queries.append(main_query)
+        for item in extra:
+            scoped_queries.append(main_query.with_text(item))
+        if result.hyde:
+            scoped_queries.append(ScopedQuery(text=result.hyde, scope=scope, kind="hyde"))
+
     return {
         "rewritten_query": rewritten,
         "query_variants": variants,
         "query_extra": extra,
         "query_hyde": result.hyde,
+        "scoped_queries": scoped_queries,
     }
 
 
@@ -368,20 +410,18 @@ async def _retrieve_node(state: MasterState) -> dict:
             raw_query[:80], safe_query[:80],
         )
 
+    # 【T3 决策 10-①】唯一推荐入口：Query 一进检索器就绑定请求级 ``UserScope``。
+    # 子查询 / 变体 / HyDE 仍**合并成 extra_queries / extra_vector_queries 一次性**
+    # 传入（见 _rewrite_node 的说明），fan-out 在 retrieve_chunks 内部发生 ——
+    # 三腿闭包共用同一个 frozen ``scope``，不存在"某个子查询绕过 Scope"的物理路径。
+    # scope 缺失（旧调用点 / 单元测试）→ retrieve_chunks_scoped fail-closed 返回空。
     chunks = await retrieve_chunks(
         query=safe_query,
+        scope=state.get("user_scope"),
         top_k=state["top_k"],
-        owner_id=state.get("owner_id"),
         collection_id=state.get("collection_id"),
         extra_queries=safe_variants,
         extra_vector_queries=[safe_hyde] if safe_hyde else None,
-        # 三层隔离：第一层公司集合前置过滤 + 第二层部门 ACL（框架图 Permission
-        # Filter 在检索之前，而非 rerank 之后）。tenant_ids=None（按身份推导）
-        # 只跳过公司维度，ACL 仍然生效 —— 别人的个人库永远检索不到。
-        tenant_ids=state.get("tenant_ids"),
-        user_department_id=state.get("department_id"),
-        tenant_wide=bool(state.get("tenant_wide")),
-        owns_tenant_ids=state.get("owns_tenant_ids") or frozenset(),
     )
 
     sources = [
@@ -485,6 +525,34 @@ def _route_after_grade(state: MasterState) -> str:
     return "rewrite"
 
 
+async def _acl_context_for(state: MasterState, chunks) -> tuple:
+    """
+    第 12 环（assemble 时对象级复核）所需的 ``(pred, view_index, materialized)``.
+
+    * ``state["user_scope"]`` 缺失（legacy 调用点 / 单元测试）⇒ 三项全 ``None``，
+      下游 ``build_context`` / ``build_multimodal_context`` 的守卫整段跳过 ⇒
+      **逐字行为不变**。
+    * 有 scope 时：用**同一份** chunk 列表、**一次** 批量查询解析视图索引（避免
+      逐文档 N+1），供 assemble 与 generate 兜底复用；pred 只在本函数里构造一次。
+
+    返回的三元组直接以关键字实参透传给两个 assemble 入口。
+    """
+    scope = state.get("user_scope")
+    if scope is None:
+        return None, None, None
+
+    from app.services.security_cascade import load_view_indexes
+
+    doc_ids = {str(getattr(c, "document_id", "") or "") for c in chunks}
+    doc_ids.discard("")
+    if not doc_ids:
+        # 没有可解析的文档：给出非 None 的空索引，让下游按"缺行"处理（fail-closed）。
+        return scope.predicate(), {}, {}
+
+    view_index, materialized = await load_view_indexes(sorted(doc_ids))
+    return scope.predicate(), view_index, materialized
+
+
 async def _multimodal_context_node(state: MasterState) -> dict:
     """
     Multimodal Context 节点（部分6：架构图 grade → multimodal_context → generate）.
@@ -505,8 +573,18 @@ async def _multimodal_context_node(state: MasterState) -> dict:
     chunks = state.get("chunks") or []
     query = state.get("rewritten_query") or state["query"]
 
+    # 【T4-第 12 环】在 assemble 之前解析一次对象视图（scope 缺失 ⇒ 三项全 None ⇒
+    # 守卫跳过、行为不变）。过滤发生在 Citation / Vision 之前，图不会"先识别再被挡"。
+    pred, view_index, materialized = await _acl_context_for(state, chunks)
+
     if not settings.MULTIMODAL_CONTEXT_ENABLED:
-        built = build_context(chunks, query=query)
+        built = build_context(
+            chunks,
+            query=query,
+            pred=pred,
+            view_index=view_index,
+            materialized=materialized,
+        )
         return {
             "multimodal_context": built.context,
             "sources": built.sources or state.get("sources", []),
@@ -516,7 +594,13 @@ async def _multimodal_context_node(state: MasterState) -> dict:
             "vision_available": False,
         }
 
-    result = await build_multimodal_context(chunks, query)
+    result = await build_multimodal_context(
+        chunks,
+        query,
+        pred=pred,
+        view_index=view_index,
+        materialized=materialized,
+    )
 
     context_images = [
         {
@@ -702,9 +786,16 @@ async def _generate_node(state: MasterState) -> dict:
 
     context_text = state.get("multimodal_context") or ""
     if not context_text:
+        # 兜底路径：multimodal_context 节点未产出上下文时，这里再组装一次 ——
+        # 同样带上第 12 环的对象级复核（scope 缺失 ⇒ 三项全 None ⇒ 行为不变）。
+        fallback_chunks = state.get("chunks") or []
+        pred, view_index, materialized = await _acl_context_for(state, fallback_chunks)
         built = build_context(
-            state.get("chunks") or [],
+            fallback_chunks,
             query=state.get("rewritten_query") or state["query"],
+            pred=pred,
+            view_index=view_index,
+            materialized=materialized,
         )
         context_text = built.context
 
@@ -763,8 +854,16 @@ async def _summary_digests_node(state: MasterState) -> dict:
         "tenant_wide": bool(state.get("tenant_wide")),
     }
 
+    # FIX-A（T5 预发布）：透传请求入口一次性签发的五维 ``UserScope``。它已在
+    # query.py → stream_master 注入 ``state["user_scope"]``，这里只消费、不重新
+    # 签发（决策 10-④）。``security_scope`` 优先走 ``to_sql(pred, Document)`` 的
+    # 五维判定；为 None（legacy / 单元测试）时退回三维 ``document_scope_clause``。
+    security_scope = state.get("user_scope")
+
     try:
-        documents = await list_accessible_documents(**acl_kwargs)
+        documents = await list_accessible_documents(
+            security_scope=security_scope, **acl_kwargs
+        )
     except Exception:
         # 列清单失败不该让总结直接不可用：退化为"整库"（下面的采样会再查一次库）
         logger.exception("document_summary: failed to list accessible documents")
@@ -786,6 +885,7 @@ async def _summary_digests_node(state: MasterState) -> dict:
 
     digests = await collect_summary_digests(
         document_ids=scope.get("ids") or None,
+        security_scope=security_scope,
         **acl_kwargs,
     )
     return {"digests": digests, "summary_scope": scope}
@@ -840,9 +940,19 @@ async def _summarize_node(state: MasterState) -> dict:
         _emit(header)
         parts.append(header)
         try:
-            body = (await _stream_llm_answer(
-                llm, build_single_doc_messages(query, digest)
+            body = (await asyncio.wait_for(
+                _stream_llm_answer(llm, build_single_doc_messages(query, digest)),
+                timeout=get_settings().DOC_SUMMARY_TIMEOUT_SECONDS,
             )).strip()
+        except asyncio.TimeoutError:
+            # 单份超时：走兜底小节，不拖垮整批（DOC_SUMMARY_TIMEOUT_SECONDS 已配）。
+            # 实测单份摘要（CPU）约 33s（reasoning=False），60s 阈值留足余量；
+            # 若后续放开 reasoning，务必同步调高该阈值。
+            logger.warning(
+                "document_summary: per-doc summary timed out for %s (%.0fs)",
+                filename, get_settings().DOC_SUMMARY_TIMEOUT_SECONDS,
+            )
+            body = ""
         except Exception:
             # 单份失败不拖垮整批：兜底小节占位，其余文档照常总结
             logger.exception("document_summary: per-doc summary failed for %s", filename)
@@ -896,6 +1006,11 @@ async def _collect_digests_node(state: MasterState) -> dict:
         owns_tenant_ids=state.get("owns_tenant_ids") or frozenset(),
         user_department_id=state.get("department_id"),
         tenant_wide=bool(state.get("tenant_wide")),
+        # FIX-A（T5 预发布）：文档关联也**必须**走五维 —— 它与文档总结是同一类
+        # "把正文拼进 prompt"的路径，只给三维就等于密级 / 项目 / deny / excluded
+        # 全不生效。只消费请求入口签发的 scope，不在此重新签发（决策 10-④）。
+        # 连同下面的 chunk 级采样一起受保护（见 relation_service 的 V-02-B）。
+        security_scope=state.get("user_scope"),
     )
     return {"digests": digest_sources(digests)}
 
@@ -1026,7 +1141,16 @@ async def _build_document_node(state: MasterState) -> dict:
             "document": {},
         }
 
-    info = await asyncio.to_thread(generate_document, query, chunks, title=title)
+    # owner_id 是产物的归属人（第三层：会话/消息归属），写入 sidecar 元数据，
+    # 成为下载端点判定"这是谁生成的产物"的唯一依据。源文档列表由 chunks 自行
+    # 推导，保证与真正写进 Word 的内容一致，不会漂移。
+    info = await asyncio.to_thread(
+        generate_document,
+        query,
+        chunks,
+        title=title,
+        owner_id=state.get("user_id"),
+    )
 
     if info.error:
         logger.warning("master_build_document: generation failed — %s", info.error)
@@ -1359,6 +1483,7 @@ async def stream_master(
     tenant_wide: bool = False,
     owns_tenant_ids: frozenset[str] = frozenset(),
     conversation_tenant_id: str | None = None,
+    user_scope: UserScope | None = None,
 ) -> AsyncGenerator[dict, None]:
     """
     执行 master graph 并产出 SSE 事件字典.
@@ -1405,6 +1530,8 @@ async def stream_master(
         "owns_tenant_ids": owns_tenant_ids,
         "conversation_tenant_id": conversation_tenant_id,
         "user_id": user_id,
+        # 【T3】请求级五维权限：入口签发一次，节点只消费、不重新签发（决策 10-④）。
+        "user_scope": user_scope,
         "forced_mode": forced_mode,
         "intent": "",
         "intent_reason": "",
@@ -1412,6 +1539,7 @@ async def stream_master(
         "query_variants": [],
         "query_extra": [],
         "query_hyde": None,
+        "scoped_queries": [],
         "chunks": [],
         "sources": [],
         "grade_good": False,
