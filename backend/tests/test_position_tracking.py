@@ -32,6 +32,14 @@ if "app.services" not in sys.modules:
     _pkg = types.ModuleType("app.services")
     _pkg.__path__ = [str(_BACKEND_ROOT / "app" / "services")]
     sys.modules["app.services"] = _pkg
+    # ★ 必须同步父包属性：否则 pytest 的字符串式 monkeypatch 解析
+    #   `app.services.x.y` 时 import 会成功，却在 getattr(app, "services")
+    #   处抛 AttributeError —— 污染同一会话中后跑的测试（实测打断
+    #   test_citation_open_recheck.py 的 10 个用例）。真实 app.services 被
+    #   导入时会自动覆盖该属性，因此这里不引入额外持久污染。
+    import app as _app_pkg
+
+    _app_pkg.services = _pkg
 
 _MOD_PATH = _BACKEND_ROOT / "app" / "services" / "chunker.py"
 _spec = importlib.util.spec_from_file_location("app.services.chunker", _MOD_PATH)

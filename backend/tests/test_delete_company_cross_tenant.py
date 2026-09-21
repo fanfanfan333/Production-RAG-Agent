@@ -136,4 +136,11 @@ async def _scenario() -> None:
 def test_delete_company_unbinds_cross_tenant_document_without_deleting_it():
     if not _IMPORT_OK:
         return
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from _module_skip import skip_if_host_shimmed
+
+    # 本用例必须连**真实 Postgres**。宿主机 asyncpg 被 conftest 哑桩顶替时，
+    # 连库会抛 ``TypeError: object _Permissive can't be used in 'await' expression``
+    # —— 那是环境缺失，**不是**跨租户级联误删缺陷。容器内依赖齐全 → 真跑。
+    skip_if_host_shimmed("asyncpg")
     asyncio.run(_scenario())

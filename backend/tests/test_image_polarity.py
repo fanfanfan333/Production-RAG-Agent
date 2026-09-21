@@ -263,6 +263,12 @@ def test_binarize_normalises_dark_theme_polarity() -> None:
     旧实现直接把深底图丢给 adaptiveThreshold：背景整块比邻域均值暗 →
     被判成前景，字形与背景糊在一起，OCR 通道等于废掉。
     """
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from _module_skip import skip_if_host_shimmed
+
+    # 同 test_image_noise_quality：宿主机无 cv2 时 _binarize 静默跳过，
+    # applied 里不会有 'binarize' —— 环境缺库，不是极性归正逻辑坏了。
+    skip_if_host_shimmed("cv2")
     img = _dark_theme_text_page()
     assert pp.page_polarity(img) == "dark"
 

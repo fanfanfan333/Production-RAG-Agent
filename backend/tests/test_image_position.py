@@ -50,6 +50,14 @@ if "app.services" not in sys.modules:
     _pkg = types.ModuleType("app.services")
     _pkg.__path__ = [str(Path(_BACKEND_ROOT) / "app" / "services")]
     sys.modules["app.services"] = _pkg
+    # ★ 必须同步父包属性：否则 pytest 的字符串式 monkeypatch 解析
+    #   `app.services.x.y` 时 import 会成功，却在 getattr(app, "services")
+    #   处抛 AttributeError —— 污染同一会话中后跑的测试（实测打断
+    #   test_citation_open_recheck.py 的 10 个用例）。真实 app.services 被
+    #   导入时会自动覆盖该属性，因此这里不引入额外持久污染。
+    import app as _app_pkg
+
+    _app_pkg.services = _pkg
 
 try:
     from PIL import Image, ImageDraw
@@ -179,6 +187,13 @@ def test_pptx_group_offset_shifts_child_bbox() -> None:
 
     不叠加就会得到一堆挤在页面左上的框 —— 这是最隐蔽的一类坐标错误。
     """
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from _module_skip import skip_if_host_shimmed
+
+    # 本用例靠 MSO_SHAPE_TYPE.PICTURE / GROUP 做形状分派；宿主机没装 python-pptx
+    # 时这两个常量是哑桩（比较恒 False）→ 遍历拿到 0 张图，表现为 "assert 0 == 1"
+    # 的**假红**（看着像坐标叠加逻辑坏了，其实是环境缺库）。容器内依赖齐全 → 真跑。
+    skip_if_host_shimmed("pptx")
     from pptx.enum.shapes import MSO_SHAPE_TYPE
 
     child = _fake_picture(10.0, 5.0, 40.0, 30.0)          # 组内坐标
@@ -208,6 +223,12 @@ def test_pptx_real_deck_geometry() -> None:
 
     这是对"EMU 换算 + 遍历顺序"最接近真实输入的一次验证。
     """
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from _module_skip import skip_if_host_shimmed
+
+    # 真造 deck 需要 python-pptx 本体；宿主机没装时 `pptx.util` 根本不存在
+    # （报 ModuleNotFoundError: No module named 'pptx.util'）。容器内真跑。
+    skip_if_host_shimmed("pptx")
     from pptx import Presentation
     from pptx.util import Emu
 

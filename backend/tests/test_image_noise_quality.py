@@ -50,6 +50,14 @@ if "app.services" not in sys.modules:
     _pkg = types.ModuleType("app.services")
     _pkg.__path__ = [str(Path(_BACKEND_ROOT) / "app" / "services")]
     sys.modules["app.services"] = _pkg
+    # ★ 必须同步父包属性：否则 pytest 的字符串式 monkeypatch 解析
+    #   `app.services.x.y` 时 import 会成功，却在 getattr(app, "services")
+    #   处抛 AttributeError —— 污染同一会话中后跑的测试（实测打断
+    #   test_citation_open_recheck.py 的 10 个用例）。真实 app.services 被
+    #   导入时会自动覆盖该属性，因此这里不引入额外持久污染。
+    import app as _app_pkg
+
+    _app_pkg.services = _pkg
 
 try:
     import importlib
@@ -216,6 +224,13 @@ def test_preprocess_binarize_goes_to_ocr_channel_only() -> None:
     否则二值图的色彩统计全废（所有像素非黑即白），图表会被分类器判成截图，
     Vision 也拿不到配色信息 —— "想要更好的 OCR 就得毁掉分类"是最蠢的取舍。
     """
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from _module_skip import skip_if_host_shimmed
+
+    # binarize 走 cv2.adaptiveThreshold；宿主机没装 opencv 时 app 侧
+    # ``_binarize`` 是 ``except Exception: return image, None``（静默"不做"），
+    # 于是 applied 里没有 'binarize' —— 这是环境缺库，不是"二值化污染了 image 通道"。
+    skip_if_host_shimmed("cv2")
     result = pp.preprocess(_scanned_page(gray_band=True), mode="scan")
     assert "binarize" in result.applied, result.applied
     assert result.ocr_image is not None, "scan 档应产出二值化的 OCR 输入"
