@@ -63,7 +63,7 @@ try:
     import importlib
 
     import numpy as np
-    from PIL import Image, ImageDraw
+    from PIL import Image, ImageDraw, ImageFilter
 
     from app.services.image_understanding.confidence import (
         apply_quality,
@@ -131,6 +131,52 @@ class _Line:
         self.text = text
         self.confidence = confidence
         self.box = box
+
+
+# ── 翻拍件造图工具（D2/D3/D4 防回归用）───────────────────────────────────────
+
+def _shade_gradient(img: Image.Image, strength: float = 0.45) -> Image.Image:
+    """水平渐变阴影：左亮右暗（低频），模拟"一半被阴影压暗的翻拍页"."""
+    a = np.asarray(img.convert("RGB"), dtype=np.float64)
+    h, w = a.shape[:2]
+    gain = np.linspace(1.0, strength, w, dtype=np.float64).reshape(1, w, 1)
+    return Image.fromarray(np.clip(a * gain, 0, 255).astype(np.uint8))
+
+
+def _defocus(img: Image.Image, radius: float = 2.5) -> Image.Image:
+    """失焦/运动模糊（高频被抹平 → 噪声估计反而偏低，只有 re-blur 比值测得到）."""
+    return img.filter(ImageFilter.GaussianBlur(radius))
+
+
+def _rotate(img: Image.Image, degrees: float) -> Image.Image:
+    """把"文档页"转歪 degrees 度（PIL 正角 = 逆时针），白底填充."""
+    return img.rotate(degrees, resample=Image.BICUBIC, expand=False,
+                      fillcolor=(255, 255, 255))
+
+
+def _chart_placeholder(width: int = 300, height: int = 200) -> Image.Image:
+    """
+    仿金标集 png_clean.png 的"彩色图例"：白底 + 深色标题条 + 4 个饱和色块.
+
+    它的块均值极差（≈0.33-0.39）来自**内容**而不是光照，与阴影在
+    illumination_range 上不可分 —— 是 colorful 门槛必须存在的活证据。
+    """
+    img = Image.new("RGB", (width, height), (255, 255, 255))
+    draw = ImageDraw.Draw(img)
+    draw.rectangle([20, 15, width - 20, 40], fill=(50, 50, 50))
+    colors = [(66, 133, 244), (234, 67, 53), (52, 168, 83), (251, 188, 5)]
+    bar_w = (width - 30 - 3 * 10) // 4
+    for i, color in enumerate(colors):
+        x0 = 15 + i * (bar_w + 10)
+        draw.rectangle([x0, 85, x0 + bar_w, 175], fill=color)
+    return img
+
+
+class _SettingsStub:
+    """给 understand_image 用的最小 Settings（隔离环境变量差异）."""
+
+    IMAGE_PREPROCESS_GEOMETRIC = True
+    MAX_IMAGE_OCR_CHARS = 20000
 
 
 def _channel(name: str, text: str, confidence: float, image_type: str,
@@ -260,6 +306,453 @@ def test_preprocess_is_fault_tolerant() -> None:
             result = pp.preprocess(img, mode=mode)
             assert result.image is not None
     print("  ok test_preprocess_is_fault_tolerant")
+
+
+# ── 翻拍件信号（D2）与纠偏（D3）：新增信号的防回归 ───────────────────────────
+
+def test_pick_mode_escalates_on_uneven_light() -> None:
+    """
+    D2：阴影翻拍页必须升 noisy 且原因含 uneven-light.
+
+    阴影是**低频渐变**：全局 contrast_span 仍是 1.0（黑字/白纸两个极端都在）、
+    噪声被平滑、只有分块均值的极差测得到"一半亮一半暗"。历史上这类图被判成
+    light，一行清洗都不做 —— 而它恰恰是 CLAHE 收益最大的输入。
+    """
+    shadow = _shade_gradient(_line_art(ink=(30, 30, 30)), 0.45)
+    assert pp.contrast_span(shadow) >= pp.LOW_CONTRAST_SPAN, (
+        "前提：阴影不该被全局对比度抓到（否则走的是 low-contrast 分支）"
+    )
+    mode, sig = pp.pick_mode(shadow)
+    assert mode == "noisy", (mode, sig.get("mode_reason"))
+    assert "uneven-light" in sig["mode_reason"], sig["mode_reason"]
+    # 判据在**纸面**口径上：阴影把白纸也压暗 → 纸面极差跟着涨（实测 0.41）
+    assert sig["illumination_paper_range"] >= pp.ILLUMINATION_RANGE_THRESHOLD
+    assert sig["illumination_gradient"] is True, (
+        "前提：阴影是低频渐变，形态判据应成立"
+    )
+    assert sig["colorful_fraction"] < pp.COLORFUL_FRACTION_THRESHOLD, (
+        "前提：阴影翻拍页是'纸+墨'，饱和色应接近 0"
+    )
+
+    # 清洗确实发生了：CLAHE（对比度归一化）进 applied
+    result = pp.preprocess(shadow, mode=mode)
+    assert "contrast" in result.applied, result.applied
+    print("  ok test_pick_mode_escalates_on_uneven_light")
+
+
+def test_pick_mode_escalates_on_defocus() -> None:
+    """
+    D2：失焦翻拍件必须升 noisy 且原因含 blur.
+
+    模糊把高频噪声抹平 → 噪声估计**反而低于阈值**；对比度也不变（黑仍是黑、
+    白仍是白）。唯一测得到的是清晰度：re-blur 比值（原图拉普拉斯方差 /
+    高斯模糊后拉普拉斯方差）—— 锐利边缘"再糊一次会明显变糊"，已经糊的不会。
+
+    造图用**粗笔画**页 + blur(2.5)：细笔画被 blur 抹没了会把 span 拉低、误走
+    low-contrast 分支（实测 width=2 + blur(2.5) 的 span 只有 0.43）—— 这张图
+    要验证的是"对比度正常但失焦"也能被抓住（实测 sharp=1.57、span=0.75）。
+    """
+    thick = Image.new("RGB", (400, 300), (255, 255, 255))
+    draw = ImageDraw.Draw(thick)
+    for i in range(8):
+        y = 40 + i * 30
+        draw.line([(40, y), (360, y)], fill=(0, 0, 0), width=6)
+    blurred = _defocus(thick, 2.5)
+    ratio = pp.sharpness_ratio(blurred)
+    assert ratio < pp.SHARPNESS_MIN_RATIO, ratio
+    assert pp.contrast_span(blurred) >= pp.LOW_CONTRAST_SPAN, (
+        "前提：这张图的对比度正常（否则走的是 low-contrast 分支，测不到本信号）"
+    )
+    assert pp.estimate_noise(blurred) < pp.NOISE_SIGMA_THRESHOLD, (
+        "前提：失焦件的噪声估计低于阈值（否则走的是 noise 分支）"
+    )
+    mode, sig = pp.pick_mode(blurred)
+    assert mode == "noisy", (mode, sig.get("mode_reason"))
+    assert "blur" in sig["mode_reason"], sig["mode_reason"]
+    print("  ok test_pick_mode_escalates_on_defocus")
+
+
+def test_colorful_chart_not_escalated_by_uneven_light() -> None:
+    """
+    **负例回归**：实心色块的图表不得因 illumination_range 被误升档.
+
+    真实金标集里的彩色图例（png_clean.png，白底+深色标题条+4 个饱和色块）
+    实测块均值极差 = 0.387 —— 纯**内容**就能超过任何拦得住阴影（实测可低到
+    0.26）的阈值，二者在块均值上原理上不可分。colorful 门槛负责把它们让开：
+    CLAHE 对彩色图要么无用要么有害，图表本就该保持 light。
+    """
+    chart = _chart_placeholder()
+    # 前提：色块把**块均值**极差抬过阈值（这正是要防的误报源）。注意块均值口径
+    # 连**纸面**口径都顶得动（色块整块填满时 90 分位测到的就是色块本身），
+    # 所以 colorful 门槛是这里的唯一拦路口。
+    assert max(pp.illumination_range(chart),
+               pp.illumination_paper_range(chart)) >= pp.ILLUMINATION_RANGE_THRESHOLD, (
+        f"前提：色块应把极差抬过阈值（mean={pp.illumination_range(chart)}、"
+        f"paper={pp.illumination_paper_range(chart)}）"
+    )
+    assert pp.colorful_fraction(chart) >= pp.COLORFUL_FRACTION_THRESHOLD
+    mode, sig = pp.pick_mode(chart)
+    assert mode == "light", (mode, sig.get("mode_reason"))
+    result = pp.preprocess(chart, mode=mode)
+    assert result.applied == [], result.applied
+    print("  ok test_colorful_chart_not_escalated_by_uneven_light")
+
+
+def test_clean_pages_stay_light_and_untouched() -> None:
+    """负例：干净文档页（不同墨量）必须保持 light 且一步清洗都不做."""
+    for img in (_line_art(), _line_art(lines=4), _line_art(lines=12)):
+        mode, sig = pp.pick_mode(img)
+        assert mode == "light", (mode, sig.get("mode_reason"))
+        result = pp.preprocess(img, mode=mode)
+        assert result.applied == [], result.applied
+    print("  ok test_clean_pages_stay_light_and_untouched")
+
+
+def test_deskew_direction_and_trustworthiness() -> None:
+    """
+    D3：纠偏方向必须正确（历史缺陷：漏负号 → 倾斜被**加倍**），
+    且照片纹理的噪声角度必须被"转正后峰度提升"关口拦下.
+
+    判据是**旋转不变**的：真倾斜的文档页转正后行投影峰度大幅提升（实测 ≥5x）；
+    方向错了（越纠越歪）或角度是噪声（照片纹理）都提升 ≈1x → 不许改图。
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from _module_skip import skip_if_host_shimmed
+
+    skip_if_host_shimmed("cv2")
+
+    # 1) 真倾斜文档页（t6 同款：-15°）：能纠、纠对、纠完显著变"齐"
+    skewed = _rotate(_line_art(), -15)
+    out, step, angle = pp._deskew(skewed.convert("RGB"))
+    assert step == "deskew", (step, angle)
+    assert abs(abs(angle) - 15) < 4, f"估出的角度应≈15°，实际 {angle}"
+    before = pp._row_peak(np.asarray(skewed.convert("L")))
+    after = pp._row_peak(np.asarray(out.convert("L")))
+    assert after > before * 2, f"转正后行投影峰度应显著提升：{before:.2f} → {after:.2f}"
+
+    # 2) 照片纹理：minAreaRect 会给出随机角度，但转正不会让行投影变尖 → 不许动
+    rng = np.random.default_rng(7)
+    photo = Image.fromarray(rng.integers(0, 256, (300, 400, 3), dtype=np.uint8))
+    out_p, step_p, _ = pp._deskew(photo)
+    assert step_p is None, "照片纹理不许被'纠偏'"
+    assert out_p.size == photo.size
+    print("  ok test_deskew_direction_and_trustworthiness")
+
+
+# ── 管线接线（D1/D3 叠加 / D4 类型升级 + OCR 回滚）：端到端防回归 ────────────
+
+def test_pipeline_geometric_overlay_keeps_noisy_clahe() -> None:
+    """
+    ① 的防回归：noisy 档做完 CLAHE 后，0b 纠偏必须**叠加**而不是覆盖.
+
+    回修前的缺陷：纠偏用原图重跑 geometric 并整体替换 pre —— noisy 档已烘焙进
+    像素的 CLAHE 被整段丢掉（geometric 档不做对比度归一化），而"有噪/发灰"的
+    翻拍页恰恰最需要它。修后：喂 ``pre.image``（已清洗）重跑，applied 合并。
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from _module_skip import skip_if_host_shimmed
+    from app.services.image_understanding.classifier import ImageClassification
+
+    skip_if_host_shimmed("cv2")
+
+    originals = {
+        "run_ocr": pl._run_ocr,
+        "classify": pl.classify_image_safe,
+        "dispatch": pl._dispatch,
+        "vision": pl.VisionEngine,
+        "settings": pl.get_settings,
+    }
+    saved = (_VisionStub.available, _VisionStub.text, _VisionStub.calls)
+    try:
+        lines = [_Line("hello world", 0.9, (10, 10, 80, 20))]
+        pl.get_settings = lambda: _SettingsStub()          # type: ignore[assignment]
+        pl._run_ocr = lambda image: EngineOutput(          # type: ignore[assignment]
+            text="hello world", confidence=0.9, engine="tesseract", ok=True, lines=lines,
+        )
+        # 判成 photo：preprocessing_mode_for("photo")=light，不会触发 D4 升级，
+        # 保证本用例走的是 0b 内容侧纠偏（mode=noisy）
+        pl.classify_image_safe = lambda image, ocr_lines=None, filename="": ImageClassification(  # type: ignore[assignment]
+            image_type="photo", confidence=0.8, signals={}, engine="rules",
+        )
+        pl._dispatch = lambda *a, **kw: EngineOutput(      # type: ignore[assignment]
+            text="照片中有文字 hello world", confidence=0.9, engine="tesseract", ok=True,
+        )
+        pl.VisionEngine = _VisionStub                      # type: ignore[assignment]
+        _VisionStub.available, _VisionStub.text, _VisionStub.calls = False, "", 0
+
+        # 有噪（σ=18 → noisy 档：去噪+CLAHE）+ 转歪 5°（0b 闸门应追加纠偏）
+        img = _rotate(_add_gaussian_noise(_line_art(), 18), 5)
+        result = pl.understand_image(img, page_number=1, filename="noisy-skew.png")
+
+        assert result.preprocess_mode == "noisy", result.preprocess_mode
+        assert "contrast" in result.preprocess, (
+            f"① 回归：noisy 档的 CLAHE 被纠偏覆盖丢了 → {result.preprocess}"
+        )
+        assert "deskew" in result.preprocess, (
+            f"D3 回归：纠偏没跑 → {result.preprocess}"
+        )
+        print("  ok test_pipeline_geometric_overlay_keeps_noisy_clahe")
+    finally:
+        pl._run_ocr = originals["run_ocr"]              # type: ignore[assignment]
+        pl.classify_image_safe = originals["classify"]  # type: ignore[assignment]
+        pl._dispatch = originals["dispatch"]            # type: ignore[assignment]
+        pl.VisionEngine = originals["vision"]           # type: ignore[assignment]
+        pl.get_settings = originals["settings"]         # type: ignore[assignment]
+        _VisionStub.available, _VisionStub.text, _VisionStub.calls = saved
+
+
+def _run_type_upgrade_scenario(monkey_ocr, expect_calls: int, upgrade_applied: bool):
+    """
+    D4 场景公共脚手架：干净但转歪的页 + 分类 table → 类型升级重跑 OCR.
+
+    :param upgrade_applied: True = 重跑被采纳（preprocess_mode 应为 geometric、
+        preprocess 含 deskew、VLM 拿到纠偏后的图）；False = 被拒（必须**什么都不
+        变**，见缺陷 A 的防回归断言）。
+    :return: ``{"result": ..., "png": Vision 侧收到的字节, "img": 原图}``
+    """
+    from app.services.image_understanding.classifier import ImageClassification
+
+    originals = {
+        "run_ocr": pl._run_ocr,
+        "classify": pl.classify_image_safe,
+        "dispatch": pl._dispatch,
+        "vision": pl.VisionEngine,
+        "settings": pl.get_settings,
+    }
+    saved = (_VisionStub.available, _VisionStub.text, _VisionStub.calls)
+    calls = {"n": 0}
+    captured: dict = {}
+    try:
+        stub = _SettingsStub()
+        stub.IMAGE_PREPROCESS_GEOMETRIC = False   # 关掉 0b 内容侧纠偏，隔离出 D4 路径
+
+        def fake_ocr(image):
+            calls["n"] += 1
+            return monkey_ocr(calls["n"])
+
+        def fake_dispatch(image_type, image, ocr_out, png, **kwargs):
+            # dispatch 是唯一必然拿到 png() 的入口 —— 借它记下 Vision 侧实际收到的字节
+            captured["png"] = png()
+            return EngineOutput(
+                text="| 指标 | 值 |\n| --- | --- |\n| 营收 | 100 |",
+                confidence=0.9, engine="table_parser:rules+cell-ocr", ok=True,
+            )
+
+        pl.get_settings = lambda: stub            # type: ignore[assignment]
+        pl._run_ocr = fake_ocr                    # type: ignore[assignment]
+        pl.classify_image_safe = lambda image, ocr_lines=None, filename="": ImageClassification(  # type: ignore[assignment]
+            image_type="table", confidence=0.9, signals={}, engine="rules",
+        )
+        pl._dispatch = fake_dispatch              # type: ignore[assignment]
+        pl.VisionEngine = _VisionStub             # type: ignore[assignment]
+        _VisionStub.available, _VisionStub.text, _VisionStub.calls = False, "", 0
+
+        # 干净（pick_mode=light）但转歪 5°：只有类型升级（table→geometric）会纠偏
+        img = _rotate(_line_art(), 5)
+        result = pl.understand_image(img, page_number=1, filename="skewed-table.png")
+        assert calls["n"] == expect_calls, f"OCR 应恰好跑 {expect_calls} 次，实际 {calls['n']}"
+
+        if upgrade_applied:
+            assert result.preprocess_mode == "geometric", result.preprocess_mode
+            assert "deskew" in result.preprocess, result.preprocess
+        else:
+            # 缺陷 A 的防回归：升级被拒必须**整体回滚**，不能留下半截中间态。
+            # ① 档位 / 审计：不能报一个实际没用的 geometric
+            assert result.preprocess_mode == "light", (
+                f"被拒的升级仍写进了 preprocess_mode：{result.preprocess_mode}"
+            )
+            # ② 审计列表：被拒的那一步不许出现（否则排查时被误导）
+            assert result.preprocess == [], (
+                f"被拒的升级仍进审计：{result.preprocess}"
+            )
+            # ③ 图与 OCR 坐标同源：preprocess 为空 ⇒ work 仍是首轮那张图
+            #    （配合 D1 闸门 ⇒ VLM 收到的必须是未经改动的首轮图）
+        return {"result": result, "png": captured.get("png"), "img": img}
+    finally:
+        pl._run_ocr = originals["run_ocr"]              # type: ignore[assignment]
+        pl.classify_image_safe = originals["classify"]  # type: ignore[assignment]
+        pl._dispatch = originals["dispatch"]            # type: ignore[assignment]
+        pl.VisionEngine = originals["vision"]           # type: ignore[assignment]
+        pl.get_settings = originals["settings"]         # type: ignore[assignment]
+        _VisionStub.available, _VisionStub.text, _VisionStub.calls = saved
+
+
+def test_type_upgrade_retry_worse_keeps_first_ocr() -> None:
+    """
+    ② 的防回归：类型升级被拒时，**整升级**必须回滚（图 / 档位 / OCR 三者同源）.
+
+    回修前的两层缺陷：
+    · 第一层：升级档位后无条件用重跑结果替换 —— 引擎抖动/二值化把字吃掉时，
+      首轮已经读到的文本被整段丢掉，"纠偏"反而把图读没了；
+    · 第二层（缺陷 A）：只回滚了 OCR 文本，没回滚 pre/mode/work/ocr_input ——
+      accept=False 时 work 是纠偏后的图而 ocr_out.lines 坐标来自纠偏前 →
+      表格结构识别按行坐标定位时几何对不上；且 preprocess/preprocess_mode
+      会把一个已被拒绝的升级照样报进审计。
+    """
+    first = "营收一千二百万元，利润三百万元，同比增长百分之十二"
+
+    def worse(n: int) -> EngineOutput:
+        if n == 1:
+            return EngineOutput(text=first, confidence=0.92, engine="tesseract",
+                                ok=True, lines=[_Line(first, 0.92)])
+        return EngineOutput(text="", confidence=0.0, engine="tesseract", ok=False, lines=[])
+
+    from app.services.image_understanding.imaging import encode_png_safe
+
+    out = _run_type_upgrade_scenario(worse, expect_calls=2, upgrade_applied=False)
+    result = out["result"]
+    assert result.ocr_text == first, f"② 回归：首轮 OCR 文本被重跑清空 → {result.ocr_text!r}"
+    rerun = result.preprocess_meta.get("ocr_rerun", {})
+    assert rerun.get("decision") == "kept-first", rerun
+    # A+B 叠加：什么清洗都没生效 ⇒ VLM 必须拿到**原图**字节（不是被判"读得更差"
+    # 的那张纠偏图）
+    assert out["png"] == encode_png_safe(out["img"]), (
+        "缺陷 A/B 叠加回归：什么都没做却把改过的图送给了 Vision"
+    )
+    print("  ok test_type_upgrade_retry_worse_keeps_first_ocr")
+
+
+def test_type_upgrade_retry_better_is_accepted() -> None:
+    """D4 正常路径：重跑确实读得更好（更长且置信不降）→ **整升级**一起提交."""
+    def better(n: int) -> EngineOutput:
+        if n == 1:
+            return EngineOutput(text="营收 1200", confidence=0.85, engine="tesseract",
+                                ok=True, lines=[_Line("营收 1200", 0.85)])
+        return EngineOutput(
+            text="营收 1200 万元 利润 300 万元 同比增长 12%",
+            confidence=0.93, engine="tesseract", ok=True,
+            lines=[_Line("营收 1200 万元 利润 300 万元 同比增长 12%", 0.93)],
+        )
+
+    from app.services.image_understanding.imaging import encode_png_safe
+
+    out = _run_type_upgrade_scenario(better, expect_calls=2, upgrade_applied=True)
+    result = out["result"]
+    expected = "营收 1200 万元 利润 300 万元 同比增长 12%"
+    assert result.ocr_text == expected, result.ocr_text
+    rerun = result.preprocess_meta.get("ocr_rerun", {})
+    assert rerun.get("decision") == "accepted", rerun
+    # 被采纳 ⇒ 图也跟着走（纠偏后的图必须同时到达 Vision）
+    assert out["png"] != encode_png_safe(out["img"]), (
+        "升级被采纳了，Vision 却还在看首轮那张没纠偏的图"
+    )
+    print("  ok test_type_upgrade_retry_better_is_accepted")
+
+
+def test_vision_receives_cleaned_image_only_when_cleaned() -> None:
+    """
+    D1：做了清洗，送给多模态模型的**必须**是清洗产物；没做清洗，保持快路径.
+
+    回修前的缺陷：``png()`` 恒复用调用方编码的原图字节 → 预处理产物到不了
+    Vision，清洗等于白做。同时保留"没清洗就复用原字节"的行为 —— 干净图不多
+    编码一次大图（评测基座余量只有 1.08x，不给干净图引入未度量的行为变化）。
+    """
+    from app.services.image_understanding.classifier import ImageClassification
+    from app.services.image_understanding.imaging import encode_png_safe
+
+    captured: dict = {}
+    saved_cls = (_VisionStub.available, _VisionStub.text, _VisionStub.calls)
+
+    class _CaptureVision(_VisionStub):
+        def process(self, image, *, png_bytes=None, image_type="photo", role="primary", **kw):
+            captured["png"] = png_bytes
+            return EngineOutput(text="柱状图描述。", confidence=0.75, engine="vision", ok=True)
+
+    originals = {
+        "run_ocr": pl._run_ocr,
+        "classify": pl.classify_image_safe,
+        "dispatch": pl._dispatch,
+        "vision": pl.VisionEngine,
+        "settings": pl.get_settings,
+    }
+    try:
+        pl.get_settings = lambda: _SettingsStub()          # type: ignore[assignment]
+        pl._run_ocr = lambda image: EngineOutput(          # type: ignore[assignment]
+            text="Q1 1200", confidence=0.9, engine="tesseract", ok=True,
+            lines=[_Line("Q1 1200", 0.9)],
+        )
+        # 判成 chart → 专用引擎就是 Vision（dispatch 会以 png() 调用）
+        pl.classify_image_safe = lambda image, ocr_lines=None, filename="": ImageClassification(  # type: ignore[assignment]
+            image_type="chart", confidence=0.8, signals={}, engine="rules",
+        )
+        pl.VisionEngine = _CaptureVision                   # type: ignore[assignment]
+
+        # (a) 阴影翻拍页：清洗确实做了（CLAHE）→ Vision 必须拿到清洗后的字节
+        pl._dispatch = lambda *a, **kw: EngineOutput(      # type: ignore[assignment]
+            text="", confidence=0.0, engine="vision", ok=False, error="stub",
+        )
+        shaded = _shade_gradient(_line_art(ink=(30, 30, 30)), 0.45)
+        captured.clear()
+        pl.understand_image(shaded, page_number=1, filename="shaded.png")
+        assert captured.get("png") is not None, "Vision 应被调用并收到 png 字节"
+        assert captured["png"] != encode_png_safe(shaded), (
+            "D1 回归：Vision 收到的仍是原图字节 —— 清洗产物没有送达"
+        )
+
+        # (b) 干净图：一步没做 → 必须复用原图字节（不多编码、不引入行为变化）
+        clean = _line_art()
+        captured.clear()
+        pl.understand_image(clean, page_number=1, filename="clean.png")
+        assert captured.get("png") == encode_png_safe(clean), (
+            "没做清洗的图不该被重新编码 —— 应复用调用方字节"
+        )
+
+        # (c) 小图只被 upscale：upscale **不在** _CLEANING_STEPS 里 → 同样必须
+        #     复用原图字节。闸门没接上时（旧写法 `if pre.applied:`）这里会失败：
+        #     一批原本干净的小图会被换成放大版送进 Vision，属于未度量的行为变化。
+        small = Image.new("RGB", (120, 90), (255, 255, 255))
+        ImageDraw.Draw(small).line([(10, 20), (110, 20)], fill=(0, 0, 0), width=2)
+        ImageDraw.Draw(small).line([(10, 60), (110, 60)], fill=(0, 0, 0), width=2)
+        captured.clear()
+        small_result = pl.understand_image(small, page_number=1, filename="small.png")
+        assert small_result.preprocess == ["upscale"], (
+            f"前提：这张小图应只被放大，实际 {small_result.preprocess}"
+        )
+        assert captured.get("png") == encode_png_safe(small), (
+            "闸门回归：仅 upscale 就换了 VLM 输入（给干净小图引入未度量的行为变化）"
+        )
+        print("  ok test_vision_receives_cleaned_image_only_when_cleaned")
+    finally:
+        pl._run_ocr = originals["run_ocr"]              # type: ignore[assignment]
+        pl.classify_image_safe = originals["classify"]  # type: ignore[assignment]
+        pl._dispatch = originals["dispatch"]            # type: ignore[assignment]
+        pl.VisionEngine = originals["vision"]           # type: ignore[assignment]
+        pl.get_settings = originals["settings"]         # type: ignore[assignment]
+        _VisionStub.available, _VisionStub.text, _VisionStub.calls = saved_cls
+
+
+def test_pick_mode_backward_compatible_signature() -> None:
+    """``pick_mode(image[, image_type])`` 既有签名语义必须原样保留."""
+    img = _line_art()
+
+    mode1, sig1 = pp.pick_mode(img)                    # 不传类型 → 内容判定，默认 light
+    assert mode1 == "light" and sig1["mode"] == "light", (mode1, sig1.get("mode_reason"))
+
+    mode2, _ = pp.pick_mode(img, "table")              # 老签名：类型默认档可以抬高
+    assert mode2 == "geometric", mode2
+
+    mode3, _ = pp.pick_mode(img, image_type="photo")   # 关键字传参也要能用
+    assert mode3 == "light", mode3
+
+    # 类型默认档映射（D4 依赖它）：结构型 → geometric，图表/照片 → light
+    for t in ("table", "code", "formula"):
+        assert pp.preprocessing_mode_for(t) == "geometric", t
+    for t in ("chart", "photo", "diagram", "screenshot"):
+        assert pp.preprocessing_mode_for(t) == "light", t
+
+    # 新信号与新阈值对调用方可见（meta 里带全，便于排查"为什么升档"）
+    sigs = pp.noise_signals(img)
+    for key in ("noise_sigma", "contrast_span", "border_px", "sharpness_ratio",
+                "illumination_range", "illumination_paper_range",
+                "illumination_gradient", "colorful_fraction"):
+        assert key in sigs, key
+    limits = pp.thresholds()
+    for key in ("noise_sigma_threshold", "low_contrast_span", "sharpness_min_ratio",
+                "illumination_range_threshold", "colorful_fraction_threshold",
+                "illumination_gradient_tolerance", "illumination_min_paper_ratio",
+                "deskew_min_peak_gain"):
+        assert key in limits, key
+    print("  ok test_pick_mode_backward_compatible_signature")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -796,6 +1289,440 @@ def test_quality_warning_surfaces_reasons() -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# QA 独立验证（闸门完整性 / 双向纠偏 / 真实页负例 / 升级回滚同源）
+#
+# 与工程师自带用例的区别：自带用例证明"改动按设计跑通"，这里专门去**证伪**
+# 设计与实现（拼错的集合成员、只测了一个方向的纠偏、覆盖面不足的负例）。
+# ─────────────────────────────────────────────────────────────────────────────
+
+_QA_FONT_CANDIDATES = (
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+    "C:/Windows/Fonts/arial.ttf",
+)
+
+
+def _qa_load_font(size: int):
+    """真实字体（抗锯齿正文）—— 造"导出页风格"负例的前提."""
+    try:
+        from PIL import ImageFont
+    except Exception:      # noqa: BLE001
+        return None
+    for path in _QA_FONT_CANDIDATES:
+        try:
+            if os.path.exists(path):
+                return ImageFont.truetype(path, size)
+        except Exception:      # noqa: BLE001
+            continue
+    return None
+
+
+def _qa_text_page(
+    width: int = 1240, height: int = 1754, *, size: int = 23, rows: int = 20,
+    top: int = 300, bottom: int = 700, margin: int = 140,
+    ink=(25, 25, 25), bg=(255, 255, 255),
+) -> Image.Image:
+    """
+    真实导出页风格：白底 + 页边距留白 + 抗锯齿正文墨迹（150dpi A4 量级）.
+
+    与 ``_line_art``（8 条横贯线）的区别：真实排版是**行数可控 + 留白可变 +
+    字形抗锯齿**，墨迹覆盖率与边缘统计都更接近入库期的原生导出页 —— 只有这类
+    图才能检验新加的内容敏感信号（illumination/sharpness）会不会误报。
+    """
+    img = Image.new("RGB", (width, height), bg)
+    draw = ImageDraw.Draw(img)
+    font = _qa_load_font(size)
+    step = (height - top - bottom) / max(rows, 1)
+    body = "retrieval augmented generation pipeline evaluation report"
+    for i in range(rows):
+        y = top + i * step
+        if y > height - bottom - step * 0.5:
+            break
+        if font is not None:
+            draw.text((margin, y), body, fill=ink, font=font)
+        else:
+            draw.rectangle([margin, y, margin + 620, y + size], fill=ink)
+    return img
+
+
+def test_cleaning_steps_cover_every_real_applied_name() -> None:
+    """
+    D1 闸门的**完整性**（不是"闸门存在"，而是"闸门真的接得住"）.
+
+    ``png()`` 用的是集合交集 ``_CLEANING_STEPS & set(pre.applied)``：拼错一个
+    成员**不会报错**，只会静默失效 —— 清洗照做，Vision 却仍拿原图字节，且没人
+    会发现。所以这里从两个方向夹逼：
+
+        · 静态：集合里每个名字都必须是 preprocess.py 真实会返回的字面量；
+        · 动态：真实跑出来的每个 step（除 upscale）都必须落在集合里，
+          包括**无 OpenCV 的回退分支**（denoise-median / contrast-stretch
+          最容易漏，因为它们只在容器没装 cv2 时才出现）。
+    """
+    import inspect
+
+    src = inspect.getsource(pp)
+
+    # 方向 1：拼错的成员不可能出现在源码里
+    for name in pl._CLEANING_STEPS:
+        assert f'"{name}"' in src or f"'{name}'" in src, (
+            f"_CLEANING_STEPS 里的 {name!r} 在 preprocess.py 源码中查无此字面量 —— "
+            "疑似拼错，D1 闸门对它会静默失效"
+        )
+
+    # 方向 2：把所有档位 + 两种依赖分支都跑一遍，收集真实 step 名
+    noisy = _add_gaussian_noise(_line_art(), 20)
+    scanned = _scanned_page()
+    small = Image.new("RGB", (120, 90), (255, 255, 255))
+    ImageDraw.Draw(small).line([(10, 30), (110, 30)], fill=(0, 0, 0), width=2)
+
+    skewed = _rotate(noisy, 6)         # 有倾斜才会真的触发 deskew 分支
+    observed: set[str] = set()
+    for mode in ("light", "text", "geometric", "noisy", "scan"):
+        observed.update(pp.preprocess(scanned, mode=mode).applied)
+        observed.update(pp.preprocess(noisy, mode=mode).applied)
+        observed.update(pp.preprocess(skewed, mode=mode).applied)
+    observed.update(pp.preprocess(small, mode="light").applied)
+
+    saved_cv2 = sys.modules.get("cv2")
+    try:
+        sys.modules["cv2"] = None      # import cv2 → ImportError → 走纯 numpy/PIL 回退
+        for mode in ("noisy", "scan"):
+            observed.update(pp.preprocess(noisy, mode=mode).applied)
+    finally:
+        if saved_cv2 is not None:
+            sys.modules["cv2"] = saved_cv2
+        else:
+            sys.modules.pop("cv2", None)
+
+    assert "upscale" in observed, f"前提：小图放大分支没被覆盖到（observed={observed}）"
+    assert observed - {"upscale"}, f"前提：没有任何清洗步骤被触发（observed={observed}）"
+    # 前提：deskew 这个**最关键**的结构性步骤必须被覆盖到 —— 没覆盖的话下面的
+    # "每个 step 都在集合里"就是一句空话，而 deskew 恰好是最容易拼错的那个
+    assert "deskew" in observed, (
+        f"前提：deskew 分支没被触发，覆盖断言形同虚设（observed={sorted(observed)}）"
+    )
+
+    for step in observed:
+        if step == "upscale":
+            continue
+        assert step in pl._CLEANING_STEPS, (
+            f"preprocess 真的做了 {step!r}，但它不在 _CLEANING_STEPS 里 → "
+            "清洗产物送不到 Vision（D1 闸门静默失效）"
+        )
+    # upscale 必须**刻意**被排除：短边 <200 的干净小图被放大后送 VLM 属于
+    # 未度量的行为变化（评测基座余量仅 1.08x）
+    assert "upscale" not in pl._CLEANING_STEPS
+    print(f"  ok test_cleaning_steps_cover_every_real_applied_name (observed={sorted(observed)})")
+
+
+def test_deskew_corrects_both_directions() -> None:
+    """
+    D3 符号缺陷的防回归：**两个方向**都要纠，而不是"改了图"就算过.
+
+    只测一个方向（工程师用例是 -15°）时，"符号恰好对这一个方向正确、对另一个
+    方向加倍"的实现照样通过 —— 历史缺陷正是漏了负号（5°→10°、15°→30°）。
+    因此这里 +θ / -θ 各测一次，并用**残余角**（同一 minAreaRect 估计器重测）
+    而不是"是否返回 deskew"来判定方向对不对。
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from _module_skip import skip_if_host_shimmed
+
+    skip_if_host_shimmed("cv2")
+    import cv2
+
+    def residual(gray) -> float | None:
+        """用与 _deskew 同一套估计器测残余倾角."""
+        ink = (np.asarray(gray) < 160).astype(np.uint8)
+        if int(ink.sum()) < 200:
+            return None
+        coords = np.column_stack(np.where(ink > 0))
+        ang = float(cv2.minAreaRect(coords.astype(np.float32))[-1])
+        if ang > 45:
+            ang -= 90
+        return round(ang, 2)
+
+    page = _qa_text_page(rows=26, top=150, bottom=150)
+    for degrees in (+15, -15):
+        skewed = _rotate(page, degrees)
+        before_angle = residual(np.asarray(skewed.convert("L")))
+        before_peak = pp._row_peak(np.asarray(skewed.convert("L")))
+        out, step, angle = pp._deskew(skewed.convert("RGB"))
+        after_peak = pp._row_peak(np.asarray(out.convert("L")))
+        after_angle = residual(np.asarray(out.convert("L")))
+
+        assert step == "deskew", f"{degrees:+d}° 没被纠偏（step={step}）"
+        assert after_peak > before_peak * 1.5, (
+            f"{degrees:+d}° 转正后行投影没变尖（{before_peak:.2f}→{after_peak:.2f}）—— "
+            "很可能纠反了方向（倾斜被加倍）"
+        )
+        assert after_angle is not None and abs(after_angle) < abs(before_angle) * 0.5, (
+            f"{degrees:+d}° 残余倾角没降下来：{before_angle}° → {after_angle}°（越纠越歪）"
+        )
+        assert abs(abs(angle) - abs(degrees)) < 4, (
+            f"{degrees:+d}° 估出的角度应≈{abs(degrees)}°，实际 {angle}"
+        )
+    print("  ok test_deskew_corrects_both_directions")
+
+
+def test_realistic_export_pages_stay_light() -> None:
+    """
+    D2 误报方向（补充工程师负例的覆盖面）：**真实排版**的导出页必须留在 light.
+
+    工程师的负例是"合成整页表格"（墨迹均匀铺满、无留白），而真实导出页的特征
+    恰恰相反 —— **大片留白**、**页眉页脚**、**高 dpi 渲染**。这些都会改变
+    块均值分布与边缘统计，是最可能顶穿新加的 illumination_range / sharpness_ratio
+    的一类图。断言之外同时打印**距阈值的余量**：只看 pass/fail 会漏掉"勉强通过"
+    的临界图（余量 <1.2x 就该警惕）。
+    """
+    cases = {
+        "常规正文页@150dpi": _qa_text_page(rows=20, top=300, bottom=700),
+        "常规正文页@300dpi": _qa_text_page(2480, 3508, size=46, rows=20, top=600,
+                                          bottom=1400, margin=280),
+        "稀疏正文 + 大片留白": _qa_text_page(rows=6, top=160, bottom=1000),
+        "页眉页脚 + 中段留白": None,
+        "双栏 + 宽页边距": None,
+    }
+    hf = _qa_text_page(rows=10, top=300, bottom=1000)
+    draw = ImageDraw.Draw(hf)
+    draw.line([(140, 250), (1100, 250)], fill=(90, 90, 90), width=2)
+    draw.line([(140, 1500), (1100, 1500)], fill=(90, 90, 90), width=2)
+    cases["页眉页脚 + 中段留白"] = hf
+
+    two_col = _qa_text_page(rows=18, top=300, bottom=700, margin=120)
+    d2 = ImageDraw.Draw(two_col)
+    f2 = _qa_load_font(23)
+    for i in range(18):
+        y = 300 + i * (754 / 18)
+        if f2 is not None:
+            d2.text((660, y), "column two body text here", fill=(25, 25, 25), font=f2)
+    cases["双栏 + 宽页边距"] = two_col
+
+    limits = pp.thresholds()
+    for name, img in cases.items():
+        sig = pp.noise_signals(img)
+        mode, picked = pp.pick_mode(img)
+        margin_illum = (
+            limits["illumination_range_threshold"] / sig["illumination_range"]
+            if sig["illumination_range"] > 0 else float("inf")
+        )
+        margin_sharp = sig["sharpness_ratio"] / limits["sharpness_min_ratio"]
+        margin_sigma = (
+            limits["noise_sigma_threshold"] / sig["noise_sigma"]
+            if sig["noise_sigma"] > 0 else float("inf")
+        )
+        print(
+            f"    {name}: sigma={sig['noise_sigma']:.2f}(余量{margin_sigma:.1f}x) "
+            f"illum={sig['illumination_range']:.3f}(余量{margin_illum:.1f}x) "
+            f"sharp={sig['sharpness_ratio']:.1f}(余量{margin_sharp:.1f}x) -> {mode}"
+        )
+        assert mode == "light", (
+            f"{name} 被误升到 {mode}（{picked.get('mode_reason')}）—— "
+            f"signals={sig}"
+        )
+        # 留在 light 的干净页：一步清洗都不该做（否则 D1 会把清洗产物送进 VLM）
+        assert pp.preprocess(img, mode=mode).applied == [], (
+            f"{name} 档位是 light 却仍被改图：{pp.preprocess(img, mode=mode).applied}"
+        )
+    print("  ok test_realistic_export_pages_stay_light")
+
+
+def test_achromatic_dark_block_does_not_escalate_clean_page() -> None:
+    """
+    D2 缺陷（本次改动引入的**新**误报）：**消色**深色块会顶穿 illumination_range.
+
+    ``colorful_fraction`` 门槛只挡得住"饱和色块"（彩色图例，实测 colorful=0.64），
+    挡不住**无饱和色的深色块** —— 深色标题条 / 深色表头行 / 深色代码区块的
+    colorful_fraction ≈ 0.00，却同样把 4×4 分块的块均值极差抬到阴影量级。
+
+    后果链（三件事叠加，正是这次改动自己声明要避免的）：
+        illumination_range ≥ 0.18 → noisy 档
+        → 施加 CLAHE（applied 含 "contrast"）
+        → contrast ∈ _CLEANING_STEPS ⇒ D1 把**清洗后**的字节重新编码送 VLM
+    于是"一张干净锐利的原生导出页"被换了输入给多模态模型 —— 而改动自己在
+    _CLEANING_STEPS 的注释里写明了"评测基座余量只有 1.08 倍，不给干净图引入
+    未度量的行为变化"。
+
+    前提断言先钉死"这是新增误报"：旧判据（sigma / border / contrast_span）
+    一条都不触发，升级**只可能**来自新的 uneven-light 规则。
+    """
+    limits = pp.thresholds()
+    img = _qa_text_page(rows=20, top=300, bottom=700)
+    draw = ImageDraw.Draw(img)
+    draw.rectangle([140, 150, 1100, 260], fill=(45, 45, 45))   # 深色标题条：占页高 ~6%
+
+    sig = pp.noise_signals(img)
+    # ① 前提：这是一张干净、锐利的原生导出页（三个旧信号全都不该触发）
+    assert sig["noise_sigma"] < limits["noise_sigma_threshold"], (
+        f"前提失效：sigma={sig['noise_sigma']} 已越过旧阈值")
+    assert sig["contrast_span"] >= limits["low_contrast_span"], (
+        f"前提失效：span={sig['contrast_span']} 已越过旧阈值")
+    assert sig["border_px"] < limits["border_trigger_px"], (
+        f"前提失效：border={sig['border_px']} 已越过旧阈值")
+    assert sig["sharpness_ratio"] >= limits["sharpness_min_ratio"], (
+        f"前提失效：清晰度 {sig['sharpness_ratio']} 已越过新阈值，不是干净页")
+    # ② 前提：深色块是**消色**的 → colorful 门槛救不了它（这正是缺陷所在）
+    assert sig["colorful_fraction"] < limits["colorful_fraction_threshold"], (
+        "前提失效：该深色块是饱和色，colorful 门槛本就该拦住它")
+
+    mode, picked = pp.pick_mode(img)
+    assert mode == "light", (
+        f"D2 误报：干净锐利的导出页（sigma={sig['noise_sigma']}、"
+        f"sharpness={sig['sharpness_ratio']}）仅因一块**消色**深色标题条就被升到 "
+        f"{mode}（{picked.get('mode_reason')}）→ 会被施加 CLAHE，且因 "
+        f"contrast ∈ _CLEANING_STEPS，清洗后的字节会被重新编码送进 VLM"
+    )
+    print("  ok test_achromatic_dark_block_does_not_escalate_clean_page")
+
+
+def test_type_upgrade_rejected_preserves_homogeneity() -> None:
+    """
+    D4 同源性（强化版）：被拒的升级不能污染**非空**的 applied / 图 / OCR 坐标.
+
+    工程师已有用例（``test_type_upgrade_retry_worse_keeps_first_ocr``）的前提是
+    ``applied == []`` —— 那是**平凡情况**：它只能证明"没凭空多出步骤"，证明不了
+    "被拒的步骤没有**追加**到已有步骤后面"。这里让首轮就已经有一步（upscale），
+    再制造一次被拒的类型升级，断言四者同源：
+
+        · 档位停在 light（不是 geometric）
+        · applied 停在 ['upscale']（被拒的 deskew 不许追加进来）
+        · ocr_text / ocr_line_count 保住首轮
+        · 送进 dispatch 的 work 仍是首轮那张图（不是纠偏后的图）
+    """
+    from app.services.image_understanding.classifier import ImageClassification
+    from app.services.image_understanding.imaging import encode_png_safe
+
+    # 短边 <200 → light 档也会先做 upscale；再转歪 8° 让 geometric 升级真的有事可做
+    small = Image.new("RGB", (160, 200), (255, 255, 255))
+    draw = ImageDraw.Draw(small)
+    for i in range(7):
+        y = 25 + i * 25
+        draw.line([(20, y), (140, y)], fill=(0, 0, 0), width=2)
+    img = _rotate(small, 8)
+
+    first = "营收一千二百万元，利润三百万元"
+    captured: dict = {}
+    saved_vision = (_VisionStub.available, _VisionStub.text, _VisionStub.calls)
+    originals = {
+        "run_ocr": pl._run_ocr, "classify": pl.classify_image_safe,
+        "dispatch": pl._dispatch, "vision": pl.VisionEngine,
+        "settings": pl.get_settings,
+    }
+    calls = {"n": 0}
+    try:
+        stub = _SettingsStub()
+        stub.IMAGE_PREPROCESS_GEOMETRIC = False   # 关掉 0b，隔离出 D4 路径
+
+        def fake_ocr(image):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return EngineOutput(text=first, confidence=0.92, engine="tesseract",
+                                    ok=True, lines=[_Line(first, 0.92)])
+            return EngineOutput(text="", confidence=0.0, engine="tesseract",
+                                ok=False, lines=[])
+
+        def fake_dispatch(image_type, image, ocr_out, png, **kwargs):
+            captured["work"] = image
+            captured["png"] = png()
+            return EngineOutput(text="| a | b |", confidence=0.9,
+                                engine="table_parser:rules", ok=True)
+
+        pl.get_settings = lambda: stub            # type: ignore[assignment]
+        pl._run_ocr = fake_ocr                    # type: ignore[assignment]
+        pl.classify_image_safe = lambda image, ocr_lines=None, filename="": ImageClassification(  # type: ignore[assignment]
+            image_type="table", confidence=0.9, signals={}, engine="rules",
+        )
+        pl._dispatch = fake_dispatch              # type: ignore[assignment]
+        pl.VisionEngine = _VisionStub             # type: ignore[assignment]
+        _VisionStub.available, _VisionStub.text, _VisionStub.calls = False, "", 0
+
+        result = pl.understand_image(img, page_number=1, filename="small-skewed-table.png")
+
+        # 前提：升级确实被**尝试**过（否则下面全是平凡断言）
+        assert calls["n"] == 2, f"OCR 应跑 2 次（首轮 + 升级重跑），实际 {calls['n']}"
+        rerun = result.preprocess_meta.get("ocr_rerun", {})
+        assert rerun.get("decision") == "kept-first", rerun
+
+        # ① 档位
+        assert result.preprocess_mode == "light", (
+            f"被拒的升级仍写进了 preprocess_mode：{result.preprocess_mode}")
+        # ② 审计列表：被拒的 deskew 不许追加到 ['upscale'] 后面
+        assert result.preprocess == ["upscale"], (
+            f"被拒的升级混进了审计列表：{result.preprocess}")
+        # ③ OCR 文本与行数保住首轮
+        assert result.ocr_text == first, f"首轮 OCR 文本被重跑清空：{result.ocr_text!r}"
+        assert result.ocr_line_count == 1, result.ocr_line_count
+        # ④ 图与 OCR 坐标同源：work 必须是首轮那张（只放大、未纠偏）的图
+        expected_work = pp.preprocess(img, mode="light").image
+        assert np.array_equal(
+            np.asarray(captured["work"].convert("RGB")),
+            np.asarray(expected_work.convert("RGB")),
+        ), "被拒的升级改了送进引擎的图（work 与首轮 OCR 坐标不同源）"
+        # ⑤ 叠加 D1：只做了 upscale（非 _CLEANING_STEPS）⇒ 闸门必须关着
+        assert captured["png"] == encode_png_safe(img), (
+            "仅 upscale 就把改过的图送给了 Vision")
+        print("  ok test_type_upgrade_rejected_preserves_homogeneity")
+    finally:
+        pl._run_ocr = originals["run_ocr"]              # type: ignore[assignment]
+        pl.classify_image_safe = originals["classify"]  # type: ignore[assignment]
+        pl._dispatch = originals["dispatch"]            # type: ignore[assignment]
+        pl.VisionEngine = originals["vision"]           # type: ignore[assignment]
+        pl.get_settings = originals["settings"]         # type: ignore[assignment]
+        _VisionStub.available, _VisionStub.text, _VisionStub.calls = saved_vision
+
+
+def test_new_thresholds_are_wired_into_settings() -> None:
+    """
+    config.py 新增的 6 个阈值必须**真的被读到**，而不是写给人看的死配置.
+
+    ``preprocess._cfg`` 走 ``getattr(get_settings(), name, 常量)``：名字对不上会
+    静默退回模块常量，实测时"改 .env 不生效"。这里用一个改了值的 Settings 桩
+    顶替 ``app.config.get_settings``，断言 ``thresholds()`` 读到的就是桩里的值。
+    """
+    import app.config as app_config
+
+    names = (
+        "IMAGE_SHARPNESS_MIN_RATIO", "IMAGE_SHARPNESS_BLUR_SIGMA",
+        "IMAGE_ILLUMINATION_RANGE_THRESHOLD", "IMAGE_ILLUMINATION_GRID",
+        "IMAGE_COLORFUL_FRACTION_THRESHOLD", "IMAGE_DESKEW_MIN_PEAK_GAIN",
+    )
+    from app.config import Settings
+
+    fields = getattr(Settings, "model_fields", None) or getattr(Settings, "__fields__", {})
+    for name in names:
+        assert name in fields, f"Settings 未声明 {name}（config.py 的改动没落地）"
+
+    class _AltSettings:
+        IMAGE_NOISE_SIGMA_THRESHOLD = 4.0
+        IMAGE_NOISE_SIGMA_STRONG = 18.0
+        IMAGE_LOW_CONTRAST_SPAN = 0.55
+        IMAGE_BORDER_TRIGGER_PX = 6
+        IMAGE_BORDER_DARK_THEME_RATIO = 0.5
+        IMAGE_SHARPNESS_MIN_RATIO = 111.0
+        IMAGE_SHARPNESS_BLUR_SIGMA = 9.5
+        IMAGE_ILLUMINATION_RANGE_THRESHOLD = 0.77
+        IMAGE_ILLUMINATION_GRID = 4
+        IMAGE_COLORFUL_FRACTION_THRESHOLD = 0.88
+        IMAGE_DESKEW_MIN_PEAK_GAIN = 9.0
+
+    saved = app_config.get_settings
+    try:
+        app_config.get_settings = lambda: _AltSettings()   # type: ignore[assignment]
+        th = pp.thresholds()
+        assert th["sharpness_min_ratio"] == 111.0, th
+        assert th["illumination_range_threshold"] == 0.77, th
+        assert th["colorful_fraction_threshold"] == 0.88, th
+        assert th["deskew_min_peak_gain"] == 9.0, th
+        assert pp._cfg("IMAGE_SHARPNESS_BLUR_SIGMA", 1.5) == 9.5
+    finally:
+        app_config.get_settings = saved                    # type: ignore[assignment]
+
+    # 还原后必须回到真实配置（证明桩没有污染后续用例）
+    assert pp.thresholds()["sharpness_min_ratio"] != 111.0
+    print("  ok test_new_thresholds_are_wired_into_settings")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 执行
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -810,6 +1737,24 @@ def main() -> None:
     test_pick_mode_escalates_on_evidence()
     test_preprocess_binarize_goes_to_ocr_channel_only()
     test_preprocess_is_fault_tolerant()
+    test_pick_mode_escalates_on_uneven_light()
+    test_pick_mode_escalates_on_defocus()
+    test_colorful_chart_not_escalated_by_uneven_light()
+    test_clean_pages_stay_light_and_untouched()
+    test_deskew_direction_and_trustworthiness()
+    test_pipeline_geometric_overlay_keeps_noisy_clahe()
+    test_type_upgrade_retry_worse_keeps_first_ocr()
+    test_type_upgrade_retry_better_is_accepted()
+    test_vision_receives_cleaned_image_only_when_cleaned()
+    test_pick_mode_backward_compatible_signature()
+
+    print("\n[一b] QA 独立验证")
+    test_cleaning_steps_cover_every_real_applied_name()
+    test_deskew_corrects_both_directions()
+    test_realistic_export_pages_stay_light()
+    test_achromatic_dark_block_does_not_escalate_clean_page()
+    test_type_upgrade_rejected_preserves_homogeneity()
+    test_new_thresholds_are_wired_into_settings()
 
     print("\n[二] 产出质量校验")
     test_code_syntax_python_uses_real_parser()

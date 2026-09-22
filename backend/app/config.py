@@ -676,6 +676,36 @@ class Settings(BaseSettings):
     IMAGE_LOW_CONTRAST_SPAN: float = 0.55
     # 四条边至少这么多像素的黑边才判为扫描黑边（避免误判深色主题截图）
     IMAGE_BORDER_TRIGGER_PX: int = 6
+    # "翻拍件"的两个正交退化信号（与噪声/对比度互补，见 preprocess.pick_mode）：
+    # 模糊会把高频噪声抹平（噪声估计反而偏低）、阴影是低频渐变（全局对比度测不到），
+    # 只看噪声/全局对比度必然把翻拍件判成 light（实测 t2/t3/t4 都是 light）。
+    #
+    # 清晰度阈值：低于该值认为"糊/失焦"，升级到 noisy 档。度量是 re-blur 比值
+    # （原图拉普拉斯方差 / 高斯模糊后拉普拉斯方差），对内容量与分辨率都稳健。
+    # 实测（容器内，含真实导出页）：干净页/线稿 ≈26-313；翻拍/失焦 ≈1-10。
+    IMAGE_SHARPNESS_MIN_RATIO: float = 15.0
+    # re-blur 用的高斯半径（像素）
+    IMAGE_SHARPNESS_BLUR_SIGMA: float = 1.5
+    # 局部光照不均匀阈值：IMAGE_ILLUMINATION_GRID×IMAGE_ILLUMINATION_GRID 分块的
+    # "块均值极差/255"超过该值升级到 noisy 档（CLAHE 对阴影翻拍页收益最大）。
+    # 实测：无彩文档页 ≤0.09（pdf_clean@72/150/300dpi=0.038、合成表格页 0.067/0.091）；
+    # 阴影翻拍页 ≈0.24-0.49。取 0.18：无彩干净页余量 1.9x、阴影件余量 1.4x。
+    IMAGE_ILLUMINATION_RANGE_THRESHOLD: float = 0.18
+    IMAGE_ILLUMINATION_GRID: int = 4
+    # 饱和彩色像素占比超过该值 → 判为"彩色图表/照片"，uneven-light 升级跳过。
+    # 实心色块自己就会把块均值极差抬到阴影量级（金标彩色图例 png_clean=0.387、
+    # 其 colorful_fraction=0.64），与阴影在块均值上不可分；而 CLAHE 对彩色图有害。
+    # 实测：纸+墨的文档页（含阴影翻拍）≈0.00-0.02。取 0.15，远离两侧。
+    IMAGE_COLORFUL_FRACTION_THRESHOLD: float = 0.15
+    # 光照"低频渐变"判据（illumination_is_gradient）：沿主轴的相邻块均值差分，
+    # 允许幅度不超过"极差 × 该比例"的抖动（吸收文字内容噪声），再大的差分必须同号。
+    IMAGE_ILLUMINATION_GRADIENT_TOLERANCE: float = 0.15
+    # 「阴影里的纸仍然是纸」：最暗块 / 最亮块的纸面亮度不得低于该比例（块内 90 分位）。
+    # 实测：翻拍阴影与合成渐变 0.50-0.63；整块被不透明深色内容填满时 0.14（测到的是内容）。
+    IMAGE_ILLUMINATION_MIN_PAPER_RATIO: float = 0.35
+    # 纠偏角度可信度：按估计角度转正后行投影峰度需较原来提升该倍数，否则判为
+    # 噪声角度 → 不改图（保护照片不被误纠）。
+    IMAGE_DESKEW_MIN_PEAK_GAIN: float = 1.2
 
     # 置信度门控阈值
     #   >= ACCEPT → 专用引擎结果直接采用（Accept）

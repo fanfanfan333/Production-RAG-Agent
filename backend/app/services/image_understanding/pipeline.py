@@ -76,7 +76,6 @@ from app.config import get_settings
 from app.services.image_understanding.classifier import (
     ImageClassification,
     classify_image_safe,
-    compute_signals,
     vision_analyze_types,
 )
 from app.services.image_understanding.confidence import (
@@ -100,7 +99,10 @@ from app.services.image_understanding.engines.base import EngineOutput
 from app.services.image_understanding.engines.registry import get_registry
 from app.services.image_understanding.engines.vision_engine import VisionEngine
 from app.services.image_understanding.preprocess import (
+    PreprocessResult,
+    mode_rank,
     pick_mode,
+    preprocessing_mode_for,
     preprocess,
 )
 from app.services.image_understanding.quality import (
@@ -219,6 +221,25 @@ def resolve_route(image_type: str) -> str:
     return ROUTE_OCR
 
 
+#: 真正改变图像语义的"结构性"清洗步骤（``preprocess`` 的 ``applied`` 取值）。
+#: 只有它们命中才值得把预处理产物**重新编码**送给多模态模型（见 ``png()``）。
+#: 单纯的 ``upscale`` 不在此列：短边 <200 的小图会被放大到 640，而历史上 Vision
+#: 恒收到调用方编码的**原图**字节；若仅因"放大"就改送 VLM 输入，等于给一批原本
+#: 干净的图引入未度量的行为变化（评测基座余量只有 1.08 倍，冒不起这个险）。
+_CLEANING_STEPS = frozenset(
+    {
+        "denoise",
+        "denoise-median",
+        "contrast",
+        "contrast-stretch",
+        "trim-border",
+        "moire-suppress",
+        "deskew",
+        "binarize",
+    }
+)
+
+
 def understand_image(
     img: Image.Image,
     *,
@@ -236,8 +257,22 @@ def understand_image(
     png_cache: dict[str, bytes] = {}
     if png_bytes:
         png_cache["png"] = png_bytes
+    # 预处理的**最终产物**（做了清洗后由下方赋值）。见 png()：一旦做了结构性清洗，
+    # 送给多模态模型的必须是清洗后的图，否则清洗等于白做；只做了 upscale 不算，
+    # 那类图仍走"复用调用方字节"的快路径（不引入未度量的行为变化）。
+    cleaned: dict[str, Image.Image] = {}
 
     def png() -> bytes:
+        # D1 修复：清洗确实做了（applied 命中 _CLEANING_STEPS）时，Vision 必须拿到
+        # 清洗产物。历史实现恒复用调用方编码的**原图**字节（png_cache["png"]）→ 预处理
+        # 产物被丢弃、到不了多模态模型。没做清洗时保留"复用调用方字节"的快路径，
+        # 避免为一张没被改动的图多编码一次大图。
+        if cleaned:
+            if "clean" not in png_cache:
+                from app.services.image_understanding.imaging import encode_png_safe
+
+                png_cache["clean"] = encode_png_safe(cleaned["image"])
+            return png_cache["clean"]
         if "png" not in png_cache:
             from app.services.image_understanding.imaging import encode_png_safe
 
@@ -249,19 +284,33 @@ def understand_image(
     # pick_mode 只看内容，与图片类型无关 —— 类型此时还没判出来。
     mode, noise = pick_mode(img)
     pre = preprocess(img, mode=mode)
-    # 纠偏只对"文档感"很强的图做：线稿占比高说明是扫描件/截图而不是照片。
-    # 这样判定不需要 OCR，成本只有一次缩略图像素遍历。
+    # ── 0b. 纠偏（几何）闸门（D3）：**不再依赖轴对齐** ──────────────────────
+    # 历史用 line_art_ratio ≥ 0.8 作准入，而该信号会被阴影/低对比打掉（实测阴影
+    # 翻拍页 line_art_ratio = 0.0）→ 闸门关闭 → 永不纠偏。现在改为"能估出可信角度
+    # 就纠、估不出或不可信就原样返回"：是否改图交给 _deskew 自己把关（它内部有
+    # ink≥200、|angle|≥MIN_SKEW_DEGREES、以及**旋转不变**的"转正后行投影峰度提升"
+    # 三重保护，照片类图（纹理会给 minAreaRect 噪声角度）不会被误纠）。
     if (
         getattr(settings, "IMAGE_PREPROCESS_GEOMETRIC", True)
         and mode in ("light", "noisy")          # scan/geometric 档位已经纠过偏
     ):
         try:
-            preview = compute_signals(pre.image)
-            if preview["line_art_ratio"] >= 0.8:
-                geometric = preprocess(img, mode="geometric")
-                if "deskew" in geometric.applied:
-                    pre = geometric
+            # 关键：喂**已清洗**的 ``pre.image``，不是原图 ``img``。
+            # preprocess 只在 noisy/scan 档（或 contrast_span 很低）做 CLAHE，而
+            # geometric 档不做 —— 若从原图重跑，noisy 档已烘焙进像素的 CLAHE 会被
+            # 整段丢弃，而"一半被阴影压暗"的翻拍页恰恰最需要它（它 span 仍可能 ≥0.55）。
+            geometric = preprocess(pre.image, mode="geometric")
+            if "deskew" in geometric.applied:
+                # 叠加而非覆盖：applied 合并，保留 noisy 档已做操作的审计记录
+                pre = PreprocessResult(
+                    image=geometric.image,
+                    applied=list(pre.applied) + list(geometric.applied),
+                    meta={**pre.meta, **geometric.meta},
+                    ocr_image=geometric.ocr_image,
+                )
+                if mode == "light":
                     mode = "geometric"
+                # noisy 档保持 noisy：它描述"施加了哪些更强的操作"，纠偏只是叠加
         except Exception as exc:      # noqa: BLE001
             logger.debug("Geometric preprocessing skipped: %s", exc)
 
@@ -277,6 +326,90 @@ def understand_image(
 
     # ── 2. Picture Classification ─────────────────────────────────────────
     classification = classify_image_safe(work, ocr_lines=ocr_out.lines, filename=filename)
+
+    # ── 2b. 类型默认档接线（D4）─────────────────────────────────────────────
+    # 分类出 image_type 之后，按类型的"默认强档"再升级一次：表格 / 代码 / 公式 →
+    # geometric（纠偏对它们收益明显），chart / photo → light（**不强加**纠偏，
+    # 这正是 preprocessing_mode_for 已表达的类型判断）。历史上该映射函数从未被
+    # 生产链路调用（全仓唯一调用点是 pick_mode，而那时还没分类 → 死代码）。
+    # 只"往上抬"不"往下压"：已经是 noisy/scan 的图不会因类型是 table 被降档。
+    #
+    # 与 0b（内容侧纠偏）的关系：两者都只可能追加 deskew（geometric 相对 light 唯一
+    # 多出的操作），默认配置下会请求同一个操作且幂等（第二遍已无残余倾斜可纠）。
+    # 它俩**开关独立**：IMAGE_PREPROCESS_GEOMETRIC 关掉的是"内容侧启发式"，类型侧
+    # 判断仍然生效 —— 表格/代码/公式是已知纠偏收益最大的类型，不该被启发式开关带走。
+    # 记住首轮 OCR 的"判据样本"：类型升级后可能重跑，重跑**绝不能**以更差的产出
+    # 收尾。只备份判定要用的文本与置信度 —— 先算后提交的实现下首轮的
+    # ``EngineOutput`` 根本没被改动过，不需要（也不应该）再回滚对象本身。
+    first_ocr_text, first_ocr_conf = ocr_text, ocr_confidence
+    typed_mode = preprocessing_mode_for(classification.image_type)
+    if mode_rank(typed_mode) > mode_rank(mode):
+        # ★ **先算后提交**：try 里只允许"算"，绝不碰 pre/mode/work/ocr_input/noise。
+        # 先改后判（历史写法）会在升级被拒时留下不自洽的中间态：work 是纠偏后的
+        # 图，而 ocr_out.lines 的坐标来自纠偏**前** → 表格结构识别 / 任何按 OCR
+        # 行坐标定位的逻辑几何对不上；且 preprocess / preprocess_mode 会把一个
+        # 已被拒绝的升级照样报进审计。
+        upgrade: tuple[PreprocessResult, EngineOutput, str, object, bool] | None = None
+        try:
+            # 同 0b：喂**已清洗**的 ``pre.image``（叠加而非覆盖）
+            typed = preprocess(pre.image, mode=typed_mode)
+            if typed.applied:            # 确实追加了操作才值得升级，避免无谓改动
+                # OCR 在升级前已经跑过一次；类型升级改变了送读的图（如纠偏后），
+                # 用新图重跑一次，纠偏/去噪才能真正作用到文本与表格结构识别上。
+                retry = _run_ocr(typed.ocr_input)
+                retry_text = (retry.text or "").strip()
+                retry_conf = assess_ocr_confidence(retry.lines)
+                first_mean = float(first_ocr_conf.mean or 0.0)
+                retry_mean = float(retry_conf.mean or 0.0)
+                # 只在"新结果非空 且（不更短 或 置信度不低于首轮）"时采用 ——
+                # 引擎抖动 / 二值化把字吃掉都会让新图读出更差甚至空的结果，那不能
+                # 反过来把首轮已经读到的文本丢掉（纠偏的初衷是"读得更好"）。
+                accept = bool(retry_text) and (
+                    len(retry_text) >= len(first_ocr_text) or retry_mean >= first_mean
+                )
+                upgrade = (typed, retry, retry_text, retry_conf, accept)
+        except Exception as exc:      # noqa: BLE001
+            logger.debug("Type-based preprocessing skipped: %s", exc)
+
+        if upgrade is not None:
+            typed, retry, retry_text, retry_conf, accept = upgrade
+            # "是否被拒"这件事本身要进审计（两种 decision 都记），用于回答"这张图
+            # 为啥没纠偏"。但**只有被接受**才允许动 pre/mode/work/ocr_input。
+            noise["ocr_rerun"] = {
+                "decision": "accepted" if accept else "kept-first",
+                "first_chars": len(first_ocr_text),
+                "retry_chars": len(retry_text),
+                "first_confidence": round(float(first_ocr_conf.mean or 0.0), 4),
+                "retry_confidence": round(float(retry_conf.mean or 0.0), 4),
+            }
+            if accept:
+                pre = PreprocessResult(
+                    image=typed.image,
+                    applied=list(pre.applied) + list(typed.applied),
+                    meta={**pre.meta, **typed.meta},
+                    ocr_image=typed.ocr_image,
+                )
+                mode = typed_mode
+                # work / ocr_input / ocr 三者一次性同源提交：Vision、表格结构识别、
+                # OCR 以及 png()（D1）都取这里，绝不能只提交其中一部分。
+                work = pre.image
+                ocr_input = pre.ocr_input
+                ocr_out = retry
+                ocr_text = retry_text[: settings.MAX_IMAGE_OCR_CHARS]
+                ocr_confidence = retry_conf
+                noise["mode"] = mode
+                noise["mode_reason"] = (
+                    f"type-upgrade({classification.image_type})->{typed_mode}"
+                )
+            # 被拒时什么都不改：pre / mode / work / ocr_input 保持首轮状态，
+            # result.preprocess 如实反映"实际用了什么"，OCR 坐标与图同源。
+
+    # 把最终预处理产物交给 png()（D1）：**只有结构性清洗**才重编码一份送给 Vision。
+    # 单纯的 upscale 不在此列 —— 短边 <200 的小图会被放大到 640，而历史上 Vision
+    # 恒收到调用方编码的**原图**字节；若仅因"放大"就改送 VLM 输入，等于给一批原本
+    # 干净的图引入未度量的行为变化（评测基座余量只有 1.08 倍，冒不起这个险）。
+    if _CLEANING_STEPS & set(pre.applied):
+        cleaned["image"] = work
 
     # ── 3. 分派专用引擎（= 通道 A）─────────────────────────────────────────
     route = resolve_route(classification.image_type)

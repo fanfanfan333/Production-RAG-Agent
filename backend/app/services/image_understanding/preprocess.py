@@ -53,8 +53,59 @@ MIN_SHORT_SIDE = 200
 TARGET_SHORT_SIDE = 640
 #: 超过该角度才值得纠偏（小角度纠偏的插值损失 > 收益）
 MIN_SKEW_DEGREES = 0.8
-#: 拉普拉斯方差低于该值认为"糊/噪声大"，值得去噪（历史判据，保留兼容）
+#: 拉普拉斯方差低于该值认为"糊/噪声大"，值得去噪（历史判据，保留兼容；未被使用）
 BLUR_VARIANCE_THRESHOLD = 60.0
+
+#: 清晰度（re-blur 比值，见 :func:`sharpness_ratio`）低于该值认为"糊 / 失焦"。
+#: 比值 = 原图拉普拉斯方差 / 一次高斯模糊后拉普拉斯方差 —— 它问的是"再糊一次会不会
+#: 明显变糊"，对**内容量**与**分辨率**都稳健（一条线的干净线稿与整页密集正文都给
+#: ~50；低分辨率渲染也稳定 >25）。实测（容器内，含真实导出页 pdf_clean）：
+#:   干净：pdf_clean@72/150/300dpi = 313 / 47 / 26；t0=37、t1=57、稀疏单线=55
+#:   退化：t2=10.2、t3=10.1、t4=9.8；干净页 GaussianBlur(2)=2.2、Blur(4)=1.2
+#: 取 15：距最"钝"的干净页（300dpi 渲染=25.8）余量 1.7x，距最"锐"的翻拍件（t2=10.2）
+#: 余量 1.5x。**不要退回裸拉普拉斯方差**（对分辨率/内容量敏感，会把高分辨率正文页
+#: 与稀疏线稿误判成"糊"）。
+SHARPNESS_MIN_RATIO = 15.0
+#: 清晰度 re-blur 用的高斯半径（像素）
+SHARPNESS_BLUR_SIGMA = 1.5
+#: 光照不均匀阈值：判定"一半被阴影压暗的翻拍页"。全局 ``contrast_span`` 对阴影是
+#: 盲区 —— 阴影是**低频渐变**，全局 0.5/99.5 分位跨度仍然很宽（实测 0.64），只有
+#: 分块才测得到"一半亮一半暗"。
+#:
+#: ⚠️ **作用于 :func:`illumination_paper_range`（纸面口径）而不是块均值** —— 这是
+#: 一次真实回归换来的结论：块均值口径下，**消色**深色块（深色标题条 / 深色表头行 /
+#: 深色代码区块）与阴影同量级且原理上不可分（QA 实测：占页高 4.6% 的深色条就能把
+#: 块均值极差顶到 0.193，6.3% → 0.250，全部越过 0.18；而真实阴影可低到 0.256）。
+#: 换成纸面口径后二者**完全可分**：深色块 0.0000（压暗的是墨，纸仍是 255），
+#: 阴影 0.235-0.486。实测（容器内，26 例）：
+#:     正例（t3/t4 翻拍件、真实页+横向/纵向/对角/平滑半页渐变）：0.235-0.486
+#:     负例（标题条 2.3/3.4/4.6/6.3%、深色表头、深色代码块、常规/300dpi/稀疏/
+#:          页眉页脚/双栏导出页、t0/t1/t5-t8）：**0.0000**
+#: 取 0.18：正侧余量 1.31x（最弱正例 t4=0.235），负侧余量 ∞（消色负例全 0）。
+ILLUMINATION_RANGE_THRESHOLD = 0.18
+#: 光照不均匀度用的分块网格边长
+ILLUMINATION_GRID = 4
+#: 饱和彩色像素占比（:func:`colorful_fraction`）超过该值 → 判为"彩色图表/照片"，
+#: **uneven-light 升级跳过**。实心色块与阴影在块均值极差上不可分（见
+#: ``ILLUMINATION_RANGE_THRESHOLD`` 的注释），而 CLAHE 对彩色图要么无用要么有害
+#: （图表/照片本就该保持 light，见 ``preprocessing_mode_for`` 的类型判断）。
+#: 实测（容器内）：pdf/png 导出页与阴影翻拍页 ≈0.00-0.02（纸+墨基本无饱和色）；
+#: 金标彩色图例 png_clean.png=0.64（4 个大色块占满画面）。取 0.15：远离两侧实测值。
+COLORFUL_FRACTION_THRESHOLD = 0.15
+#: 光照"低频渐变"判据（:func:`illumination_is_gradient`）的容差：沿主轴的相邻块
+#: 纸面亮度差分，允许幅度不超过**极差 × 该比例**的抖动（吸收文字内容造成的噪声），
+#: 幅度超过容差的差分必须**同号**（真渐变是单调的）。实测见该函数文档。
+ILLUMINATION_GRADIENT_TOLERANCE = 0.15
+#: 「阴影里的纸仍然是纸」：最暗块的纸面亮度 / 最亮块的纸面亮度不得低于该比例。
+#: 阴影再重，被压暗的**纸**也仍是灰白的；而整块被不透明深色内容（内嵌深色照片 /
+#: 深色底图）填满时，90 分位测到的是**内容**而不是纸，会一路黑下去。
+#: 实测（容器内）：翻拍阴影与合成渐变 0.50-0.63；整块深色内容 0.14。取 0.35：
+#: 正侧余量 1.4x、负侧余量 2.5x。
+ILLUMINATION_MIN_PAPER_RATIO = 0.35
+#: 纠偏角度可信度：按估计角度**转正后**的行投影"峰度"需较原来提升该倍数，否则判为
+#: 噪声角度。真实倾斜文档转正后峰度提升通常 ≥5x；照片纹理的 ``minAreaRect`` 给的是
+#: 随机角度，转正不会让行投影变尖（提升比 ≈1）→ 被拦下（保护"照片不被误纠"）。
+DESKEW_MIN_PEAK_GAIN = 1.2
 
 #: 噪声标准差（0-255 灰度域）高于该值才值得去噪。经验值：
 #:   原生导出 ≈ 0.5-1.5   截图 ≈ 2-4   扫描件 ≈ 5-12   翻拍 ≈ 10-25
@@ -129,6 +180,11 @@ class PreprocessResult:
 #: 误判成噪声 —— 这是"干净的代码截图被当成噪点图去模糊"这类事故的根因。
 _NOISE_MASK = np.array(
     [[1.0, -2.0, 1.0], [-2.0, 4.0, -2.0], [1.0, -2.0, 1.0]], dtype=np.float64
+)
+
+#: 拉普拉斯（3×3）掩膜 —— 清晰度度量的无 OpenCV 回退实现用（见 sharpness_ratio）
+_LAPLACE_MASK = np.array(
+    [[0.0, 1.0, 0.0], [1.0, -4.0, 1.0], [0.0, 1.0, 0.0]], dtype=np.float64
 )
 
 
@@ -235,12 +291,246 @@ def border_trim(image: Image.Image) -> int:
     return int(min(thickness))
 
 
+def _gray_u8(image: Image.Image) -> np.ndarray | None:
+    """转 uint8 灰度（H×W）。失败返回 None."""
+    try:
+        gray = np.asarray(image.convert("L"), dtype=np.uint8)
+    except Exception:      # noqa: BLE001
+        return None
+    if gray.ndim != 2 or gray.size == 0:
+        return None
+    return gray
+
+
+def _laplacian_variance(gray: np.ndarray) -> float:
+    """灰度图的拉普拉斯方差. 无 OpenCV 时用等价的 numpy 卷积回退."""
+    try:
+        import cv2
+
+        return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    except Exception:      # noqa: BLE001
+        pass
+    try:
+        g = gray.astype(np.float64)
+        h, w = g.shape
+        if h < 3 or w < 3:
+            return 0.0
+        windows = np.stack([
+            g[i:i + h - 2, j:j + w - 2] for i in range(3) for j in range(3)
+        ])
+        response = np.tensordot(_LAPLACE_MASK.ravel(), windows, axes=([0], [0]))
+        return float(response.var())
+    except Exception:      # noqa: BLE001
+        return 0.0
+
+
+def _gaussian_blur_gray(gray: np.ndarray, sigma: float) -> np.ndarray | None:
+    """高斯模糊灰度图（re-blur 用）. 无 OpenCV 时用 PIL 回退."""
+    try:
+        import cv2
+
+        return cv2.GaussianBlur(gray, (0, 0), sigma)
+    except Exception:      # noqa: BLE001
+        pass
+    try:
+        from PIL import ImageFilter
+
+        return np.asarray(
+            Image.fromarray(gray).filter(ImageFilter.GaussianBlur(sigma)), dtype=np.uint8
+        )
+    except Exception:      # noqa: BLE001
+        return None
+
+
+def sharpness_ratio(image: Image.Image) -> float:
+    """
+    清晰度 = ``原图拉普拉斯方差 / 高斯模糊后拉普拉斯方差``（越大越清晰）.
+
+    为什么用"re-blur 比值"而不是**裸**拉普拉斯方差：后者对**内容量**与**分辨率**
+    都敏感 —— 只有一条线的干净线稿方差很低（会被误判成"糊"），高分辨率正文页缩到
+    同一尺寸后笔画变细、方差同样骤降（也会被误判）。re-blur 比值问的是"再糊一次
+    会不会明显变糊"：锐利的边缘会，已经糊掉的不会。因此它对内容量与分辨率都稳健。
+
+    低于 :data:`SHARPNESS_MIN_RATIO` 认为"糊 / 失焦"。无法度量（坏图）时返回一个
+    足够大的安全值 —— 宁可不动手，也不因度量失败把图升级去 CLAHE。
+    """
+    gray = _gray_u8(image)
+    if gray is None or gray.shape[0] < 3 or gray.shape[1] < 3:
+        return 1.0e6
+    sigma = float(_cfg("IMAGE_SHARPNESS_BLUR_SIGMA", SHARPNESS_BLUR_SIGMA))
+    blurred = _gaussian_blur_gray(gray, sigma)
+    if blurred is None:
+        return 1.0e6
+    sharp = _laplacian_variance(gray)
+    return round(float(sharp / (_laplacian_variance(blurred) + 1e-6)), 3)
+
+
+def _block_stat_grid(
+    image: Image.Image, stat: str = "mean", grid: int | None = None
+) -> np.ndarray | None:
+    """
+    ``grid×grid`` 分块统计量矩阵（行主序，便于取行列 profile）.
+
+    :param stat: ``"mean"``（块均值，含墨迹）或 ``"paper"``（块 90 分位 = **纸面亮度**，
+        墨迹覆盖率通常远低于 10%，因此它测的是"纸"而不是"字"）。
+        两个口径的区别正是"阴影"与"深色块"的分水岭，见
+        :func:`illumination_paper_range`。
+
+    :func:`illumination_range` / :func:`illumination_paper_range` /
+    :func:`illumination_is_gradient` 共用它 —— 三者必须看**同一份**分块，否则
+    "极差够大"与"是渐变"可能来自不同口径。失败（坏图 / 太小）返回 None。
+    """
+    try:
+        gray = np.asarray(image.convert("L"), dtype=np.float64)
+    except Exception:      # noqa: BLE001
+        return None
+    h, w = gray.shape[:2]
+    g = int(grid if grid else _cfg("IMAGE_ILLUMINATION_GRID", ILLUMINATION_GRID))
+    g = max(2, min(16, g))
+    if h < g or w < g:
+        return None
+    out = np.empty((g, g), dtype=np.float64)
+    for i in range(g):
+        for j in range(g):
+            blk = gray[i * h // g:(i + 1) * h // g, j * w // g:(j + 1) * w // g]
+            out[i, j] = blk.mean() if stat == "mean" else float(np.percentile(blk, 90))
+    return out
+
+
+def illumination_range(image: Image.Image) -> float:
+    """
+    局部光照不均匀度 = ``grid×grid`` 分块块均值极差 / 255（范围 0~1）.
+
+    与全局 :func:`contrast_span` 互补：阴影是**低频渐变**，全局 0.5/99.5 分位跨度
+    仍然很宽（测不到"一半亮一半暗"），而分块的极差能直接测到。
+
+    ⚠️ **这个口径含墨迹**，所以它**不是**升级判据：实心色块（饱和的彩色图例）以及
+    **消色**深色块（深色标题条 / 深色表头行 / 深色代码区块）都会把它抬到阴影量级。
+    真正的判据是 :func:`illumination_paper_range`（看**纸**而不是看墨），本值只作
+    为审计/排查信号保留在 meta 里 —— 二者摆在一起，一眼能看出"极差是墨迹造成的
+    还是光照造成的"。
+    """
+    grid = _block_stat_grid(image, "mean")
+    if grid is None:
+        return 0.0
+    return round(float(grid.max() - grid.min()) / 255.0, 4)
+
+
+def illumination_paper_range(image: Image.Image) -> float:
+    """
+    **纸面**亮度不均匀度 = ``grid×grid`` 分块的"块内 90 分位（纸面亮度）极差 / 255".
+
+    与 :func:`illumination_range`（块**均值**）的区别是本次消色深色块误报的根因：
+
+        阴影压暗的是**纸**  —— 阴影区里连白底都变灰 → 纸面亮度跟着掉
+        深色块压暗的是**墨** —— 深色标题条 / 深色表头行 / 深色代码区块周围与
+                                内部的白纸仍然是 255 → 纸面亮度**纹丝不动**
+
+    实测（容器内，A4@150dpi 导出页）：
+        阴影正例（t3/t4 翻拍件、真实页+渐变）  纸面极差 0.235-0.486
+        消色误报（标题条 2.3-6.3%、深色表头、深色代码块、常规/双栏/稀疏正文页）
+                                            纸面极差 **0.0000**
+    即"墨"造成的块均值起伏在纸面口径下直接归零，而"光"造成的起伏原样保留 ——
+    因此在纸面口径上，阴影与深色块是**完全可分**的（不再依赖脆弱的形态启发式）。
+
+    块内 90 分位取"纸"的前提是块内至少有 ~10% 的纸；整块被不透明深色内容
+    （内嵌深色照片）填满时会测到内容而非纸 —— 那一类由
+    :func:`illumination_is_gradient` 的形态判据兜住（深色块是阶跃/V 形，不是渐变）。
+    """
+    grid = _block_stat_grid(image, "paper")
+    if grid is None:
+        return 0.0
+    return round(float(grid.max() - grid.min()) / 255.0, 4)
+
+
+def illumination_is_gradient(image: Image.Image) -> bool:
+    """
+    纸面亮度的不均匀是否像**光照渐变**（阴影）而不是**内容**（深色块 / 深色图）.
+
+    为什么需要它：:func:`illumination_paper_range` 已经滤掉了"墨迹造成的块均值
+    起伏"，但当某几块被**不透明深色内容整块填满**（内嵌深色照片、深色底图）时，
+    90 分位测到的是内容而不是纸 —— 那一类只能靠形态与量级来挡。
+
+    判据（两条都要过；**判不出来一律返回 False** —— 本模块的原则是保守，
+    宁可不清洗也不误伤干净页）：
+
+        1. **单调**：取行 / 列两个 profile 中极差更大的那个作主轴，其相邻差分必须
+           **同号**，幅度不超过 ``极差 × ILLUMINATION_GRADIENT_TOLERANCE`` 的抖动
+           被容忍（吸收文字内容造成的噪声）。深色块是 V 形阶跃（实测
+           [255, 145, 145, 255]），一票否决。
+        2. **纸仍然是纸**：最暗块 / 最亮块的纸面亮度不低于
+           ``ILLUMINATION_MIN_PAPER_RATIO``。阴影再重，被压暗的纸也是灰白的
+           （实测 0.50-0.63）；整块深色内容会一路黑下去（实测 0.14）。
+           ⚠️ 这条是**召回上的取舍**：暗于 ~35% 亮度的极重阴影会被判成"内容"
+           而放弃升级（宁可漏，不可误伤）。
+
+    注意 profile 取自**纸面亮度**矩阵（与 :func:`illumination_paper_range` 同一份
+    分块）：形态判据要判的是"光"的走向，块均值里混着墨迹会污染它。
+    """
+    grid = _block_stat_grid(image, "paper")
+    if grid is None:
+        return False
+
+    row_profile = grid.mean(axis=1)
+    col_profile = grid.mean(axis=0)
+    row_span = float(row_profile.max() - row_profile.min())
+    col_span = float(col_profile.max() - col_profile.min())
+    profile = row_profile if row_span >= col_span else col_profile
+    span = max(row_span, col_span)
+    if span < 1.0:                      # 没有不均匀可判 → 不是阴影
+        return False
+
+    diffs = np.diff(profile)
+    tol = span * float(
+        _cfg("IMAGE_ILLUMINATION_GRADIENT_TOLERANCE", ILLUMINATION_GRADIENT_TOLERANCE)
+    )
+    # 1) 同号（小抖动容忍）：全 ≤ tol 或全 ≥ -tol
+    if not (bool(np.all(diffs <= tol)) or bool(np.all(diffs >= -tol))):
+        return False
+    # 2) 纸仍然是纸：最暗处不能黑到"这是内容而不是纸"的程度
+    floor = float(_cfg("IMAGE_ILLUMINATION_MIN_PAPER_RATIO", ILLUMINATION_MIN_PAPER_RATIO))
+    return float(profile.min()) / max(float(profile.max()), 1e-6) >= floor
+
+
+def colorful_fraction(image: Image.Image) -> float:
+    """
+    饱和彩色像素占比 = HSV 中 S、V 双高的像素比例（范围 0~1）.
+
+    用途：把"彩色图表/照片"从 :func:`illumination_range` 的作用范围里排除 ——
+    实心色块自己就会把块均值极差抬到阴影量级（金标彩色图例实测 0.387），
+    二者在该信号上原理上不可分；而 CLAHE 对彩色图要么无用要么有害。
+    "纸+墨"的文档页（含阴影翻拍件）饱和像素几乎为 0（实测 ≤0.02）。
+    """
+    try:
+        # PIL 自带 HSV 转换（S/V 均在 0-255），零 OpenCV 依赖
+        hsv = np.asarray(image.convert("RGB").convert("HSV"), dtype=np.uint8)
+    except Exception:      # noqa: BLE001
+        return 0.0
+    if hsv.ndim != 3 or hsv.shape[2] < 3 or hsv.size == 0:
+        return 0.0
+    sat = hsv[:, :, 1]
+    val = hsv[:, :, 2]
+    return round(float(((sat >= 60) & (val >= 60)).mean()), 4)
+
+
 def noise_signals(image: Image.Image) -> dict:
-    """一次算全部噪声相关信号（写进 meta，便于排查"为什么这张图被去噪了"）."""
+    """
+    一次算全部质量信号（写进 meta，便于排查"为什么这张图被升级了"）.
+
+    除了噪声 / 对比度 / 边框，还包含"翻拍件"的两个关键退化信号 ——
+    失焦（:func:`sharpness_ratio`）与局部光照不匀（:func:`illumination_range`）。
+    二者与噪声**正交**：模糊把高频噪声抹平（噪声估计反而偏低）、阴影是低频渐变
+    （全局对比度测不到），只看噪声阈值必然漏判这两类翻拍件。
+    """
     return {
         "noise_sigma": estimate_noise(image),
         "contrast_span": contrast_span(image),
         "border_px": border_trim(image),
+        "sharpness_ratio": sharpness_ratio(image),
+        "illumination_range": illumination_range(image),
+        "illumination_paper_range": illumination_paper_range(image),
+        "illumination_gradient": illumination_is_gradient(image),
+        "colorful_fraction": colorful_fraction(image),
     }
 
 
@@ -268,6 +558,24 @@ def thresholds() -> dict:
         "border_trigger_px": _cfg("IMAGE_BORDER_TRIGGER_PX", BORDER_TRIGGER_PX),
         "border_dark_theme_ratio": _cfg(
             "IMAGE_BORDER_DARK_THEME_RATIO", BORDER_DARK_THEME_RATIO
+        ),
+        "sharpness_min_ratio": _cfg(
+            "IMAGE_SHARPNESS_MIN_RATIO", SHARPNESS_MIN_RATIO
+        ),
+        "illumination_range_threshold": _cfg(
+            "IMAGE_ILLUMINATION_RANGE_THRESHOLD", ILLUMINATION_RANGE_THRESHOLD
+        ),
+        "colorful_fraction_threshold": _cfg(
+            "IMAGE_COLORFUL_FRACTION_THRESHOLD", COLORFUL_FRACTION_THRESHOLD
+        ),
+        "illumination_gradient_tolerance": _cfg(
+            "IMAGE_ILLUMINATION_GRADIENT_TOLERANCE", ILLUMINATION_GRADIENT_TOLERANCE
+        ),
+        "illumination_min_paper_ratio": _cfg(
+            "IMAGE_ILLUMINATION_MIN_PAPER_RATIO", ILLUMINATION_MIN_PAPER_RATIO
+        ),
+        "deskew_min_peak_gain": _cfg(
+            "IMAGE_DESKEW_MIN_PEAK_GAIN", DESKEW_MIN_PEAK_GAIN
         ),
     }
 
@@ -375,15 +683,21 @@ _MODE_RANK = {"light": 0, "geometric": 1, "noisy": 2, "scan": 3, "text": 1}
 
 def pick_mode(image: Image.Image, image_type: str | None = None) -> tuple[str, dict]:
     """
-    自动选档：类型默认值 + 噪声信号 → 最终档位.
+    自动选档：类型默认值 + 质量信号 → 最终档位.
 
     规则（保守，只在**有证据**时升级档位）：
 
-        noise_sigma ≥ 强噪声   → scan     （翻拍/扫描：去噪+去边框+摩尔纹+纠偏）
-        四条边都有黑边          → scan     （扫描仪盖板痕迹，必须裁掉）
-        noise_sigma ≥ 阈值     → noisy    （有噪但结构干净：去噪+对比度）
-        contrast_span 很低      → noisy    （发灰的扫描件，即使噪声不大）
-        其余                    → 类型默认值
+        noise_sigma ≥ 强噪声       → scan   （翻拍/扫描：去噪+去边框+摩尔纹+纠偏）
+        四条边都有黑边             → scan   （扫描仪盖板痕迹，必须裁掉）
+        noise_sigma ≥ 阈值         → noisy  （有噪但结构干净：去噪+对比度）
+        contrast_span 很低         → noisy  （发灰的扫描件，即使噪声不大）
+        局部光照不匀（且非彩色图）  → noisy  （一半被阴影压暗的翻拍页）
+        清晰度过低（糊/失焦）      → noisy  （失焦翻拍件：噪声已被抹平，测不到）
+        其余                       → 类型默认值
+
+    后两条是本次新增的"翻拍件"信号：它们与噪声正交 —— **模糊会把高频噪声抹平**
+    （噪声估计反而低于阈值）、**阴影是低频渐变**（全局对比度跨度仍然很宽），
+    只看噪声/全局对比度必然把翻拍件判成 light（实测 t2/t3/t4 都是 light）。
 
     返回 ``(mode, signals)``，signals 里带上 `mode_reason` 便于排查。
     """
@@ -404,6 +718,24 @@ def pick_mode(image: Image.Image, image_type: str | None = None) -> tuple[str, d
         mode, reason = "noisy", f"noise({sigma})"
     elif span < limits["low_contrast_span"]:
         mode, reason = "noisy", f"low-contrast({span})"
+    elif (
+        signals["illumination_paper_range"] >= limits["illumination_range_threshold"]
+        and signals["colorful_fraction"] < limits["colorful_fraction_threshold"]
+        and signals["illumination_gradient"]
+    ):
+        # 局部光照不匀（阴影翻拍页）：全局对比度测不到，CLAHE 收益最大。
+        # 三重门槛，缺一个都会误伤干净的**导出页**：
+        #   paper_range —— 看**纸面**亮度而不是块均值：深色标题条 / 深色表头 /
+        #                  深色代码块压暗的是墨（实测纸面极差 0.0000），阴影压暗
+        #                  的是纸（实测 0.235-0.486）；
+        #   colorful    —— 排除**饱和**色块（彩色图例/插图，实测 colorful=0.64），
+        #                  它们会把**每一个**口径的分块极差都顶到阴影量级；
+        #   gradient    —— 形态判据，兜住"整块被不透明深色内容填满"的情况
+        #                  （那时纸面口径也会测到内容），判不出来一律不升级。
+        mode, reason = "noisy", f"uneven-light({signals['illumination_paper_range']})"
+    elif signals["sharpness_ratio"] < limits["sharpness_min_ratio"]:
+        # 失焦/运动模糊：噪声被抹平、对比度可能正常，只有清晰度（re-blur 比值）测得到
+        mode, reason = "noisy", f"blur({signals['sharpness_ratio']})"
     else:
         mode, reason = default, f"type-default({image_type or '?'})"
 
@@ -414,6 +746,11 @@ def pick_mode(image: Image.Image, image_type: str | None = None) -> tuple[str, d
     signals["mode"] = mode
     signals["mode_reason"] = reason
     return mode, signals
+
+
+def mode_rank(mode: str) -> int:
+    """档位强度排序（只用于"往上抬"的比较）—— 公开给管线按类型升级档位时用."""
+    return _MODE_RANK.get(mode, 0)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -568,8 +905,18 @@ def _deskew(image: Image.Image) -> tuple[Image.Image, str | None, float]:
     """
     倾斜校正.
 
-    用所有"墨点"的最小外接矩形角度估计倾斜。这个估计对文字块很准，对无文字的
-    图会给出噪声角度 —— 因此低于 ``MIN_SKEW_DEGREES`` 一律不动。
+    用所有"墨点"的最小外接矩形（``minAreaRect``）角度估计倾斜，再朝**反方向**
+    旋转把它转正。
+
+    ⚠️ 两个必须的关口，缺一个都会把图弄坏：
+
+    1. **方向**：``minAreaRect`` 返回的是"内容相对水平的方向 θ"，纠偏要转 **-θ**。
+       历史上漏了这个负号 → 纠偏把倾斜**加倍**（5° 变 10°、15° 变 30°），越纠越歪。
+    2. **可信度**：``minAreaRect`` 对无文字的图（照片纹理、纯色块）也能给出一个
+       "角度"——那是噪声角度。因此转正前先验证"按该角度转正后行投影峰度确实显著
+       提升"（真倾斜文档转正后提升 ≥5x；噪声角度转正后 ≈1x）。过不了就原样返回。
+
+    低于 ``MIN_SKEW_DEGREES`` 一律不动（小角度纠偏的插值损失大于收益）。
     """
     try:
         import cv2
@@ -583,8 +930,11 @@ def _deskew(image: Image.Image) -> tuple[Image.Image, str | None, float]:
         angle = float(cv2.minAreaRect(coords.astype(np.float32))[-1])
         if angle > 45:
             angle -= 90
+        angle = -angle                      # 关口 1：纠偏朝反方向转（修正历史符号缺陷）
         if abs(angle) < MIN_SKEW_DEGREES:
             return image, None, 0.0
+        if not _deskew_angle_is_trustworthy(gray, angle):
+            return image, None, 0.0         # 关口 2：噪声角度 → 不改图
 
         h, w = gray.shape
         matrix = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
@@ -595,6 +945,40 @@ def _deskew(image: Image.Image) -> tuple[Image.Image, str | None, float]:
         return Image.fromarray(rotated), "deskew", round(angle, 2)
     except Exception:      # noqa: BLE001
         return image, None, 0.0
+
+
+def _row_peak(gray: np.ndarray) -> float:
+    """行投影峰度 = max(每行墨迹数) / mean(每行墨迹数)（越大说明"行越对齐"）."""
+    row = (gray < 160).sum(axis=1).astype(np.float64)
+    mean = float(row.mean())
+    if mean <= 0.0:
+        return 0.0
+    return float(row.max() / mean)
+
+
+def _deskew_angle_is_trustworthy(gray: np.ndarray, angle: float) -> bool:
+    """
+    纠偏角度是否可信：转正后行投影峰度需较原来提升 ``DESKEW_MIN_PEAK_GAIN`` 倍.
+
+    旋转不变的判据 —— 真倾斜的文档转正后文字行重新对齐，行投影显著变尖；
+    照片 / 纯纹理图无论怎么转都不会变尖（提升比 ≈1），因此被拦下，避免误纠。
+    """
+    try:
+        import cv2
+
+        h, w = gray.shape[:2]
+        before = _row_peak(gray)
+        matrix = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
+        rotated = cv2.warpAffine(
+            gray, matrix, (w, h), flags=cv2.INTER_NEAREST,
+            borderMode=cv2.BORDER_REPLICATE,
+        )
+        after = _row_peak(rotated)
+        return after >= before * float(
+            _cfg("IMAGE_DESKEW_MIN_PEAK_GAIN", DESKEW_MIN_PEAK_GAIN)
+        )
+    except Exception:      # noqa: BLE001
+        return False
 
 
 def _binarize(image: Image.Image) -> tuple[Image.Image, str | None]:
@@ -721,11 +1105,17 @@ __all__ = [
     "preprocess",
     "preprocessing_mode_for",
     "pick_mode",
+    "mode_rank",
     "noise_signals",
     "thresholds",
     "estimate_noise",
     "contrast_span",
     "border_trim",
+    "sharpness_ratio",
+    "illumination_range",
+    "illumination_paper_range",
+    "illumination_is_gradient",
+    "colorful_fraction",
     "page_polarity",
     "invert_for_ocr",
     "MIN_SHORT_SIDE",
@@ -735,5 +1125,11 @@ __all__ = [
     "NOISE_SIGMA_STRONG",
     "LOW_CONTRAST_SPAN",
     "BORDER_TRIGGER_PX",
+    "SHARPNESS_MIN_RATIO",
+    "ILLUMINATION_RANGE_THRESHOLD",
+    "COLORFUL_FRACTION_THRESHOLD",
+    "ILLUMINATION_GRADIENT_TOLERANCE",
+    "ILLUMINATION_MIN_PAPER_RATIO",
+    "DESKEW_MIN_PEAK_GAIN",
     "MIXED_POLARITY_FRAC",
 ]
