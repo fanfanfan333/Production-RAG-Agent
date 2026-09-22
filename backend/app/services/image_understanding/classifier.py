@@ -85,6 +85,40 @@ _TABLE_MAX_COLORFUL_RATIO = 0.12
 # 可用 settings.TABLE_OCR_MIN_COL_STABILITY 覆盖。
 _TABLE_OCR_MIN_COL_STABILITY = 0.20
 
+# ── 彩色结构示意图（diagram）的兜底判据（2026-09，见 _decide 第 6.5 步）──────────
+# 背景：一张**结构示意图**（三栏对比图、带彩色标题条 / 卡片面板的示意图）会同时
+# 踩空既有的三条判据 ——
+#   · 它的彩色面积够不上图表（图表要求 colorful_ratio ≥ 0.15），
+#   · 它的 line_art_ratio 又够不上流程图 / 结构图的线稿判据（要求 ≥ 0.8），
+# 于是掉进最后的 "default" → photo → 走 OCR、**永远**拿不到图意总结。实测
+# 「企业知识库RAG系统建设实施手册.docx」的第 3 张图就是这样丢掉了 image_caption
+# （Qdrant payload image_caption=None）。
+# 这里补一条"结构图"兜底：**统一背景 + 可辨结构 + 彩度不足以判图表**即认作
+# diagram（→ 走多模态，拿得到图意描述）。用已有信号即可判定，无需新模型。
+#
+# 关于"确有结构"的析取项：**只认几何结构**（粗带 / 彩色描边块 / 细直线），
+# **不**把 ``ocr_rows >= 2`` 算进去。理由：一张"白底黑字、无线无色带"的**纯文字页**
+# 翻拍件同样满足"统一背景 + 彩度低 + OCR 多行"，若把 OCR 行数当结构信号，就会把
+# 纯文字页误升格成 diagram —— 而纯文字页的正解是 OCR（要文字），不是 vision
+# （要图意）。这条边界由 test_image_structured_diagram.py 的红-绿用例守住。
+#
+# 阈值锚点（2026-09 真实管线实测，DOMINANT 高 / 彩度低 / 线稿占比中等是这类图的
+# 共同特征；真实照片三条信号全部落在门外）：
+#
+#                    dominant  line_art  colorful  raw_bands  期望
+#   image 3（真实）    0.4761    0.6519    0.0889    1          diagram
+#   合成结构示意图      0.5823    0.7081    0.0971    8          diagram
+#   _photo_image      0.1679    0.0000    1.0000    3          必须仍为 photo
+#
+# photo 的 dominant 极低（连续渐变里没有大面积同色块）、line_art≈0（连续色调中
+# 几乎没有近白/近黑像素）、colorful≈1.0（高饱和）—— 所以"真实照片必须仍判 photo"
+# 这条红线由信号本身保证，而不是靠把阈值调紧去碰运气。
+_STRUCTURED_MIN_DOMINANT_RATIO = 0.45
+_STRUCTURED_MIN_LINE_ART = 0.55
+# 与图表判据的 colorful_ratio ≥ 0.15 互补：达到 0.15 就已是图表，这边只接"彩度
+# 不足"的那一类。两个分支因此构成对彩色的干净二分，不会互相抢。
+_STRUCTURED_MAX_COLORFUL_RATIO = 0.15
+
 
 def _rule_count(
     profile: list[int], limit: int, ratio: float, max_gap: int, max_thick: int
@@ -632,6 +666,41 @@ def _decide(signals: dict, settings) -> tuple[str, float, str]:
             0.85, 0.45 + signals["line_art_ratio"] * 0.3 + 0.03 * (h_lines + v_lines)
         )
         return IMAGE_TYPE_DIAGRAM, confidence, "line-art-structured"
+
+    # ── 6.5 彩色结构示意图兜底：统一背景 + 可辨结构 + 彩度不足以判图表 ────────
+    # 有些"结构示意图"（三栏对比图、带彩色标题条 / 卡片面板的示意图）彩色面积
+    # 够不上图表（colorful_ratio < 0.15），line_art_ratio 又够不上上面 0.8 的
+    # 流程图线稿判据，于是掉进 default → photo → 走 OCR、永远没有图意总结。
+    # 这类图有**统一背景 + 可辨结构**（面板 / 色带 / 直线等几何结构），把它认成
+    # diagram 让它走多模态，才是"图能被读懂"的正确归宿（见模块级常量注释里的
+    # 实测锚点）。真实照片的三条信号都落在门外（dominant 低、line_art≈0、
+    # colorful 极高），因此不会被误收。
+    structured_color_panels = (
+        signals["dominant_ratio"]
+        >= getattr(settings, "STRUCTURED_MIN_DOMINANT_RATIO", _STRUCTURED_MIN_DOMINANT_RATIO)
+        and signals["line_art_ratio"]
+        >= getattr(settings, "STRUCTURED_MIN_LINE_ART", _STRUCTURED_MIN_LINE_ART)
+        and signals["colorful_ratio"]
+        < getattr(settings, "STRUCTURED_MAX_COLORFUL_RATIO", _STRUCTURED_MAX_COLORFUL_RATIO)
+        # 必须确有**几何结构**（粗带 / 彩色描边块 / 细直线之一）；
+        # 三者皆空的（纯空白页、纯色块、以及"有文字但没有任何线/带"的纯文字页）
+        # 都不能凭"背景统一"就升格成 diagram —— 纯文字页的正解是 OCR（要文字），
+        # 不是 vision（要图意）。⚠️ 特别注意：**不要**把 `ocr_rows >= 2` 当结构
+        # 信号加回来 —— 一张"白底黑字、无线无色带"的打印页翻拍件恰好会满足
+        # "统一背景 + 彩度低 + OCR 多行"，一旦把 OCR 行数算作结构，它就会被误
+        # 升格成 diagram，把本该走 OCR 的文字页推去白烧一次多模态推理。
+        and (
+            raw_bands >= 1
+            or chromatic >= 1
+            or (h_lines + v_lines) >= 1
+        )
+    )
+    if structured_color_panels:
+        confidence = min(
+            0.8,
+            0.45 + signals["line_art_ratio"] * 0.25 + signals["dominant_ratio"] * 0.2,
+        )
+        return IMAGE_TYPE_DIAGRAM, confidence, "structured-panels"
 
     # ── 7. 其余：普通图片 → OCR ────────────────────────────────────────────
     return IMAGE_TYPE_PHOTO, 0.4, "default"

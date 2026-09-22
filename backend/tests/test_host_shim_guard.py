@@ -32,6 +32,30 @@ from _module_skip import host_shimmed, skip_if_host_shimmed  # noqa: E402
 _REAL_PACKAGES = ("PIL", "sqlalchemy", "pytest", "numpy")
 
 
+def _carries_shim_marker(obj: object) -> bool:
+    """对象是否**真的**被垫片打了标记 —— 只读它自身的 ``__dict__``。
+
+    为什么不能用 ``getattr(obj, "__host_shim__", False)``
+    ────────────────────────────────────────────────────
+    ``torch.ops`` 是 ``torch._ops._Ops`` 的**实例**（不是模块），它实现了自定义
+    ``__getattr__``：访问任意未定义的名字都会**动态构造**并返回一个 operator
+    namespace 模块。于是
+
+        getattr(torch.ops, "__host_shim__", False)
+        → <module 'torch.ops.__host_shim__' from 'torch.ops'>   （truthy！）
+
+    守卫据此把它判成"带哑桩标记"，再去要 ``__spec__`` 就必然是 ``None`` → 用例
+    在**容器内**变红（宿主机 torch 被垫片顶替、根本没有 ``torch.ops``，所以一直
+    没暴露）。实测：``vars(torch.ops)`` 里**没有**这个键，即垫片从未标记过它。
+
+    垫片（``conftest._pad``）是**显式写入模块 ``__dict__``** 的
+    （``mod.__host_shim__ = True``），所以按 ``__dict__`` 判断才是准确判据 ——
+    而且比 ``getattr`` **更严格**（不再被自定义属性协议骗过）。
+    """
+    d = getattr(obj, "__dict__", None)
+    return isinstance(d, dict) and bool(d.get("__host_shim__", False))
+
+
 def test_guard_is_not_vacuous() -> None:
     """① 真装了的包不能被判成"缺失" —— 否则容器里也会被无辜跳过。"""
     for name in _REAL_PACKAGES:
@@ -47,7 +71,7 @@ def test_real_modules_never_carry_host_shim_marker() -> None:
     """③ 真包不得带哑桩标记（带了 → 无故跳过 → 假绿）。"""
     for name in _REAL_PACKAGES:
         mod = sys.modules.get(name)
-        assert not getattr(mod, "__host_shim__", False), f"{name} 是真包却带哑桩标记"
+        assert not _carries_shim_marker(mod), f"{name} 是真包却带哑桩标记"
 
 
 def test_marked_modules_are_actually_fakes() -> None:
@@ -59,7 +83,7 @@ def test_marked_modules_are_actually_fakes() -> None:
     """
     marked = [
         n for n, m in list(sys.modules.items())
-        if getattr(m, "__host_shim__", False)
+        if _carries_shim_marker(m)
     ]
     for name in marked:
         spec = getattr(sys.modules[name], "__spec__", None)

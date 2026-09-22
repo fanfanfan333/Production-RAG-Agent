@@ -62,6 +62,10 @@ def terms_for_text(text: str, max_chars: int = 4000) -> str:
     截断到 *max_chars*：超长 chunk（表格/代码）的词项数量爆炸，而尾部词项对
     召回的贡献极低。截断发生在**字符**层面而不是词项层面，保持函数便宜（不需要
     先把十万字符全 tokenize 再丢）。
+
+    ⚠️ 大小写：``tokenize()`` 会 lower，索引侧与查询侧因此**恒为小写**（契约见
+    :func:`build_tsquery`）—— "S" 与 "s" 在检索里是同一个词元，英文型号
+    ``ABX-300`` 与 ``abx-300`` 命中同一批块。
     """
     from app.services.hybrid_search import tokenize
 
@@ -101,7 +105,13 @@ def build_tsquery(query: str) -> str:
     tokens: list[str] = []
     seen: set[str] = set()
     for raw in tokenize(query):
-        clean = _TSQUERY_SAFE_RE.sub("", raw)
+        # 大小写折叠：本仓库的**契约**是"英文词检索与大小写无关"（S 与 s 等价）。
+        # ``tokenize()`` 已经 lower 过一次，这里的 ``.lower()`` 是**显式复述同一条
+        # 约定**：谁将来把 tokenize 换成不做折叠的实现，查询侧仍不会与索引侧分叉
+        # —— 索引侧由 PG 的 ``simple`` 词典再折叠一次（``to_tsvector('simple', …)``
+        # 与 ``to_tsquery('simple', …)`` 双向都会 lower），
+        # 于是"两边都折叠"这件事在代码里看得见，而不是散落在两处隐含行为里。
+        clean = _TSQUERY_SAFE_RE.sub("", raw.lower())
         if not clean or clean in seen:
             continue
         seen.add(clean)

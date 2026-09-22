@@ -21,7 +21,6 @@ from app.db.qdrant import get_qdrant_client
 from app.services.embedding_service import embed_batch_with_retry
 from app.services.evidence_trust import apply_trust_weighting, compute_trust
 from app.services.hybrid_search import BM25Index, rrf_fuse
-from app.services.audit_service import record_audit
 from app.services.metadata import MetadataFilter, matches_payload
 from app.services.pg_keyword_search import keyword_search
 from app.services.security_policy import (
@@ -146,6 +145,15 @@ class RetrievedChunk:
     # 下面几个 property 会自动降级为"无警示"。
     analyze_quality: dict = field(default_factory=dict)
     analyze_fusion: dict = field(default_factory=dict)
+
+    # ── 第 11 环对象级复核所需的**原始 payload**（内部字段，不进 API 出参）─────────
+    # 只有内存 BM25 腿需要它：向量腿与 PG 腿各自手里就有 payload 字典，而内存腿
+    # 的候选是按 ``(document_id, chunk_index)`` 从语料列表里取出来的 —— 原实现
+    # 丢掉 payload 后，第 11 环 ``_object_level_filter`` 拿到 ``None`` 就"宁缺勿错"
+    # 地放行，于是该腿**整条跳过** ``allows()``：同一条腿在 ``HYBRID_KEYWORD_BACKEND
+    # =memory`` 下与另两条腿判定不同源，且剔除不进审计。带上一份引用即可同源。
+    # ``repr=False``：日志里不打印整块 payload；``compare=False``：不影响相等语义。
+    _acl_payload: dict | None = field(default=None, repr=False, compare=False)
 
     @property
     def is_image(self) -> bool:
@@ -527,6 +535,10 @@ async def _scroll_pages(
                     chunk_index=chunk_index,
                     text=str(payload.get("text", "")),
                     score=0.0,
+                    # 带上原始 payload：内存 BM25 腿要拿它跑第 11 环 allows()
+                    # （见 RetrievedChunk._acl_payload 的说明）。同一份字典被缓存
+                    # 里的语料共享，不额外复制。
+                    _acl_payload=payload,
                     **_media_fields(payload),
                     **_line_fields(payload),
                     **_position_fields(payload),
@@ -1279,33 +1291,55 @@ class ScopedQuery:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-async def _record_acl_drop(
-    decision: Decision,
+def _security_strict_mode() -> bool:
+    """``SECURITY_STRICT_MODE``（读配置失败按**严格**，与 ``security_scope._strict_mode`` 同口径）."""
+    try:
+        return bool(get_settings().SECURITY_STRICT_MODE)
+    except Exception:      # noqa: BLE001 — 读不到配置时不能静默变成"放行"
+        logger.exception("SECURITY_STRICT_MODE 读取失败 —— 按严格模式处理")
+        return True
+
+
+async def _record_acl_drops(
+    drops: list[tuple[Decision, str, str]],
     *,
-    object_id: str,
-    document_id: str,
     stage: str,
     scope_fingerprint: str | None,
 ) -> None:
     """
-    记录一次"因权限被剔除"的审计（共享知识 13：``acl.drop.<stage>``）.
+    批量记录"因权限被剔除"的审计（共享知识 13：``acl.drop.<stage>``）.
 
-    复用 :func:`audit_service.record_audit` 现有能力（不新增函数）；``AuditLog``
-    的 ``resource_id`` 是 ``String(64)``、``detail`` 截断 2000 字符 —— 这里对
-    ``object_id`` 主动截断，避免超长写崩。
+    为什么不逐条 ``await``：一次检索可能剔除几十个对象（权限刚收紧时最多，而那
+    正是最该快的时候），逐条 = 几十次串行事务，全在用户请求路径上。改走
+    :func:`audit_service.record_acl_drops` 后**每批一次事务**；每条剔除仍单独成行
+    （``resource_id`` = 对象 id，可逐对象追溯），要求不变。
+
+    ``drops`` 每项 ``(decision, object_id, document_id)``。
+
+    审计是旁路：坏掉不能影响检索（fail-open），只记日志。
     """
+    if not drops:
+        return
     try:
-        await record_audit(
-            f"acl.drop.{stage}",
-            resource_type="document_object",
-            resource_id=str(object_id or document_id or "")[:64] or None,
-            detail=(
-                f"stage={stage}; reason={decision.reason}; gate={decision.gate}; "
-                f"document_id={document_id}; scope_fp={scope_fingerprint or '-'}"
-            ),
+        from app.services.audit_service import record_acl_drops
+
+        await record_acl_drops(
+            stage,
+            [
+                {
+                    "object_id": object_id,
+                    "document_id": document_id,
+                    "reason": decision.reason,
+                    "gate": decision.gate,
+                }
+                for decision, object_id, document_id in drops
+            ],
+            scope_fingerprint=scope_fingerprint,
         )
     except Exception:      # noqa: BLE001 — 审计是旁路，坏掉不能影响检索
-        logger.exception("acl.drop audit failed (stage=%s, doc=%s)", stage, document_id)
+        logger.exception(
+            "acl.drop batch audit failed (stage=%s, n=%d)", stage, len(drops)
+        )
 
 
 async def _object_level_filter(
@@ -1326,33 +1360,39 @@ async def _object_level_filter(
     无法表达"这张图 / 这个表格被单独提级或剔除"。图片/表格/代码块的对象级
     收紧只有在这一层才生效（PRD P0-6）。
 
-    取不到 payload 的候选（例如内存 BM25 腿只给了 ``RetrievedChunk``）：**保留**，
-    交由文档级 ``valid_docs`` 与前置过滤共同兜底 —— 不因为"拿不到对象视图"就
-    凭空丢弃证据（那会把可用召回也一起杀掉）。
+    取不到 payload 的候选（例如老向量点根本没有安全字段）：默认**保留**，交由
+    文档级 ``valid_docs`` 与前置过滤共同兜底 —— 不因为"拿不到对象视图"就凭空
+    丢弃证据（那会把可用召回也一起杀掉）。``SECURITY_STRICT_MODE=true`` 时改为
+    **丢弃**（fail-closed）：严格模式的口径就是"安全字段没回填完就别放行"，
+    与 ``to_qdrant`` 的 ``ACL_SECURITY_PREFILTER_STRICT`` 同向；读配置失败按严格
+    （与 ``security_scope._strict_mode`` 同口径），否则"配置读不到"会静默变成放行。
 
     Returns:
         ``(保留的 chunks, 被剔除计数)``
     """
+    strict = _security_strict_mode()
     kept: list[RetrievedChunk] = []
-    dropped = 0
+    drops: list[tuple[Decision, str, str]] = []
     for chunk in chunks:
         payload = payloads.get(_chunk_key(chunk))
         if payload is None:
+            if strict:
+                drops.append((
+                    Decision(False, "missing_object_view", "tenant"),
+                    str(chunk.document_id),
+                    chunk.document_id,
+                ))
+                continue
             kept.append(chunk)
             continue
         decision = allows(pred, ObjectACLView.from_payload(payload))
         if decision.allowed:
             kept.append(chunk)
             continue
-        dropped += 1
-        await _record_acl_drop(
-            decision,
-            object_id=str(payload.get("object_id") or ""),
-            document_id=chunk.document_id,
-            stage=stage,
-            scope_fingerprint=scope_fingerprint,
-        )
-    return kept, dropped
+        drops.append((decision, str(payload.get("object_id") or ""), chunk.document_id))
+    # 一次批量落库（写库次数与剔除数量解耦）；每条剔除仍是独立审计行。
+    await _record_acl_drops(drops, stage=stage, scope_fingerprint=scope_fingerprint)
+    return kept, len(drops)
 
 
 async def retrieve_chunks_scoped(
@@ -1397,9 +1437,24 @@ async def retrieve_chunks_scoped(
         ``list[RetrievedChunk]``，best first；``scope`` 为 ``None`` 时 fail-closed 返回 ``[]``。
     """
     if scope is None:
+        # fail-closed 是**行为**，但**静默**不是可接受的可观测性：用户看到的是
+        # "知识库没有相关内容"——与"真的没有"逐字相同，运维在日志里也只会看到
+        # 一条与请求无关的 error。这里把"有人没带 Scope 就进来了"落成一条审计，
+        # 事后可查（谁、什么时候、多少次），同时保留 ERROR 日志。
+        # 【发现问题 #15】审计是旁路，失败不改变 fail-closed 的返回。
         logger.error(
             "retrieve_chunks_scoped called without a UserScope — refused (fail-closed)"
         )
+        try:
+            from app.services.audit_service import record_audit
+
+            await record_audit(
+                "retrieval.unscoped_refused",
+                resource_type="retrieval",
+                detail=f"query={query[:120]!r}",
+            )
+        except Exception:      # noqa: BLE001 — 审计失败不影响 fail-closed 语义
+            logger.exception("unscoped-refusal audit failed")
         return []
     return await retrieve_chunks(
         query=query,
@@ -1774,6 +1829,9 @@ async def retrieve_chunks(
     object_payloads: dict[tuple[str, int], dict] = {}
     meta_skipped = 0
     acl_dropped: set[str] = set()
+    # 第 11 环的剔除审计先攒后写（见 _record_acl_drops）：一次检索可能剔除几十个
+    # 候选，逐条 await 就是几十次串行事务压在请求路径上。
+    postcheck_drops: list[tuple[Decision, str, str]] = []
     for (doc_id_str, _ci), (score, payload) in all_results.items():
         if doc_id_str not in valid_docs:
             # 措辞要准确：文档**通常是存在的**，只是「未 COMPLETED 或在本人的
@@ -1789,13 +1847,9 @@ async def retrieve_chunks(
         if pred is not None:
             decision = allows(pred, ObjectACLView.from_payload(payload))
             if not decision.allowed:
-                await _record_acl_drop(
-                    decision,
-                    object_id=str(payload.get("object_id") or ""),
-                    document_id=doc_id_str,
-                    stage="postcheck",
-                    scope_fingerprint=scope_fingerprint,
-                )
+                postcheck_drops.append((
+                    decision, str(payload.get("object_id") or ""), doc_id_str,
+                ))
                 acl_dropped.add(doc_id_str)
                 continue
         # 元数据纵深防御：前置过滤在 Qdrant 侧已生效，这里只拦"字段存在且冲突"
@@ -1929,13 +1983,9 @@ async def retrieve_chunks(
                 if pred is not None:
                     decision = allows(pred, ObjectACLView.from_payload(payload))
                     if not decision.allowed:
-                        await _record_acl_drop(
-                            decision,
-                            object_id=str(payload.get("object_id") or ""),
-                            document_id=doc_id_str,
-                            stage="postcheck",
-                            scope_fingerprint=scope_fingerprint,
-                        )
+                        postcheck_drops.append((
+                            decision, str(payload.get("object_id") or ""), doc_id_str,
+                        ))
                         acl_dropped.add(doc_id_str)
                         continue
                 if meta_conds and not matches_payload(metadata_filter, payload):
@@ -2001,6 +2051,12 @@ async def retrieve_chunks(
                         meta_skipped += 1
                         continue
                     rows.append(key)
+                    # 【第 11 环同源】把语料里带回来的原始 payload 交给收尾的对象级
+                    # 复核：缺这一步，该腿的候选在 ``_object_level_filter`` 里没有
+                    # 对象视图 → 只能放行，等于整条腿**跳过** ``allows()``，且剔除
+                    # 不进审计。空 payload（老点）不注册，保持"宁缺勿错"的旧口径。
+                    if c._acl_payload:
+                        object_payloads.setdefault(key, c._acl_payload)
                     if key not in merged:
                         # 以 BM25 候选 chunk 为基底、仅覆盖 score —— 这样**全部**
                         # 字段（含图片分类 image_type / 位置 position·bbox / 质检
@@ -2015,6 +2071,11 @@ async def retrieve_chunks(
                 logger.exception(
                     "Hybrid BM25 leg failed — falling back to vector-only retrieval"
                 )
+
+    # 两条关键词腿的剔除审计在这里一次写库（向量腿在循环前已攒好，共用一个列表）。
+    await _record_acl_drops(
+        postcheck_drops, stage="postcheck", scope_fingerprint=scope_fingerprint
+    )
 
     if meta_skipped:
         logger.info(

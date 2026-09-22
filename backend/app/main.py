@@ -70,8 +70,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # FIX-B（T5 预发布）：弱密钥 fail-closed。
     # 仅在 JWT_SECRET **真正**是默认值/已知弱值/长度<32 且未显式开启 escape 开关时
     # 才终止启动（杜绝自签 admin token）。环境变量显式提供了 ≥32 字符强密钥则照常启动。
+    # ⚠️ 只导入**模块级**名字。ALLOW_INSECURE_JWT 是 Settings 的字段（不是模块级
+    # 名字），一律经 _settings.ALLOW_INSECURE_JWT 读取 —— 写进这里的 import 会让
+    # FastAPI 启动即 ImportError（2026-09-21 实测踩到，见 tests/test_module_import_wiring.py）。
     from app.config import (
-        ALLOW_INSECURE_JWT,
         is_jwt_secret_weak,
         jwt_secret_must_fail_startup,
     )

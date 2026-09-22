@@ -992,7 +992,16 @@ async def _run_ingestion(
                 }
                 for pid, c in chunk_map.items()
             ]
-            acl_stats = await materialize_document_objects(fresh_doc or doc, acl_points)
+            acl_stats = await materialize_document_objects(
+                fresh_doc or doc,
+                acl_points,
+                # 【发现问题 #14】把 chunk_parents 一并物化成 ``parent_chunk`` 对象行。
+                # 少了这一步，设计 §19.2-A 整条是死代码：父块没有权限行 ⇒ small-to-big
+                # 回填的父块正文既不进第 12 环 ``allows()``，也无法被单独提级 / 剔除。
+                # 后果是"子块判定通过、父块正文绕道进 LLM"—— 一份被提级的父块仍会
+                # 以完整小节正文出现在答案上下文里。
+                parents=hierarchy.parents,
+            )
             logger.info(
                 "Document '%s' (id=%s): materialized %s object ACL rows",
                 filename, doc_id_str, acl_stats,
@@ -1002,6 +1011,16 @@ async def _run_ingestion(
                 "Document '%s' (id=%s): document_objects materialization failed — "
                 "PostgreSQL stays authoritative, object-level ACL may be incomplete",
                 filename, doc_id_str,
+            )
+            # ──【发现问题 #5】失败必须**留下可查的标记**，不能只写日志就照常
+            # COMPLETED：`filter_chunks_by_acl` 对"从未物化"的文档按缺行回退放行，
+            # 所以这份文档的对象级保护此刻已经失效，而界面、检索、监控全都正常。
+            # 标 `acl_sync_state=stale`（有索引）→ 一句 SQL 就能捞出全部受影响文档，
+            # 重跑入口见 scripts/rematerialize_document_objects.py。
+            from app.services.security_cascade import mark_materialization_failed
+
+            await mark_materialization_failed(
+                doc.id, reason="ingest_materialize_failed"
             )
 
         # ── 6. Mark COMPLETED ─────────────────────────────────────────────────

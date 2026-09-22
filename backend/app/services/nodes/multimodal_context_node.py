@@ -238,6 +238,9 @@ async def build_multimodal_context(
     # ── 【T4】第 12 环对象级最终校验：**必须先于 Vision**（图不能先被识别再被挡）──
     acl_status = "clean"
     dropped_count = 0
+    # 逐文档物化结论；提升到 if 之外，供下面的父块复核（发现问题 #14）复用。
+    mat_map: dict[str, bool] = {}
+    parent_blocked = 0
     if pred is not None and view_index is not None:
         from app.services.nodes.final_check_node import (
             audit_acl_drops,
@@ -381,7 +384,14 @@ async def build_multimodal_context(
             # ── small-to-big：命中子块后回填父块完整语义 ──────────────────────
             body = chunk.text
             if expand_parent and chunk.parent_text:
-                body = chunk.parent_text
+                # 【#14】父块正文也要过对象级判定（父块可被单独提级 / 剔除）。
+                # 判定函数与 context_builder 共用，避免两个入口规则分叉。
+                from app.services.nodes.final_check_node import parent_block_allows
+
+                if parent_block_allows(chunk, pred, view_index, mat_map):
+                    body = chunk.parent_text
+                else:
+                    parent_blocked += 1
 
             safe_text, was_masked = sanitize_document_context(body)
             if was_masked:
@@ -517,6 +527,13 @@ async def build_multimodal_context(
     if masked:
         logger.warning(
             "Multimodal context masked %d block(s) before generation", masked
+        )
+    if parent_blocked:
+        # 安全剔除留痕：父块被单独提级 / 剔除，正文不再进 LLM（退回子块正文）。
+        logger.warning(
+            "Multimodal context blocked %d parent block(s) by object-level ACL "
+            "(small-to-big fell back to child text)",
+            parent_blocked,
         )
     if image_chunks:
         logger.info(

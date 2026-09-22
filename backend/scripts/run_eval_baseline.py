@@ -9,7 +9,9 @@
 本脚本：
   1. 从 ``backend/eval/golden_v1.json`` 读金标（标注用 filename+chunk_index
      逻辑坐标，运行期解析成 ``document_id::chunk_index``，语料重导不用改标注）；
-  2. 以管理员身份 ``POST /eval/run``，真实走生产同一条检索链路；
+  2. 以管理员身份 ``POST /eval/run``，真实走生产同一条检索链路（进程内的负例 /
+     分带测量也共用 ``main`` 里**一次签发**的五维 scope —— ``request_security_scope``
+     + ``retrieve_chunks_scoped``，与端点逐字同源）；
   3. 复核 ``GET /eval/history`` 里确实出现了这一轮（验证**落库**生效，
      而不是"跑完就没了"）；
   4. 单独做负例拒答检查（库里没有的问题必须拒答）—— 召回率单指标会被
@@ -49,17 +51,41 @@ def _http(base: str, path: str, *, method: str = "GET", body: dict | None = None
         return {"ok": False, "status": 0, "error": f"{type(exc).__name__}: {exc}"}
 
 
-async def resolve_labels(golden: dict) -> tuple[list[dict], list[str]]:
-    """把 (filename, chunk_index) 逻辑坐标解析成 ``document_id::chunk_index``."""
+async def resolve_labels(
+    golden: dict, scope,
+) -> tuple[list[dict], list[str], list[dict]]:
+    """
+    把 (filename, chunk_index) 逻辑坐标解析成 ``document_id::chunk_index``.
+
+    解析的同时**用与检索链路同一个判定内核**复核可达性（见下）。这一步不能省：
+    ``/eval/run`` 端点是五维口径、会剔除测试公司等范围外文档；若这里只按 filename
+    命中就把坐标塞进 ``relevant``，一条「标注恰好落在调用者权限范围外」的用例会在
+    回执里被算成 **recall 0/2 的检索失败** —— 与「检索真的漏了」在输出上完全无法
+    区分。那正是本项目最忌讳的静默失效，所以这里显式把这类标注分离到
+    ``unattainable``，绝不混入 ``relevant`` 参与打分。
+
+    返回 ``(cases, problems, unattainable)``：
+      * ``cases``        —— 可评分用例（可达标注；全部标注不可达的整条用例已剔除）；
+      * ``problems``     —— filename 在库里查不到的解析失败（与旧行为一致）；
+      * ``unattainable`` —— ``(query, filename, gate, reason)``，标注在权限范围外的事实。
+
+    Args:
+        golden: 金标集（``backend/eval/golden_v1.json`` 的形状）。
+        scope:  **调用者本人**的 :class:`UserScope`（由 ``main()`` 一次签发、透传）。
+    """
+    # 延迟导入（与本文件既有风格一致）：判定内核 + 会话工厂
     from sqlalchemy import text
 
     from app.db.postgres import get_db_session
+    from app.services.security_policy import ObjectACLView, allows, build_predicate
 
     wanted = {
         item["filename"]
         for case in golden["cases"]
         for item in case["expect"]
     }
+    by_name: dict[str, list[str]] = {}
+    views: dict[str, ObjectACLView] = {}
     async with get_db_session() as session:
         rows = (
             await session.execute(
@@ -70,67 +96,109 @@ async def resolve_labels(golden: dict) -> tuple[list[dict], list[str]]:
                 {"names": list(wanted)},
             )
         ).all()
-    by_name: dict[str, list[str]] = {}
-    for filename, doc_id in rows:
-        by_name.setdefault(filename, []).append(doc_id)
+        for filename, doc_id in rows:
+            by_name.setdefault(filename, []).append(doc_id)
+
+        # 取回这些文档在 document_objects 里的 object_type='doc' 行 —— 它是第 11/12
+        # 环「对象级统一视图」的权威源，判定内核 ``allows()`` 吃的就是它。
+        # 用 ``document_id::text = any(:ids)`` 而非 ``= any(:ids)``：文档 id 在
+        # documents 侧已被 ``::text`` 成字符串，直接拿字符串比 UUID 列会强转报错。
+        all_ids = [doc_id for ids in by_name.values() for doc_id in ids]
+        if all_ids:
+            obj_rows = (
+                await session.execute(
+                    text(
+                        "select * from document_objects "
+                        "where object_type = 'doc' and document_id::text = any(:ids)"
+                    ),
+                    {"ids": all_ids},
+                )
+            ).mappings().all()
+            for row in obj_rows:
+                view_row = dict(row)
+                views[str(view_row.get("document_id"))] = ObjectACLView.from_row(view_row)
+
+    # 谓词只构造一次、整轮复用（``allows`` 是纯函数，可安全复用；这也保证与检索
+    # 链路**同一个判定内核**，而不是这里另写一份 if-else）。
+    pred = build_predicate(scope)
 
     problems: list[str] = []
     cases: list[dict] = []
+    unattainable: list[dict] = []
     for case in golden["cases"]:
         relevant: list[str] = []
+        # 该用例是否至少有一条标注解析到了文档（未被 problems 拦掉）。用来区分
+        # 「标注全落权限范围外」（剔除整条）与「expect 为空 / 全是解析失败」
+        # （沿用旧行为，不剔除）。
+        resolved_any = False
         for item in case["expect"]:
             name = item["filename"]
             ids = by_name.get(name)
             if not ids:
                 problems.append(f"金标引用的文档不存在：{name!r}（query={case['query']!r}）")
                 continue
+            resolved_any = True
+            # 该标注能否被调用者看见：**任一** document_id 不可达 ⇒ 整条标注判为
+            # 不可达（多个同名文档时保守整条剔除，避免"部分命中"掩盖权限事实）。
+            unreachable = None
+            for doc_id in ids:
+                decision = allows(pred, views.get(doc_id))
+                if not decision.allowed:
+                    unreachable = decision
+                    break
+            if unreachable is not None:
+                unattainable.append({
+                    "query": case["query"],
+                    "filename": name,
+                    "gate": unreachable.gate,
+                    "reason": unreachable.reason,
+                })
+                continue
             for doc_id in ids:
                 relevant.append(f"{doc_id}::{item['chunk_index']}")
+        if resolved_any and not relevant:
+            # 整条用例的可达标注为空 → 从评测集剔除（不留一个必然 0 召回的用例去
+            # 污染 recall）。留痕已由上面逐标注的 ``unattainable`` 记录承担。
+            continue
         cases.append({"query": case["query"], "relevant": relevant,
                       "modality": "text", "note": case.get("note", "")})
-    return cases, problems
+    return cases, problems, unattainable
 
 
-async def check_negatives(golden: dict, username: str) -> list[dict]:
+async def check_negatives(golden: dict, scope) -> list[dict]:
     """
     负例拒答检查：库里没有的问题，精排最高分必须低于证据闸阈值.
 
-    scope 刻意与 ``POST /eval/run`` **完全同源**（同一个 ``tenancy.scope_for``），
+    scope 刻意与 ``POST /eval/run`` **完全同源** —— 二者都消费 ``main()`` 里
+    **一次签发**的 :func:`security_scope.request_security_scope`，检索都走
+    :func:`retrieval_service.retrieve_chunks_scoped`（五维口径，含测试公司剔除），
     而不是"随便给一个大范围"：
       * 用窄口径 → 会把"权限上看不到"误判成"库里不存在"，负例检查退化成
         永远通过的假测试；
       * 用 ``owner_id=None`` 的伪全量口径 → 私有库整片看不见，而本语料里
         绝大多数内容是 private，等于把检查范围悄悄缩小了 90%。
-    所以这里把调用者自己按 scope_for 展开，与评测链路一字不差。
-    """
-    from sqlalchemy import select
+    所以这里直接用调用者的五维 scope 检索，与评测链路一字不差。
 
+    Args:
+        golden: 金标集（供 ``negative_cases``）。
+        scope:  调用者本人的 :class:`UserScope`（由 ``main()`` 签发、透传）。
+    """
     from app.config import get_settings
-    from app.db.postgres import get_db_session
-    from app.db.user_models import User
-    from app.services.retrieval_service import retrieve_chunks
-    from app.services.tenancy import request_scope
+    from app.services.retrieval_service import retrieve_chunks_scoped
 
     settings = get_settings()
-    async with get_db_session() as session:
-        user = (
-            await session.execute(select(User).where(User.username == username))
-        ).scalars().first()
-    if user is None:
-        return [{"query": nc["query"], "error": f"user {username!r} not found",
+    if scope is None:
+        # 防御性：没有 scope 时**绝不**退化成"不过滤"（那会让负例全部假通过）。
+        # main() 已保证传有效 scope，这一支只在调用约定被破坏时触发，且会显式
+        # 以 refused=False 反映为失败，而不是静默放行。
+        return [{"query": nc["query"], "error": "missing UserScope (fail-closed)",
                  "refused": False} for nc in golden["negative_cases"]]
-    scope = await request_scope(user)
 
     out: list[dict] = []
     for case in golden["negative_cases"]:
         try:
-            chunks = await retrieve_chunks(
-                case["query"], top_k=10,
-                owner_id=str(scope.owner_id) if scope.owner_id else None,
-                tenant_ids=scope.tenant_ids,
-                user_department_id=scope.department_id,
-                tenant_wide=scope.tenant_wide,
-                owns_tenant_ids=scope.owns_tenant_ids,
+            chunks = await retrieve_chunks_scoped(
+                query=case["query"], top_k=10, scope=scope,
             )
             top = max((c.score for c in chunks), default=0.0)
             top_doc = chunks[0].document_id if chunks else None
@@ -148,7 +216,7 @@ async def check_negatives(golden: dict, username: str) -> list[dict]:
 
 
 async def measure_band_headroom(
-    golden: dict, username: str, resolved_cases: list[dict], top_k: int = 10
+    scope, resolved_cases: list[dict], top_k: int = 10
 ) -> dict:
     """
     在**关闭阈值过滤**的那一态下测量相对分带的真实安全上界.
@@ -168,23 +236,11 @@ async def measure_band_headroom(
     注：该值取自**过完整条流水线之后**的分数，已含 ``PARENT_SCORE_DECAY``
     折损，因此偏保守（真实可容忍上界略高）。对护栏而言保守方向正确。
     """
-    from sqlalchemy import select
-
     from app.config import get_settings
-    from app.db.postgres import get_db_session
-    from app.db.user_models import User
     from app.services.evaluation import gold_score_profile, item_from_chunk
-    from app.services.retrieval_service import retrieve_chunks
-    from app.services.tenancy import request_scope
+    from app.services.retrieval_service import retrieve_chunks_scoped
 
     settings = get_settings()
-    async with get_db_session() as session:
-        user = (
-            await session.execute(select(User).where(User.username == username))
-        ).scalars().first()
-    if user is None:
-        return {"error": f"user {username!r} not found"}
-    scope = await request_scope(user)
 
     # 只测「金标 ≥ 2 条」的用例：单金标用例 gold/head ≡ 1.0，无论如何都有上界
     # 1.0 —— 放进来看起来"余量充足"，其实是恒真命题，会掩盖真实风险。
@@ -193,14 +249,8 @@ async def measure_band_headroom(
         return {"error": "金标集里没有一条需要 ≥2 条证据的用例 —— 分带风险仍然测不出"}
 
     async def _retrieve(query: str):
-        return await retrieve_chunks(
-            query, top_k=top_k,
-            owner_id=str(scope.owner_id) if scope.owner_id else None,
-            tenant_ids=scope.tenant_ids,
-            user_department_id=scope.department_id,
-            tenant_wide=scope.tenant_wide,
-            owns_tenant_ids=scope.owns_tenant_ids,
-        )
+        # 与端点同源的五维路径（调用者 scope 由 main() 一次签发、透传）
+        return await retrieve_chunks_scoped(query=query, top_k=top_k, scope=scope)
 
     per_case: list[dict] = []
     original = settings.RERANK_MIN_SCORE_FILTER
@@ -226,7 +276,7 @@ async def measure_band_headroom(
 
     ratios = [c["min_gold_ratio"] for c in per_case if c["min_gold_ratio"] is not None]
     return {
-        "method": "容器内复跑 retrieve_chunks（admin scope, top_k=%d），两态对照："
+        "method": "容器内复跑 retrieve_chunks_scoped（五维 scope, top_k=%d），两态对照："
                   "态A=生产配置（过滤开）；态B=关闭阈值过滤" % top_k,
         "measured_state": "B（过滤关）。态A会把被砍掉的证据算成『本来就不存在』，"
                           "使 min_gold_ratio 偏高 → 不能用来定上界。",
@@ -242,11 +292,16 @@ async def measure_band_headroom(
 
 
 def judge(report: dict, negatives: list[dict], thresholds: dict,
-          band: dict | None = None) -> dict:
+          band: dict | None = None, unattainable: list[dict] | None = None) -> dict:
     """把「指标 / 负例拒答 / 多证据 / 分带余量」四类判据合并成一个结论.
 
     ``band`` 为 ``measure_band_headroom`` 的返回值（可为 None —— 拿不到测量时
     只跳过"实测上界"那一条，其余判据照常生效，不会静默放行）。
+
+    ``unattainable`` 为 ``resolve_labels`` 交回的权限事实清单（标注在调用者权限
+    范围外）。它**不**参与 ``passed`` 判定 —— 权限变更不是检索质量回归，让它变红
+    只会把门禁信号带偏；但它必须**可见**（见返回里的 ``unattainable`` 字段），
+    否则「标注在权限范围外」与「检索真的漏了」在回执里无法区分。
     """
     recall10 = (report.get("recall") or {}).get("10")
     if recall10 is None:
@@ -331,6 +386,13 @@ def judge(report: dict, negatives: list[dict], thresholds: dict,
         "failures": failures,
         "metrics": detail,
         "band": band_detail,
+        # 权限事实：标注在调用者权限范围外（见 resolve_labels）。**不参与 passed**
+        # —— 权限变更不是检索质量回归；但必须可见，否则消费方分不清
+        # 「标注在范围外」与「没实现这个字段」（正是上面 docstring 的承诺）。
+        "unattainable": {
+            "count": len(unattainable or []),
+            "items": list(unattainable or []),
+        },
         "negative_cases_total": len(negatives),
         "negative_cases_refused": refused,
         "negative_gate_ok": neg_ok,
@@ -365,14 +427,6 @@ async def main() -> int:
         print("缺少环境变量 RAG_EVAL_PASSWORD（评测需要 audit.read 权限的账号）")
         return 3
 
-    cases, problems = await resolve_labels(golden)
-    if problems:
-        print("金标解析失败：")
-        for p in problems:
-            print("  -", p)
-        return 4
-    print(f"golden={golden['name']} cases={len(cases)} negatives={len(golden['negative_cases'])}")
-
     login = _http(args.base_url, "/auth/login", method="POST",
                   body={"username": user, "password": password}, timeout=30)
     if not login.get("ok"):
@@ -380,6 +434,47 @@ async def main() -> int:
         return 3
     token = login["body"].get("access_token")
     print(f"login ok as {login['body'].get('user', {}).get('username')}")
+
+    # ── 权限 scope：**全脚本只签发一次**，三处（resolve_labels / check_negatives
+    # / measure_band_headroom）共用 ──────────────────────────────────────────
+    # 为什么必须在 main 里签发而不是各函数各自查：``request_security_scope`` 是五维
+    # 权限的**唯一签发点**，检索端点消费的就是它。若各辅助函数各自按旧的三维
+    # ``tenancy.request_scope`` 展开，就会在**比 /eval/run 更宽**的语料上测量（测试
+    # 公司等范围外文档不会被剔除），所谓"完全同源"就成了假的。
+    from sqlalchemy import select
+
+    from app.db.postgres import get_db_session
+    from app.db.user_models import User
+    from app.services.security_scope import request_security_scope
+
+    async with get_db_session() as session:
+        eval_user = (
+            await session.execute(select(User).where(User.username == user))
+        ).scalars().first()
+    if eval_user is None:
+        print(f"评测账号 {user!r} 在库中不存在 —— 无法签发权限 scope")
+        return 3
+    user_scope = await request_security_scope(eval_user)
+    print(f"scope -> user_id={user_scope.user_id} "
+          f"tenants={sorted(user_scope.base.tenant_ids or [])} "
+          f"owns={sorted(user_scope.base.owns_tenant_ids)} "
+          f"clearance={user_scope.clearance}")
+
+    cases, problems, unattainable = await resolve_labels(golden, user_scope)
+    if problems:
+        print("金标解析失败：")
+        for p in problems:
+            print("  -", p)
+        return 4
+    print(f"golden={golden['name']} cases={len(cases)} negatives={len(golden['negative_cases'])}")
+    if unattainable:
+        # 显著打印：这是"权限事实"，不判回归，但绝不能悄悄吞掉 —— 否则
+        # 「标注在权限范围外」与「检索真的漏了」在回执里无法区分。
+        print(f"unattainable（标注在权限范围外，共 {len(unattainable)} 条，"
+              f"已从评分剔除；不判回归）:")
+        for u in unattainable:
+            print(f"  - query={u.get('query')!r} filename={u.get('filename')!r} "
+                  f"gate={u.get('gate')} reason={u.get('reason')}")
 
     started = datetime.now(timezone.utc)
     run = _http(args.base_url, "/eval/run", method="POST", token=token, timeout=1200, body={
@@ -409,7 +504,7 @@ async def main() -> int:
     print(f"eval/history -> runs={len(runs or [])} persisted={persisted} "
           f"source={(runs or [{}])[0].get('source')}")
 
-    negatives = await check_negatives(golden, user)
+    negatives = await check_negatives(golden, user_scope)
     for n in negatives:
         print(f"  negative [{'refuse' if n.get('refused') else 'LEAK'}] "
               f"top={n.get('top_score')} {n['query']!r}")
@@ -419,7 +514,7 @@ async def main() -> int:
     band: dict = {}
     if not args.skip_band:
         print("measuring relative-band headroom (filter OFF pass) …")
-        band = await measure_band_headroom(golden, user, cases, top_k=args.top_k)
+        band = await measure_band_headroom(user_scope, cases, top_k=args.top_k)
         if band.get("error"):
             print(f"  band: ERROR {band['error']}")
         else:
@@ -431,7 +526,8 @@ async def main() -> int:
                       f"found={c['found_without_filter']}/{c['gold_count']} "
                       f"{c['query'][:42]!r}{flag}")
 
-    verdict = judge(report, negatives, golden.get("thresholds", {}), band=band)
+    verdict = judge(report, negatives, golden.get("thresholds", {}), band=band,
+                    unattainable=unattainable)
     verdict["eval_persisted_to_db"] = persisted
     if not persisted:
         verdict["failures"].append("评测结果未落库：/eval/history 里看不到本轮（跨重启基线不成立）")
@@ -445,6 +541,9 @@ async def main() -> int:
         "report": report,
         "negatives": negatives,
         "band": band,
+        # 新增顶层键（只增不改）：标注在权限范围外的事实清单。既不参与 verdict
+        # 的通过判定，也不与既有键重叠，方便未来归档比对。
+        "unattainable": unattainable,
         "verdict": verdict,
     }
     with open(args.out, "w", encoding="utf-8") as f:

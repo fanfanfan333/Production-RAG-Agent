@@ -1,0 +1,68 @@
+# CI 轻量测试依赖 —— 「不依赖真实栈」门禁专用。
+#
+# 为什么单独一份，而不是直接用 requirements.txt
+# ────────────────────────────────────────────
+# requirements.txt 是**运行镜像**的依赖：含 torch(+cpu) / paddlepaddle / paddleocr /
+# docling / torchvision 等重包，一次装下来数 GB、几个到十几分钟，且首次使用还要
+# 联网下载模型权重 —— GitHub 托管 runner 上既慢又不稳，不适合当 PR 门禁。
+#
+# 本文件是**开发机 venv 的等价轻量集**：装完之后跑
+#     python -m pytest tests -q
+# 全套用例仍能跑通 —— 因为 tests/conftest.py 有一层「宿主机轻依赖垫片」：仅在
+# 真实第三方包 import 失败时注入哑桩，且只在宿主机/CI 缺包时生效（容器里依赖齐全
+# 时完全不生效）。需要真 cv2 / python-pptx / asyncpg 的少数用例会经
+# _module_skip.skip_if_host_shimmed **运行期条件跳过**，不会假绿（见
+# tests/test_host_shim_guard.py 对这两个前提的守卫）。
+#
+# ⚠️ 以下四个包必须**真实安装**（不能落到垫片里）：
+#     pillow / SQLAlchemy / pytest / numpy
+# 因为 test_host_shim_guard.py 断言 host_shimmed() 对它们返回 False（真包才算通过）。
+# 它们都不在 conftest._HOST_PAD_NAMES 名单里，所以天然不会被顶替。
+#
+# 版本取自「backend 全量用例在本机 venv 上全绿」的那次冻结；为避免平台差异，
+# 去掉了仅 Windows 适用的 pywin32。
+#
+# 维护：当 requirements.txt 里**纯逻辑路径**新增了顶层依赖时，同步在这里补一条，
+# 否则 CI 会因为缺包走垫片路径而漏测。
+
+fastapi==0.141.1
+starlette==1.6.0
+uvicorn==0.38.0
+pydantic==2.13.5
+pydantic-settings==2.15.0
+bcrypt==5.0.0
+httpx==0.28.1
+python-multipart==0.0.32
+python-dotenv==1.2.3
+PyYAML==6.0.3
+PyJWT==2.10.1
+
+# Database（asyncpg 不在轻量集里 → 被垫片顶替；纯逻辑用 SQLAlchemy Core 即可）
+SQLAlchemy==2.0.54
+alembic==1.14.0
+
+# 文档 / 图片的**纯逻辑**路径
+pillow==12.3.0
+python-docx==1.2.0
+python-pptx==1.0.2
+openpyxl==3.1.5
+xlsxwriter==3.2.9
+numpy==2.5.3
+
+# 向量客户端（构造 payload / point id 的单测用）
+qdrant-client==1.19.1
+
+# LangGraph / LangChain 编排（graph 装配、topology 单测用）
+langchain==0.3.30
+langchain-community==0.3.27
+langchain-core==0.3.86
+langchain-ollama==0.3.10
+langchain-text-splitters==0.3.11
+langgraph==1.0.1
+langgraph-checkpoint==3.0.1
+langgraph-prebuilt==1.0.1
+langgraph-sdk==0.2.15
+
+# 测试工具
+pytest==9.1.1
+pyflakes==3.4.0

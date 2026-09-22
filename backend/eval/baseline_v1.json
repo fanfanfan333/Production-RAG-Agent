@@ -1,22 +1,22 @@
 {
   "golden_set": "golden-v1",
   "accepted_at": "2026-09-18T07:26:02Z",
-  "updated_at": "2026-09-18T08:15:00Z",
-  "revision": 2,
-  "revision_note": "rev2：修掉相对分带 OR→AND 的语义缺陷后复测。指标除 precision@5/10 与负例最高分外与 rev1 一致（修复只是让分带真正开始砍尾，不动召回）。",
+  "updated_at": "2026-09-21T09:33:38Z",
+  "revision": 4,
+  "revision_note": "rev4：**真实栈复跑重钉**（`scripts/run_eval_baseline.py`，admin 五维内容口径，top_k=10，15 例全部提交）。结论 **PASS**：recall@10=1.0 / mrr=1.0 / precision@3=0.8 / multi_evidence=1.0 / 负例 3/3 拒答；分带实测上界 0.062。**thresholds 与用例零改动**；与 rev3 的差异仅在 precision@5/@10（run-to-run 噪声，见 revalidation_rev4）。这一轮同时确认了「门禁已红但无人执行」为**假红**（检索质量零退化），并把门禁接进 CI 以防再次发生。",
   "note": "检索质量基线。此后任何改动都要用 scripts/run_eval_baseline.py 复跑并与本文件对比；低于 thresholds 即为回归。",
-  "measured_by": "scripts/run_eval_baseline.py（POST /eval/run，管理员口径，top_k=10）；rev2 由等效的进程内复测（evaluate + persist_eval_run）复核，结果一致且已落 eval_runs 表。",
-  "cases": 11,
-  "scored_cases": 11,
+  "measured_by": "scripts/run_eval_baseline.py（POST /eval/run，admin 五维内容口径，top_k=10，16 例全部提交）。容器内真实栈：rag_backend + postgres + qdrant + 宿主机 ollama；结果已落 eval_runs 表（cross-restart 可查，source=database）。",
+  "cases": 15,
+  "scored_cases": 15,
   "metrics": {
-    "recall@1": 0.9545,
+    "recall@1": 0.8333,
     "recall@3": 1.0,
     "recall@5": 1.0,
     "recall@10": 1.0,
     "precision@1": 1.0,
-    "precision@3": 0.8182,
-    "precision@5": 0.7985,
-    "precision@10": 0.7985,
+    "precision@3": 0.8,
+    "precision@5": 0.7411,
+    "precision@10": 0.7411,
     "mrr": 1.0,
     "map": 1.0,
     "ndcg@1": 1.0,
@@ -24,25 +24,34 @@
     "ndcg@5": 1.0,
     "ndcg@10": 1.0,
     "hit_rate@1": 1.0,
+    "hit_rate@3": 1.0,
+    "hit_rate@5": 1.0,
     "hit_rate@10": 1.0,
-    "avg_returned_chunks_per_case": 1.91
+    "avg_returned_chunks_per_case": null,
+    "avg_returned_chunks_per_case_note": "⚠️ 置 null 而非沿用 rev2 的 1.91：POST /eval/run 的响应**不聚合**单例 retrieved 计数（CaseResult.retrieved 只在进程内，未进 EvalRunResponse），该值无法从本轮回执恢复。rev2 的 1.91 属 11 例口径，与本文件 rev3 的 15 例口径不可比，故不沿用（沿用会制造假延续）。需要该值请用 band 段的逐例 retrieved（过滤关那一态）。"
   },
   "metric_reading_notes": {
-    "recall@1": "0.9545 = (10 例满分 + 1 例 0.5) / 11。唯一不满分的是『紫罗兰计划的年度预算是多少，由谁负责审批？』：两份同内容文档（紫罗兰计划-1z5pp.txt / -bjld8.txt，分属不同租户）各在 chunk 0，文本完全相同 → 精排分相同（0.9999），k=1 时只能取其一，故该例 recall@1=0.5。这是标注口径（命中任一即算对）决定的，不是检索缺陷。",
-    "avg_returned_chunks_per_case": "1.91 是相对分带收紧后的实测值（修复前为 2.09）。"
+    "recall@1": "0.8333 = (10 个单证据用例各 1.0 + 5 个双证据用例各 0.5) / 15。双证据用例在 k=1 时**最多只能命中两条金标中的一条**，故每例上限 0.5 —— 这是金标结构决定的，不是检索缺陷。k≥3 起全部为 1.0。",
+    "hit_rate@10": "1.0 = 15/15，每条用例都至少命中一条金标。",
+    "multi_evidence": "⚠️ 该切片是分带护栏的**行为侧**判据：5/5 用例全部 gold 召回（all_gold_found_rate=1.0），且这 5 例在**过滤开启**（生产口径）下就已 2/2 齐全 —— 即当前 ratio=0.05 没有砍掉任何合法次要证据。",
+    "与 rev2 数字不可比": "rev2 的 recall@1=0.9545 / precision@3=0.8182 是 **11 例**口径，且当时 ratio=0.10；rev3 是 **15 例**口径、ratio=0.05。跨版本直接比大小没有意义，判回归请只看 golden_v1.json 的 thresholds。"
   },
   "negative_cases": {
     "total": 3,
     "refused": 3,
-    "top_scores": [0.0, 0.0, 0.0005],
-    "note": "证据闸阈值 0.05。三条域外问题的精排最高分为 0.0 / 0.0 / 0.0005，距闸门 100 倍以上余量，拒答不依赖运气。第三条 0.0005 是『头名兜底』交出的那一条（非空不变量），远低于闸门，不构成泄漏。"
+    "top_scores": [
+      0.0,
+      0.0,
+      0.0007
+    ],
+    "note": "证据闸阈值 0.05。三条域外问题的精排最高分为 0.0 / 0.0 / 0.0007，距闸门 71 倍以上余量（rev3 实测 0.0007 略高于 rev2 的 0.0005，同量级，不构成泄漏）。第三条 0.0007 是『头名兜底』交出的那一条（非空不变量），远低于闸门。**口径已修正**：rev3 起负例检查与 /eval/run 使用**同一份五维 UserScope**（旧实现用三维 tenancy.request_scope，语料比端点更宽 —— 见 scope_basis）。"
   },
   "config_snapshot": {
     "hybrid_search": true,
     "reranker": true,
     "hierarchical_rag": true,
     "rerank_min_score": 0.05,
-    "rerank_min_score_ratio": 0.1,
+    "rerank_min_score_ratio": 0.05,
     "rerank_min_score_filter": true,
     "evidence_gate_min_top_score": 0.05,
     "retrieval_min_score": 0.3,
@@ -50,19 +59,78 @@
     "multi_query_max_extra": 4,
     "query_rewrite_enabled": true,
     "acl_prefilter_enabled": true,
-    "parent_score_decay": 0.85
+    "parent_score_decay": 0.85,
+    "hybrid_keyword_backend": "postgres"
   },
   "rerank_band_sweep": {
     "why": "RERANK_MIN_SCORE_RATIO 的取值 0.10 原先没有数据支撑。扫一遍 7 档，用它来回答『该旋钮是否需要调』。",
     "fixed_bug": "旧实现把判据写成 `score >= min_score or score >= band`。因 band = best*ratio ≤ best，OR 使分带**只能放宽、永不收紧**：实测 7 档指标逐位相同（avg_returned 全为 2.09），同时把生效下限降成 min(min_score, best*ratio)（best=0.22 时 0.05 被悄悄降为 0.022），废掉了『距噪声 100 倍』的校准前提。修成 AND 后分带立即分化。",
     "arms_after_fix": [
-      {"ratio": 0.00, "recall@10": 1.0, "recall@3": 1.0, "mrr": 1.0, "precision@3": 0.8182, "avg_returned": 2.09, "negatives_refused": "3/3"},
-      {"ratio": 0.05, "recall@10": 1.0, "recall@3": 1.0, "mrr": 1.0, "precision@3": 0.8182, "avg_returned": 2.09, "negatives_refused": "3/3"},
-      {"ratio": 0.10, "recall@10": 1.0, "recall@3": 1.0, "mrr": 1.0, "precision@3": 0.8182, "avg_returned": 1.91, "negatives_refused": "3/3", "is_current": true},
-      {"ratio": 0.15, "recall@10": 1.0, "recall@3": 1.0, "mrr": 1.0, "precision@3": 0.8182, "avg_returned": 1.91, "negatives_refused": "3/3"},
-      {"ratio": 0.20, "recall@10": 1.0, "recall@3": 1.0, "mrr": 1.0, "precision@3": 0.8485, "avg_returned": 1.64, "negatives_refused": "3/3"},
-      {"ratio": 0.30, "recall@10": 1.0, "recall@3": 1.0, "mrr": 1.0, "precision@3": 0.8939, "avg_returned": 1.55, "negatives_refused": "3/3"},
-      {"ratio": 0.50, "recall@10": 1.0, "recall@3": 1.0, "mrr": 1.0, "precision@3": 0.9091, "avg_returned": 1.27, "negatives_refused": "3/3"}
+      {
+        "ratio": 0.0,
+        "recall@10": 1.0,
+        "recall@3": 1.0,
+        "mrr": 1.0,
+        "precision@3": 0.8182,
+        "avg_returned": 2.09,
+        "negatives_refused": "3/3"
+      },
+      {
+        "ratio": 0.05,
+        "recall@10": 1.0,
+        "recall@3": 1.0,
+        "mrr": 1.0,
+        "precision@3": 0.8182,
+        "avg_returned": 2.09,
+        "negatives_refused": "3/3"
+      },
+      {
+        "ratio": 0.1,
+        "recall@10": 1.0,
+        "recall@3": 1.0,
+        "mrr": 1.0,
+        "precision@3": 0.8182,
+        "avg_returned": 1.91,
+        "negatives_refused": "3/3",
+        "is_current": false,
+        "_was_current_in_rev2": true
+      },
+      {
+        "ratio": 0.15,
+        "recall@10": 1.0,
+        "recall@3": 1.0,
+        "mrr": 1.0,
+        "precision@3": 0.8182,
+        "avg_returned": 1.91,
+        "negatives_refused": "3/3"
+      },
+      {
+        "ratio": 0.2,
+        "recall@10": 1.0,
+        "recall@3": 1.0,
+        "mrr": 1.0,
+        "precision@3": 0.8485,
+        "avg_returned": 1.64,
+        "negatives_refused": "3/3"
+      },
+      {
+        "ratio": 0.3,
+        "recall@10": 1.0,
+        "recall@3": 1.0,
+        "mrr": 1.0,
+        "precision@3": 0.8939,
+        "avg_returned": 1.55,
+        "negatives_refused": "3/3"
+      },
+      {
+        "ratio": 0.5,
+        "recall@10": 1.0,
+        "recall@3": 1.0,
+        "mrr": 1.0,
+        "precision@3": 0.9091,
+        "avg_returned": 1.27,
+        "negatives_refused": "3/3"
+      }
     ],
     "decision": "维持 0.10，不上调。",
     "decision_reasoning": [
@@ -72,17 +140,228 @@
       "经验安全上界：已知合法金标分可低至 0.22（回归哨兵用例），已知头名最高 0.9999 → 跨用例上限 = 0.22/0.9999 = 0.2200（留 25% 稳健折扣 → 0.165）。0.10 在包线内且余量充足。"
     ],
     "cross_case_safe_ceiling": 0.22,
-    "recommended_upper_bound_with_margin": 0.165
+    "recommended_upper_bound_with_margin": 0.165,
+    "_status": "historical（rev2 口径，11 例金标 + ratio 0.10 时代）。**数据保留供追溯**，但其中的 is_current / decision 已失效 —— 当前口径见 band_headroom_measured_rev3 与 golden_v1.json 的 multi_evidence 段。",
+    "decision_superseded_by": "band_headroom_measured_rev3"
   },
   "context": {
     "why_this_baseline_exists": "建立它之前 /eval/history 恒为空：评测结果只存在进程内 deque 里，后端一重启就丢，于是『改完是变好还是变坏』无法回答。现在评测结果落 eval_runs 表，重启后仍在（已实测：source=database）。",
     "what_it_guards": [
-      "recall@10 不得低于 1.0（11 条正例必须全部召回）",
+      "recall@10 不得低于 1.0（可达正例必须全部召回）",
       "mrr 不得低于 0.95（首条命中不得退化）",
       "precision@3 不得低于 0.75（防止为了召回把噪声堆进 top-3）",
-      "3 条负例必须全部拒答（防止用『放低阈值换召回』刷分）"
+      "multi_evidence_all_found_rate 不得低于 1.0（分带不得误杀次要证据 —— 行为侧判据）",
+      "3 条负例必须全部拒答（防止用『放低阈值换召回』刷分）",
+      "RERANK_MIN_SCORE_RATIO 必须严格小于 declared(0.07) 且小于**本轮实测**上界（数值侧判据）"
     ],
-    "known_regression_sentinel": "用例『各期交付物和完成时间分别是什么？』对应的块精排分只有 0.22，是历史上被阈值误杀的那一块，必须长期留在集里。",
-    "known_limitation": "⚠️ 本金标集**结构上无法度量相对分带的风险**：11 个用例里每个用例的金标块都恰好是精排第 1 名（gold == head），因此 gold/head 恒等于 1.0，分带开到 1.0 也测不出误杀。换言之『提高 ratio 在金标集上不损召回』是恒真的，不能作为上调依据。要真正评估分带，需要补**多证据用例**——答案需要 2 个以上分片、且第二个分片的精排分明显低于头名（如『对比 A 与 B 的差异』『完整列出各项…』）。这是下一轮该做的事。"
+    "known_regression_sentinel": "用例『各期交付物和完成时间分别是什么？』对应的块精排分只有 0.22，是历史上被阈值误杀的那一块，必须长期留在集里。（rev3 复核：该块所在的多证据复合问句实测 头名 0.8195 / 次证 0.0876，仍是最弱的一环，比值 0.1069 是 ratio 的第二道天然上界。）",
+    "known_limitation": "1. **语料可见性覆盖不全**：admin 口径只看得到 3/9 份（且金标只覆盖其中 2 份）；测试公司文档（紫罗兰计划×2 / 探测载体×2）自『测试公司内容不可消费』规则起对 admin 也不可见 —— 一条金标用例因此不可达并被 harness 剔除（见 scope_basis）。要覆盖须按归属人 / 测试公司成员 scope 分别评测（多 scope 评测尚未实现）。2. **多证据用例只覆盖同文档内跨分节**，没有跨文档多证据用例（admin 可见且内容互补的文档对不存在）。3. **绝对下限余量偏薄且仍在变薄**：最弱合法证据 0.0541 vs 下限 0.05（1.08 倍，rev3 实测；rev3 校准时为 1.16 倍）。见 band_headroom_measured_rev3.drift_warning。4. 负例只有 3 条，且都是『域外事实』型；『同域但库内无可答内容』型只有 1 条。"
+  },
+  "golden_cases_total": 16,
+  "excluded_unattainable_cases": 1,
+  "scope_basis": {
+    "why_recorded": "金标的『可达性』取决于**评测口径**，而口径变过。不记下来，下一次看到 recall 掉了就无法判断是检索变差还是权限变窄 —— 本轮的假红正是这么来的。",
+    "current": "request_security_scope（五维）→ tenancy.content_scope → exclude_test_tenants",
+    "admin_scope_rev3": {
+      "tenant_ids": [
+        "default"
+      ],
+      "owns_tenant_ids": [],
+      "department_id": null,
+      "tenant_wide": true,
+      "clearance": 3
+    },
+    "unattainable_labels": {
+      "count": 2,
+      "case": "紫罗兰计划的年度预算是多少，由谁负责审批？",
+      "gate": "tenant",
+      "reason": "tenant_mismatch",
+      "filenames": [
+        "紫罗兰计划-1z5pp.txt",
+        "紫罗兰计划-bjld8.txt"
+      ],
+      "note": "两条标注所在租户（c8111de986583 / cfb08c53677c4）∈ test_tenant_ids()，被内容口径剔除 → admin 不可达。harness 已改为：不可达标注进 unattainable、整条用例从评分集剔除但不判回归（权限事实 ≠ 检索质量回归）。"
+    },
+    "history": "eval_runs 里 recall@10 最后一次为 1.0 是 2026-09-18T08:55:29Z（16 例口径）；自 2026-09-19T04:03:41Z 起恒为 0.9375 至今。该时间窗内的提交是可见性内核重构：9ebdd01（2026-09-18 18:23『公司注册表基础设施 + 可见性内核替换 platform_wide → tenant_ids/owns_tenant_ids』）、ded3f74 与 5cdee51（2026-09-19『admin 检索收敛与测试公司隔离』/『admin 可见集补回所属租户 default』），以及 4231fac（2026-09-21『请求级五维数据隔离』，评测端点由此切到五维 —— 当前口径的直接来源）。结论：这是**权限范围收窄**，不是检索质量退化（single_evidence 切片在整段时间里始终 1.0）。"
+  },
+  "band_headroom_measured_rev3": {
+    "at": "2026-09-21T08:08:00Z（rev3 实测，态 B=关闭阈值过滤）",
+    "current_ratio": 0.05,
+    "measured_safe_ceiling": 0.062,
+    "declared_ceiling_in_golden": 0.07,
+    "guard_constant": 0.07,
+    "margin_vs_current": 1.24,
+    "multi_evidence_cases_measured": 5,
+    "cases_fully_found_without_filter": 5,
+    "weakest_legal_secondary_score": 0.0541,
+    "weakest_legal_secondary_ratio_vs_floor": 1.08,
+    "drift_warning": "⚠️ **余量在侵蚀，必须记录**：rev3 口径下最弱合法次要证据是 **0.0541**（= ratio 0.062 × 头名 0.8724），而 golden rev3 校准时是 0.0582 —— 距绝对下限 RERANK_MIN_SCORE=0.05 的余量由 **1.16 倍薄到 1.08 倍**。同源：实测分带上界由 0.07 降到 **0.062**，已低于 golden 里声明的 0.07。两者都仍**通过**（ratio=0.05 < 0.062；0.05 < 0.0541），且 harness 每次都实测对账，所以**本次不动任何阈值** —— 按实测去收紧 0.07→0.06 只会把只剩 3% 的噪声余量当门槛，反而更脆。但换精排模型 / 换语料 / 动 PARENT_SCORE_DECAY 前后**必须**重跑本项并对齐常量。"
+  },
+  "input_fingerprint": {
+    "schema": 1,
+    "algo": "sha256",
+    "generated_at": "2026-09-21T09:20:25.758770+00:00",
+    "why": "检索质量基线的**输入指纹**：这些输入没变，baseline 的 metrics 才作数。任何一项变了而本对象未重钉 → scripts/check_eval_baseline_freshness.py 判红。本对象只记录证据，不约束业务（阈值以 golden_v1.json 的 thresholds 为准）。",
+    "config_defaults": {
+      "HYBRID_SEARCH_ENABLED": true,
+      "RERANKER_ENABLED": true,
+      "HIERARCHICAL_RAG_ENABLED": true,
+      "RERANK_MIN_SCORE": 0.05,
+      "RERANK_MIN_SCORE_RATIO": 0.05,
+      "RERANK_MIN_SCORE_FILTER": true,
+      "EVIDENCE_GATE_MIN_TOP_SCORE": 0.05,
+      "RETRIEVAL_MIN_SCORE": 0.3,
+      "RETRIEVAL_MAX_GAP": 0.05,
+      "MULTI_QUERY_MAX_EXTRA": 4,
+      "QUERY_REWRITE_ENABLED": true,
+      "ACL_PREFILTER_ENABLED": true,
+      "PARENT_SCORE_DECAY": 0.85,
+      "HYBRID_KEYWORD_BACKEND": "postgres",
+      "RETRIEVAL_TOP_K": 5,
+      "ANN_OVERFETCH_FACTOR": 4,
+      "RERANKER_MAX_CANDIDATES": 20,
+      "RERANKER_MAX_TEXT_CHARS": 1200,
+      "RERANKER_USE_QUERY_VARIANTS": false,
+      "HYBRID_RRF_K": 60,
+      "EVIDENCE_GATE_MIN_COVERAGE": 0.2,
+      "PARENT_CHILD_MAX_PER_PARENT": 2,
+      "RETRIEVAL_CONTENT_DEDUP_ENABLED": true,
+      "EVIDENCE_TRUST_ENABLED": true,
+      "EVIDENCE_TRUST_RERANK_WEIGHT": 0.15,
+      "MULTI_QUERY_ENABLED": true,
+      "QUERY_HYDE_ENABLED": true,
+      "QUERY_DECOMPOSITION_ENABLED": true,
+      "METADATA_FILTER_ENABLED": true,
+      "MIN_CHUNK_SIZE": 500,
+      "MAX_CHUNK_SIZE": 2000,
+      "CHUNK_OVERLAP": 200,
+      "CHUNK_TOKEN_AWARE": true,
+      "CHARS_PER_TOKEN": 1.6,
+      "CHUNK_PARENT_SIZE_MULT": 2.5,
+      "CHUNK_PARENT_OVERLAP": 200,
+      "SECURITY_STRICT_MODE": false,
+      "DEFAULT_SECURITY_LEVEL": 1
+    },
+    "config_effective": {
+      "HYBRID_SEARCH_ENABLED": true,
+      "RERANKER_ENABLED": true,
+      "HIERARCHICAL_RAG_ENABLED": true,
+      "RERANK_MIN_SCORE": 0.05,
+      "RERANK_MIN_SCORE_RATIO": 0.05,
+      "RERANK_MIN_SCORE_FILTER": true,
+      "EVIDENCE_GATE_MIN_TOP_SCORE": 0.05,
+      "RETRIEVAL_MIN_SCORE": 0.3,
+      "RETRIEVAL_MAX_GAP": 0.05,
+      "MULTI_QUERY_MAX_EXTRA": 4,
+      "QUERY_REWRITE_ENABLED": true,
+      "ACL_PREFILTER_ENABLED": true,
+      "PARENT_SCORE_DECAY": 0.85,
+      "HYBRID_KEYWORD_BACKEND": "postgres",
+      "RETRIEVAL_TOP_K": 5,
+      "ANN_OVERFETCH_FACTOR": 4,
+      "RERANKER_MAX_CANDIDATES": 20,
+      "RERANKER_MAX_TEXT_CHARS": 1200,
+      "RERANKER_USE_QUERY_VARIANTS": false,
+      "HYBRID_RRF_K": 60,
+      "EVIDENCE_GATE_MIN_COVERAGE": 0.2,
+      "PARENT_CHILD_MAX_PER_PARENT": 2,
+      "RETRIEVAL_CONTENT_DEDUP_ENABLED": true,
+      "EVIDENCE_TRUST_ENABLED": true,
+      "EVIDENCE_TRUST_RERANK_WEIGHT": 0.15,
+      "MULTI_QUERY_ENABLED": true,
+      "QUERY_HYDE_ENABLED": true,
+      "QUERY_DECOMPOSITION_ENABLED": true,
+      "METADATA_FILTER_ENABLED": true,
+      "MIN_CHUNK_SIZE": 500,
+      "MAX_CHUNK_SIZE": 2000,
+      "CHUNK_OVERLAP": 200,
+      "CHUNK_TOKEN_AWARE": true,
+      "CHARS_PER_TOKEN": 1.6,
+      "CHUNK_PARENT_SIZE_MULT": 2.5,
+      "CHUNK_PARENT_OVERLAP": 200,
+      "SECURITY_STRICT_MODE": false,
+      "DEFAULT_SECURITY_LEVEL": 1
+    },
+    "config_effective_env_present": true,
+    "env_overrides": {},
+    "models_defaults": {
+      "embedding_model": "BAAI/bge-large-zh-v1.5",
+      "embedding_dimension": 1024,
+      "reranker_model": "BAAI/bge-reranker-base",
+      "ollama_chat_model": "qwen3:8b",
+      "ollama_vision_model": "qwen2.5vl:7b"
+    },
+    "models_effective": {
+      "embedding_model": "BAAI/bge-large-zh-v1.5",
+      "embedding_dimension": 1024,
+      "reranker_model": "BAAI/bge-reranker-base",
+      "ollama_chat_model": "qwen3:8b",
+      "ollama_vision_model": "qwen2.5vl:3b"
+    },
+    "corpus": {
+      "documents": [
+        "研发部-2024年度技术方案-2e19.docx",
+        "Python AI大模型成神手册 (1).docx",
+        "A公司-印章使用与档案归档操作手册-李四.docx",
+        "B公司-2024年第四季度经营分析报告-王五.docx",
+        "B公司-固定资产盘点与办公用品领用规范-某某.docx",
+        "紫罗兰计划-1z5pp.txt",
+        "紫罗兰计划-bjld8.txt",
+        "探测载体-1z5pp.txt",
+        "探测载体-bjld8.txt"
+      ],
+      "sha256": "b4963fa22f2dda0de522277b5e7991c6d4b88b9585a7a476d78d74a377681135"
+    },
+    "thresholds_sha256": "49f8065cbf7cc51d33dc7089e34da6d910a9e365eb2583435a2a21a64724187c",
+    "config_snapshot_sha256": "393adfc2efe48ba9e47fd1da9050e5c3e12c37381ca989442a490082118f09f4",
+    "fingerprint_sha256": "f757277b0970f925d087da5e5d2ae284f088bb2e730d3b43e9aed581ab2cc673",
+    "check_scope": "纯逻辑：只读 app/config.py 类默认值 / backend/.env / app/services/reranker.py 接线 / golden_v1.json 语料与阈值；不需要真实栈。"
+  },
+  "revalidation_rev4": {
+    "at": "2026-09-21T09:33:38Z",
+    "by": "scripts/run_eval_baseline.py（容器内真实栈：rag_backend + postgres + qdrant + 宿主机 ollama）",
+    "verdict_passed": true,
+    "exit_code": 0,
+    "wall_seconds": 578.1,
+    "cases_scored": 15,
+    "measured": {
+      "recall@10": 1.0,
+      "mrr": 1.0,
+      "precision@3": 0.8,
+      "ndcg@10": 1.0,
+      "multi_evidence_all_found_rate": 1.0,
+      "negatives_refused": "3/3",
+      "band_measured_safe_ceiling": 0.062
+    },
+    "delta_vs_previous_revision": {
+      "precision@5": {
+        "rev3": 0.7444,
+        "rev4": 0.7411
+      },
+      "precision@10": {
+        "rev3": 0.7324,
+        "rev4": 0.7411
+      }
+    },
+    "unattainable": {
+      "count": 2,
+      "items": [
+        {
+          "query": "紫罗兰计划的年度预算是多少，由谁负责审批？",
+          "filename": "紫罗兰计划-1z5pp.txt",
+          "gate": "tenant",
+          "reason": "tenant_mismatch"
+        },
+        {
+          "query": "紫罗兰计划的年度预算是多少，由谁负责审批？",
+          "filename": "紫罗兰计划-bjld8.txt",
+          "gate": "tenant",
+          "reason": "tenant_mismatch"
+        }
+      ]
+    },
+    "eval_persisted_to_db": true,
+    "raw_report": "_rk_eval_report_run1.json（宿主工作区，未入库）",
+    "note": "本轮**未改任何阈值**。差异仅出现在 precision@5/@10 这类受单例命中次序影响的指标上，属 run-to-run 噪声：recall / mrr / ndcg / multi_evidence / 负例 / 分带全部与上一版一致。"
   }
 }

@@ -183,6 +183,8 @@ def build_context(
     # ── 【T4】第 12 环对象级最终校验（未给 pred 时整段跳过，零行为变化）────────
     acl_status = "clean"
     dropped_count = 0
+    # 逐文档物化结论；提升到 if 之外，供下面的父块复核（发现问题 #14）复用。
+    mat_map: dict[str, bool] = {}
     if pred is not None and view_index is not None:
         from app.services.nodes.final_check_node import filter_chunks_by_acl
 
@@ -234,6 +236,7 @@ def build_context(
     masked = 0
     expanded = 0
     compressed = 0
+    parent_blocked = 0
 
     for chunk in chunks:
         # ── small-to-big 回填：命中子块后，把父块完整文本交给 LLM ──────────
@@ -241,8 +244,16 @@ def build_context(
         # 所以这里换成父块文本。父块不存在就退回子块，不影响功能。
         body = chunk.text
         if use_parent and chunk.parent_text:
-            body = chunk.parent_text
-            expanded += 1
+            # 【#14】父块正文同样要过对象级判定：子块可见 ≠ 父块可见。不可见时
+            # 退回子块正文（少一层上下文，而不是少一条证据，更不是把提级的整节
+            # 正文送出去）。判定与 multimodal 组装入口**共用同一函数**。
+            from app.services.nodes.final_check_node import parent_block_allows
+
+            if parent_block_allows(chunk, pred, view_index, mat_map):
+                body = chunk.parent_text
+                expanded += 1
+            else:
+                parent_blocked += 1
 
         # 检索到的文本是数据，绝不能当成指令 —— 注入清洗（压缩之前做，
         # 被屏蔽的注入段落就不会作为"相关句"被压缩器重新选中）
@@ -351,6 +362,14 @@ def build_context(
         logger.info(
             "Context builder expanded %d/%d chunk(s) to parent context (small-to-big)",
             expanded, len(chunks),
+        )
+    if parent_blocked:
+        # 这是一条**安全剔除**的留痕：父块被单独提级 / 剔除，正文不再进 LLM。
+        # 打在 WARNING 上，运维看日志就知道"不是回填坏了，是权限拦下了"。
+        logger.warning(
+            "Context builder blocked %d parent block(s) by object-level ACL "
+            "(small-to-big fell back to child text)",
+            parent_blocked,
         )
     if compressed:
         logger.info(

@@ -415,6 +415,16 @@ async def _retrieve_node(state: MasterState) -> dict:
     # 传入（见 _rewrite_node 的说明），fan-out 在 retrieve_chunks 内部发生 ——
     # 三腿闭包共用同一个 frozen ``scope``，不存在"某个子查询绕过 Scope"的物理路径。
     # scope 缺失（旧调用点 / 单元测试）→ retrieve_chunks_scoped fail-closed 返回空。
+    #
+    # 【发现问题 #15】缺失时在这里**显式 ERROR**（带用户与问题，便于定位是哪条请求
+    # 漏签），而不是让用户只看到"知识库没有相关内容"。retrieval_service 内部那条
+    # 日志没有请求上下文，两者互补。
+    if state.get("user_scope") is None:
+        logger.error(
+            "master_retrieve: user_scope is None — fail-closed (empty result). "
+            "user=%s conversation=%s query=%r",
+            state.get("user_id"), state.get("conversation_id"), raw_query[:80],
+        )
     chunks = await retrieve_chunks(
         query=safe_query,
         scope=state.get("user_scope"),

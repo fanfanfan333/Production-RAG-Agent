@@ -48,6 +48,14 @@ from app.services.security_policy import (
     P_ACL_EXPIRES_AT_TS,
     ObjectACLView,
 )
+# 三层知识库的取值域。规范归属是 tenancy（``normalize_access_level`` 也在那里），
+# security_policy 已经从同一处导入 —— 这里复用同一份常量，不另写字面量。
+# tenant 是硬边界、department 是中间层，两者参与对象级可见性判定（见 _source_gate）。
+from app.services.tenancy import (
+    ACCESS_DEPARTMENT,
+    ACCESS_PRIVATE,
+    ACCESS_TENANT,
+)
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -117,6 +125,41 @@ def _raw_from_object_id(object_id: str, document_id: str) -> str | None:
     if object_id.startswith(marker):
         return object_id[len(marker):]
     return object_id     # OBJECT_ID_MODE='raw' 时 object_id 即 raw_object_id
+
+
+def _payload_from_row(row: Mapping[str, Any]) -> dict:
+    """由 ``document_objects`` 行派生 Qdrant payload 副本（**唯一**构造点）.
+
+    第 11 环 ``allows()`` 读的是 Qdrant payload（``ObjectACLView.from_payload``），
+    所以这组物化字段必须与 PG 行**逐字同源**。所有对象类型（分块 / 图片 / 派生）
+    共用这一个函数，杜绝"分块行写了、图片行漏写"这类只在某一类对象上暴露的分叉。
+    """
+    return {
+        "object_id": row["object_id"],
+        "object_type": row["object_type"],
+        "parent_object_id": row["parent_object_id"],
+        "inherited_from": row["inherited_from"],
+        "visibility_mode": row["visibility_mode"],
+        "project_ids": sorted(row["project_ids"]),
+        "security_level": row["security_level"],
+        "parent_security_level": row["parent_security_level"],
+        "effective_security_level": row["effective_security_level"],
+        "acl_allow": sorted(row["acl_allow"]),
+        "acl_deny": sorted(row["acl_deny"]),
+        "acl_expires_at": (
+            row["acl_expires_at"].isoformat()
+            if isinstance(row["acl_expires_at"], datetime)
+            else None
+        ),
+        P_ACL_EXPIRES_AT_TS: (
+            row["acl_expires_at"].timestamp()
+            if isinstance(row["acl_expires_at"], datetime)
+            else None
+        ),
+        "excluded": row["excluded"],
+        "acl_sync_state": row["acl_sync_state"],
+        "share_status": row["share_status"],
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -222,34 +265,47 @@ def build_object_rows(
     # ── 2. 图片对象（同一 image_id 只建一行；一图多块时后者合并）────────────────
     image_rows: dict[str, dict] = {}
 
-    def _ensure_image_row(image_id: str, payload: Mapping[str, Any]) -> dict:
+    def _ensure_image_row(
+        image_id: str, payload: Mapping[str, Any], point_id: str | None
+    ) -> dict:
         obj_id = make_object_id(doc_id, image_id, object_type=OBJECT_TYPE_IMAGE)
         row = image_rows.get(obj_id)
-        if row is not None:
-            return row
-        row = _base_row(obj_id, OBJECT_TYPE_IMAGE)
-        row.update(
-            parent_object_id=doc_id,
-            inherited_from=doc_id,
-            parent_security_level=doc_level,
-            image_id=image_id,
-            image_path=_norm(payload.get("image_path")),
-            content_type=_norm(payload.get("content_type")) or "image",
-            page_number=_as_int(payload.get("page_number")),
-        )
-        image_rows[obj_id] = row
-        rows.append(row)
-        stats["image"] += 1
+        if row is None:
+            row = _base_row(obj_id, OBJECT_TYPE_IMAGE)
+            row.update(
+                parent_object_id=doc_id,
+                inherited_from=doc_id,
+                parent_security_level=doc_level,
+                image_id=image_id,
+                image_path=_norm(payload.get("image_path")),
+                content_type=_norm(payload.get("content_type")) or "image",
+                page_number=_as_int(payload.get("page_number")),
+            )
+            image_rows[obj_id] = row
+            rows.append(row)
+            stats["image"] += 1
+        # 图片对象的 Qdrant 点 id：**只有图片本体块**才是那个点。OCR 派生块
+        # （content_type=text/table/code）同样带 image_id，但它各自有独立的点 ——
+        # 拿它的点 id 去 set_payload 会把图片对象的 ACL 误写到派生块上，必须区分。
+        # 图片本体块的 content_type 为 "image"；老数据可能为空，一并按本体处理。
+        ctype = _norm(payload.get("content_type"))
+        if point_id and ctype in (None, "", "image"):
+            row["_point_id"] = point_id
+        # 载荷与 PG 行同源（与分块行共用 _payload_from_row，键恒等）；point_id 缺失时
+        # push_payload_async 会跳过该行，不会误推。
+        row["_payload"] = _payload_from_row(row)
         return row
 
     for p in points:
-        payload = (p.get("payload") or {}) if isinstance(p, Mapping) else {}
+        if not isinstance(p, Mapping):
+            continue
+        payload = p.get("payload") or {}
         image_id = _norm(payload.get("image_id"))
         if not image_id:
             continue
         # 只要看到 image_id 就为该图建行：图片本体块会走到这里；
         # OCR 派生块（content_type=table/code/text）也意味着一张源图存在。
-        _ensure_image_row(image_id, payload)
+        _ensure_image_row(image_id, payload, _norm(p.get("id")))
 
     # ── 3. 分块对象（含 OCR 派生取严）───────────────────────────────────────────
     seen_chunk_index: dict[tuple[str, int], str] = {}
@@ -316,38 +372,17 @@ def build_object_rows(
                 seen_chunk_index[key] = obj_id
 
         row["_point_id"] = point_id
-        row["_payload"] = {
-            "object_id": obj_id,
-            "object_type": object_type,
-            "parent_object_id": row["parent_object_id"],
-            "inherited_from": row["inherited_from"],
-            "visibility_mode": row["visibility_mode"],
-            "project_ids": sorted(row["project_ids"]),
-            "security_level": row["security_level"],
-            "parent_security_level": row["parent_security_level"],
-            "effective_security_level": row["effective_security_level"],
-            "acl_allow": sorted(row["acl_allow"]),
-            "acl_deny": sorted(row["acl_deny"]),
-            "acl_expires_at": (
-                row["acl_expires_at"].isoformat()
-                if isinstance(row["acl_expires_at"], datetime)
-                else None
-            ),
-            P_ACL_EXPIRES_AT_TS: (
-                row["acl_expires_at"].timestamp()
-                if isinstance(row["acl_expires_at"], datetime)
-                else None
-            ),
-            "excluded": row["excluded"],
-            "acl_sync_state": row["acl_sync_state"],
-            "share_status": row["share_status"],
-        }
+        row["_payload"] = _payload_from_row(row)
         rows.append(row)
 
     # ── 4. 父块对象（设计 §19.2-A）───────────────────────────────────────────────
     # small-to-big 回填的父块正文也进 LLM，必须与其它对象同一套判定。父块自身没有
     # security_level 列 ⇒ 以文档密级为基线（父块 ≡ 文档），owner/department 取父块行
     # （历史行可能为空 → 回落文档行）；acl_allow 恒空（派生不得单独放行）。
+    # ⚠️ 父块在 Qdrant 里**没有对应的向量点**（实测载荷 content_type 仅 table/text/
+    #    image），父块正文按 parent_id 从 chunk_parents 表回填，不来自向量库 ⇒ 这里
+    #    只写 PG 行、**不写** `_point_id` / `_payload`（无点可推，也无需推）。切勿
+    #    顺手补 `_payload`——那会指向不存在的点。
     seen_parent_ids: set[str] = set()
     for parent in parents or []:
         parent_id = _norm(_doc_get(parent, "parent_id"))
@@ -479,6 +514,78 @@ async def materialize_document_objects(
     if push_payload:
         await push_payload_async(rows)
     return stats
+
+
+async def mark_materialization_failed(
+    document_id: uuid.UUID | str,
+    *,
+    reason: str = "materialize_failed",
+    session: Any = None,
+) -> dict:
+    """
+    对象级物化失败时的**显式标记**（发现问题 #5）.
+
+    为什么必须有：物化失败原本只写一条日志，文档照常标 ``COMPLETED`` —— 前端一切
+    正常、检索也"能跑"，但 ``document_objects`` 缺行（``filter_chunks_by_acl`` 对
+    **从未物化**的文档按"缺行回退允许"处理）意味着这份文档的对象级保护**永久失效**，
+    而且没有任何入口能发现它、也没有重跑入口。这是最危险的一类静默失效：不报错、
+    不告警、面板上看不见，只有"越是该挡住的内容越出得来"。
+
+    标记落在 ``documents.acl_sync_state``（**已有索引** ``ix_documents_acl_sync_state``）
+    以及该文档已有的对象行上，取 ``stale`` —— 与 :func:`sync_doc_row` 判失败时同一
+    取值与同一条查询路径：:
+
+        SELECT id, filename FROM documents WHERE acl_sync_state <> 'synced';
+
+    重跑入口：``scripts/rematerialize_document_objects.py``（默认 dry-run）。
+
+    **永不抛**：标记失败只记日志。真正的失败已经在调用方的日志里，标记是补一道
+    可查询的信号，不该再制造一个新的失败点。
+    """
+    counts = {"document_rows": 0, "object_rows": 0}
+    try:
+        from sqlalchemy import update
+
+        from app.db.models import Document
+        from app.db.security_models import DocumentObject
+
+        doc_uuid = (
+            document_id if isinstance(document_id, uuid.UUID) else uuid.UUID(str(document_id))
+        )
+
+        async def _run(sess: Any) -> None:
+            res = await sess.execute(
+                update(Document)
+                .where(Document.id == doc_uuid)
+                .values(acl_sync_state=ACL_SYNC_STALE)
+            )
+            counts["document_rows"] = int(res.rowcount or 0)
+            res = await sess.execute(
+                update(DocumentObject)
+                .where(DocumentObject.document_id == doc_uuid)
+                .values(
+                    acl_sync_state=ACL_SYNC_STALE,
+                    updated_at=datetime.now(timezone.utc),
+                )
+            )
+            counts["object_rows"] = int(res.rowcount or 0)
+
+        if session is not None:
+            await _run(session)
+        else:
+            from app.db.postgres import get_db_session
+
+            async with get_db_session() as sess:
+                await _run(sess)
+        logger.error(
+            "object ACL materialization marked stale (reason=%s, doc=%s, "
+            "object_rows=%d) — query 'acl_sync_state <> synced' and re-run "
+            "scripts/rematerialize_document_objects.py",
+            reason, doc_uuid, counts["object_rows"],
+        )
+    except Exception:      # noqa: BLE001 — 标记是旁路，绝不再制造新的失败点
+        logger.exception("mark_materialization_failed failed (doc=%s)", document_id)
+    return counts
 
 
 async def sync_doc_row(
@@ -615,6 +722,145 @@ async def sync_doc_row(
     # payload 副本异步追平（失败置 stale，不阻断请求）
     await _push_document_payload(document_id, session=session)
     return result
+
+
+async def sync_access_level(
+    document_id: uuid.UUID | str,
+    *,
+    access_level: str,
+    department_id: str | None,
+    session: Any = None,
+) -> int:
+    """
+    把 ``documents.access_level`` / ``department_id`` 同步到该文档**全部**
+    ``document_objects`` 行（幂等，返回被改写的行数）.
+
+    为什么必须有这一步
+    ──────────────────
+    三层知识库的**对象级**可见性判定读的是 ``document_objects`` 的这两列，而
+    "发布 / 收回 / 转为部门文档"改的是 ``documents`` 行。对象行是**入库那一刻的
+    快照**：文档在入库时必然是 private，之后无论被提到部门库还是公司库，对象行
+    都还写着 private。
+
+        document_objects   access_level='private'   ← 第 11 / 12 环 allows()、
+                                                      GET /documents/{id}/chunks
+                                                      的逐块复核读的是这一份
+        documents          access_level='department' ← 列表 / 详情 / 权限判断读这一份
+
+    表现极具欺骗性（这正是它长期没被发现的原因）：
+
+        * 列表里看得见、点得开、文档级判定全对（那走 ``documents`` 行）；
+        * 但"原文预览"逐块复核 → 除 owner 外**返回 0 条分块**，界面显示成
+          "该文档暂无索引内容（可能仍在处理中）"，看起来像入库没跑完；
+        * 检索第 11 / 12 环逐块 ``allows()`` → 该文档**全部 chunk 被丢弃**，
+          表现为"知识库里检索不到这份刚刚共享出去的文档"。
+
+    只影响**非 owner** —— ``allows()`` 的 ``_source_gate`` 对 owner 恒放行，
+    所以文档作者自己永远测不出来，必须换一个账号才复现。
+
+    与本函数配套的另一半在 ``vector_service.update_document_access_payload``
+    （Qdrant 副本）；两处都做完，"PG 行 / 对象行 / 向量副本"三者才重新一致。
+
+    ``department_id`` 与 :func:`knowledge_tier_service.set_document_access_level`
+    同一口径：只有部门库保留部门归属，个人库 / 公司库一律清空（避免旧部门值
+    残留导致日后误判）。
+
+    刻意**只改这两列**：``acl_allow`` / ``effective_security_level`` / ``excluded``
+    属于密级与 need-to-know 维度，改动它们会牵动 ``derive_child_fields`` 的取严
+    级联（那是 :func:`sync_doc_row` 的职责）。层级变更不该顺手清空派生对象的
+    授权副本。
+    """
+    from sqlalchemy import update
+
+    from app.db.security_models import DocumentObject
+
+    doc_uuid = (
+        document_id if isinstance(document_id, uuid.UUID) else uuid.UUID(str(document_id))
+    )
+    # 归一化：与 tenancy.normalize_access_level 同口径（未知值回落 private，
+    # 绝不把"没认出来"实现成"更宽松"）。
+    level = (str(access_level or "").strip().lower() or ACCESS_PRIVATE)
+    if level not in (ACCESS_PRIVATE, ACCESS_DEPARTMENT, ACCESS_TENANT):
+        level = ACCESS_PRIVATE
+    dept = (str(department_id).strip() or None) if level == ACCESS_DEPARTMENT else None
+
+    async def _run(sess: Any) -> int:
+        result = await sess.execute(
+            update(DocumentObject)
+            .where(DocumentObject.document_id == doc_uuid)
+            .values(access_level=level, department_id=dept,
+                    updated_at=datetime.now(timezone.utc))
+        )
+        return int(result.rowcount or 0)
+
+    try:
+        if session is not None:
+            written = await _run(session)
+        else:
+            from app.db.postgres import get_db_session
+
+            async with get_db_session() as sess:
+                written = await _run(sess)
+    except Exception:      # noqa: BLE001 — 与相邻函数一致：不改动判定权威源就返回
+        logger.exception(
+            "sync_access_level: document=%s level=%s — object rows NOT updated "
+            "(非 owner 的原文预览 / 检索将看不到这份文档)",
+            doc_uuid, level,
+        )
+        return 0
+
+    logger.info(
+        "sync_access_level: document=%s level=%s dept=%s → %d object row(s) aligned",
+        doc_uuid, level, dept, written,
+    )
+    return written
+
+
+async def sync_all_access_levels() -> int:
+    """
+    存量修复：用**一条 UPDATE** 把所有 ``document_objects`` 行的 ``access_level``
+    / ``department_id`` 与所属 ``documents`` 行对齐（幂等，返回被改写行数）.
+
+    存在意义：:func:`sync_access_level` 是"新变更写对"，本函数是"把历史写错的
+    追平"。在上线 :func:`sync_access_level` 之前发布/转为部门文档/收回过的文档，
+    对象行都停在入库时的 private —— 那些文档对**除 owner 以外的人**在"原文预览"
+    与检索里是不可见的，且不会有任何报错。不跑一次回填，修复只对新操作生效。
+
+    需要的权限：``document_chunk_terms`` / ``document_objects`` 的 UPDATE，
+    与迁移脚本同级；因此放在运维脚本里调用，不在请求路径上。
+    """
+    from sqlalchemy import text
+
+    from app.db.postgres import get_db_session
+
+    stmt = text(
+        """
+        UPDATE document_objects AS o
+           SET access_level  = LOWER(COALESCE(d.access_level, 'private')),
+               department_id = CASE
+                   WHEN LOWER(COALESCE(d.access_level, 'private')) = 'department'
+                   THEN d.department_id ELSE NULL END,
+               updated_at    = NOW()
+          FROM documents AS d
+         WHERE o.document_id = d.id
+           AND (
+                 o.access_level IS DISTINCT FROM LOWER(COALESCE(d.access_level, 'private'))
+              OR o.department_id IS DISTINCT FROM (
+                     CASE WHEN LOWER(COALESCE(d.access_level, 'private')) = 'department'
+                          THEN d.department_id ELSE NULL END)
+               )
+        """
+    )
+    try:
+        async with get_db_session() as sess:
+            result = await sess.execute(stmt)
+            written = int(result.rowcount or 0)
+    except Exception:      # noqa: BLE001
+        logger.exception("sync_all_access_levels: bulk alignment failed")
+        return 0
+
+    logger.info("sync_all_access_levels: %d object row(s) realigned", written)
+    return written
 
 
 async def cascade_image_derived(
@@ -1056,6 +1302,14 @@ async def load_view_indexes(
                 view_index[doc_key]["doc"] = view
             elif r.object_type == OBJECT_TYPE_IMAGE and r.image_id:
                 view_index[doc_key][f"img:{r.image_id}"] = view
+            elif r.object_type == OBJECT_TYPE_PARENT_CHUNK:
+                # 父块键。**必须与单文档版逐字一致** —— 两版键规则一旦分叉，
+                # small-to-big 的父块行就只在一版里能被查到：走批量版的调用点
+                # 会把它当成"缺行"，按 fail-closed 丢掉本该保留的块（而单文档版
+                # 却保留），同一份数据在两条入口上给出相反结论。
+                _raw_parent = _raw_from_object_id(r.object_id, doc_key)
+                if _raw_parent:
+                    view_index[doc_key][f"pc:{_raw_parent}"] = view
             if r.chunk_index is not None:
                 view_index[doc_key][f"ci:{int(r.chunk_index)}"] = view
 
@@ -1118,6 +1372,9 @@ __all__ = [
     "load_object_views",
     "load_view_indexes",
     "materialize_document_objects",
+    "mark_materialization_failed",
     "push_payload_async",
+    "sync_access_level",
+    "sync_all_access_levels",
     "sync_doc_row",
 ]

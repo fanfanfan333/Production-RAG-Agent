@@ -5,6 +5,12 @@
     ``resource_id=object_id``、``detail`` 含 stage / reason / gate / document_id）。
   * **阳性对照**：可见对象必须被保留，且**不**产生审计（证明判定不是恒拒）。
   * 取不到 payload 的候选保留（不因缺视图凭空丢证据）。
+  * 【#16 收口】同一批剔除走**一次**批量写库（``record_audit_many``）——
+    "一条事务"与"每对象一行"必须同时成立，因此这里验的是最终 entry 列表：
+    合并成一条记录同样是回归。
+
+⚠️ 拦截点选在最内层的 ``record_audit_many``：这样 ① detail 的构造
+（``_acl_drop_detail``）也在被测范围内；② 顺带证明整批只写一次库。
 """
 
 from __future__ import annotations
@@ -45,15 +51,21 @@ def _chunk(document_id: str, index: int = 0) -> RetrievedChunk:
     )
 
 
+def _capture_audit(monkeypatch):
+    """把审计写库换成"记录最终 entries"，返回 captures 列表（每批一项）"""
+    import app.services.audit_service as audit
+
+    batches: list[list[dict]] = []
+
+    async def fake_record_many(entries):
+        batches.append([dict(e) for e in entries])
+
+    monkeypatch.setattr(audit, "record_audit_many", fake_record_many)
+    return batches
+
+
 def test_object_level_filter_drops_and_audits(monkeypatch):
-    import app.services.retrieval_service as rs
-
-    recorded: list[tuple[str, dict]] = []
-
-    async def fake_record(action, **kw):
-        recorded.append((action, kw))
-
-    monkeypatch.setattr(rs, "record_audit", fake_record)
+    batches = _capture_audit(monkeypatch)
 
     pred = _scope().predicate()
     chunks = [_chunk(DOC_VISIBLE), _chunk(DOC_FORBIDDEN)]
@@ -76,26 +88,20 @@ def test_object_level_filter_drops_and_audits(monkeypatch):
 
     assert [c.document_id for c in kept] == [DOC_VISIBLE]
     assert dropped == 1
-    assert len(recorded) == 1
-    action, kw = recorded[0]
-    assert action == "acl.drop.postcheck"
-    assert kw["resource_type"] == "document_object"
-    assert kw["resource_id"] == "obj_bad"
-    assert "stage=postcheck" in kw["detail"]
-    assert f"document_id={DOC_FORBIDDEN}" in kw["detail"]
-    assert "gate=" in kw["detail"] and "reason=" in kw["detail"]
+    assert len(batches) == 1, "整批剔除应只写一次库"
+    assert len(batches[0]) == 1
+    entry = batches[0][0]
+    assert entry["action"] == "acl.drop.postcheck"
+    assert entry["resource_type"] == "document_object"
+    assert entry["resource_id"] == "obj_bad"
+    assert "stage=postcheck" in entry["detail"]
+    assert f"document_id={DOC_FORBIDDEN}" in entry["detail"]
+    assert "gate=" in entry["detail"] and "reason=" in entry["detail"]
 
 
 def test_object_level_filter_keeps_visible_and_no_audit(monkeypatch):
     """阳性对照：可见对象保留且**不**产生审计（判定不是恒拒）."""
-    import app.services.retrieval_service as rs
-
-    recorded: list = []
-
-    async def fake_record(action, **kw):
-        recorded.append((action, kw))
-
-    monkeypatch.setattr(rs, "record_audit", fake_record)
+    batches = _capture_audit(monkeypatch)
 
     pred = _scope().predicate()
     payloads = {
@@ -109,35 +115,23 @@ def test_object_level_filter_keeps_visible_and_no_audit(monkeypatch):
         [_chunk(DOC_VISIBLE)], payloads, pred, stage="postcheck", scope_fingerprint=None,
     ))
     assert [c.document_id for c in kept] == [DOC_VISIBLE]
-    assert dropped == 0 and recorded == []
+    assert dropped == 0 and batches == []
 
 
 def test_object_level_filter_keeps_chunks_without_payload(monkeypatch):
     """取不到 payload 的候选保留（交由文档级 valid_docs 兜底，不凭空丢证据）."""
-    import app.services.retrieval_service as rs
-
-    async def fake_record(action, **kw):      # pragma: no cover - 不应被调用
-        raise AssertionError("无 payload 的候选不应触发审计")
-
-    monkeypatch.setattr(rs, "record_audit", fake_record)
+    batches = _capture_audit(monkeypatch)
 
     kept, dropped = asyncio.run(_object_level_filter(
         [_chunk(DOC_VISIBLE)], {}, _scope().predicate(),
         stage="postcheck", scope_fingerprint=None,
     ))
     assert [c.document_id for c in kept] == [DOC_VISIBLE]
-    assert dropped == 0
+    assert dropped == 0 and batches == []
 
 
 def test_object_level_filter_drops_excluded_and_over_clearance(monkeypatch):
-    import app.services.retrieval_service as rs
-
-    recorded: list = []
-
-    async def fake_record(action, **kw):
-        recorded.append(action)
-
-    monkeypatch.setattr(rs, "record_audit", fake_record)
+    batches = _capture_audit(monkeypatch)
 
     pred = _scope().predicate()
     d_excl = str(uuid.uuid4())
@@ -157,7 +151,12 @@ def test_object_level_filter_drops_excluded_and_over_clearance(monkeypatch):
         stage="postcheck", scope_fingerprint=None,
     ))
     assert kept == [] and dropped == 2
-    assert recorded == ["acl.drop.postcheck", "acl.drop.postcheck"]
+    # 两条剔除 ⇒ 一次写库、两行记录（不是合并成一行）
+    assert len(batches) == 1 and len(batches[0]) == 2
+    assert [e["action"] for e in batches[0]] == [
+        "acl.drop.postcheck", "acl.drop.postcheck",
+    ]
+    assert [e["resource_id"] for e in batches[0]] == ["e1", "h1"]
 
 
 if __name__ == "__main__":      # pragma: no cover

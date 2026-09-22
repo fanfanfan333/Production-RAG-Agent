@@ -112,3 +112,10 @@ _qa_pylibs/
 /_*
 backend/_iq_t1.txt
 eval_cases.txt
+
+# ── 运行时上传产物（含真实文档与页面原图，严禁入库）──────────────────
+uploads/
+
+# ── backend 侧一次性侦察 / 日志产物（统一前缀 _）──────────────────────
+backend/_*.txt
+backend/scripts/_*.py

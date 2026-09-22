@@ -131,8 +131,15 @@ function DocumentViewer({ doc }: { doc: Document }) {
           {error}
         </div>
       ) : !data || data.chunks.length === 0 ? (
+        // 空结果有两种成因，文案必须分开 —— 此前一律显示"可能仍在处理中"，
+        // 把"文档已入库完成、但没有任何分块对当前账号可见"也描述成处理中：
+        // 用户会一直等一个永远不会出现的进度条。
+        // ⚠️ 不写"部分内容因权限不可见"：后端刻意不返回占位符（占位符等于承认
+        // "这里有东西被藏了"），前端也不该用文案把它说出来。
         <p className="py-6 text-center text-sm text-muted-foreground">
-          该文档暂无索引内容（可能仍在处理中）
+          {doc.status === "processing"
+            ? "该文档仍在处理中，索引完成后即可预览原文。"
+            : "暂无可预览的原文内容。若刚刚调整过这份文档的权限，请稍候重试或刷新页面。"}
         </p>
       ) : (
         <div className="space-y-2.5">

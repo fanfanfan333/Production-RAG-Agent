@@ -243,6 +243,18 @@ async def upload_documents(
     upload_department_id = (
         effective_department_id(user) if target_level == ACCESS_DEPARTMENT else None
     )
+    # 不变量：department ⇒ department_id 非空。上传者无部门归属时（典型是平台
+    # 管理员 / 未分配部门的账号）**绝不静默落库**成 "department + NULL" —— 那种
+    # 文档连 owner 都检索不到（只有层级没有部门的退化态）。前置拦截给用户可见的
+    # 4xx，而不是让它变成一个查不出来的静默缺陷。
+    if target_level == ACCESS_DEPARTMENT and upload_department_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "上传到部门知识库需要你已归属某个部门；当前账号没有部门归属。"
+                "你可以改为上传到个人知识库 / 公司知识库，或联系管理员为你分配部门。"
+            ),
+        )
 
     # ── 快速受理：判重 + 建行（毫秒级），重活丢后台 ───────────────────────────
     # 以前这里 await 整条管线，一份 13 MB 文档要把 HTTP 连接挂住 7 分钟以上；

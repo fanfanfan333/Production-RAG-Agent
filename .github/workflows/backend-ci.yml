@@ -1,0 +1,184 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# 后端 CI —— 「不依赖真实栈」门禁 + 发布前「检索质量」门禁入口
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# 设计原则
+# ────────
+# 1. **CI 只跑不依赖真实栈的门禁**：检索质量基线**输入对账**
+#    （scripts/check_eval_baseline_freshness.py）、条件分支内 import 遮蔽检查、
+#    全量 pytest（借 tests/conftest.py 的宿主机轻依赖垫片）、隔离/权限子集。
+#    任何一步非 0 即红。
+# 2. **真实栈门禁（检索质量）单列一个 job 且默认不跑**：run_eval_baseline.py 需要
+#    postgres + qdrant + ollama + keycloak 齐活，托管 runner 起不动；需要时在
+#    带 `rag-eval` 标签的自托管 runner 上手动触发（见该 job 注释）。
+# 3. **不改 app/** 生产代码**：本 workflow 只消费既有脚本与测试。
+#
+# 触发范围只覆盖 backend/ 与本文件：前端（node_modules / katex 等）变化不该触发
+# 后端门禁。
+name: backend-ci
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - "backend/**"
+      - ".github/workflows/backend-ci.yml"
+  pull_request:
+    paths:
+      - "backend/**"
+      - ".github/workflows/backend-ci.yml"
+  # 允许在 Actions 页面手动触发。
+  # run_eval_gate=true 才会拉起「发布前检索质量门禁」（真实栈，见 Job 2）——
+  # 默认 false，避免托管 runner 上无脑跑真实栈把 CI 拖死。
+  workflow_dispatch:
+    inputs:
+      run_eval_gate:
+        description: "在自托管 runner [self-hosted, rag-eval] 上真跑检索质量门禁（需完整栈 + secrets）"
+        type: boolean
+        default: false
+
+# 同一 PR/分支的旧运行自动取消：门禁只关心最新一次提交，省 runner。
+concurrency:
+  group: backend-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Job 1：非真实栈门禁（CI 里**真跑**，任一子门禁非 0 → 整个 workflow 红）
+  # ═══════════════════════════════════════════════════════════════════════════
+  gates:
+    name: 静态门禁 + 全量 pytest + 隔离/权限子集
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/requirements-ci.txt
+
+      - name: 安装轻量测试依赖
+        # 刻意**不**装 requirements.txt（含 torch/paddle/docling 等重包，数 GB、
+        # 首次还要下模型）。轻量集 + conftest 垫片已在开发机验证可全量跑通；
+        # 理由与被顶替的包名单见 backend/requirements-ci.txt 顶部注释。
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-ci.txt
+
+      # ── 门禁 1：条件分支内 import 遮蔽模块级导入（UnboundLocalError 隐患）──
+      - name: "门禁 1 · check_shadowed_imports"
+        run: python scripts/check_shadowed_imports.py .
+
+      # ── 门禁 1b：作用域遮蔽超集检查（**仅告警、不阻断**）────────────────────
+      # check_shadowing.py 是 check_shadowed_imports.py 的超集（额外扫"复合块内
+      # 参数/常量再绑定"），候选多、需人工逐条三查，当前仓库有 12 处待从人日
+      # 视角复核 —— 因此只做**可见性**，不作为硬门禁（continue-on-error）。
+      - name: "门禁 1b · check_shadowing（advisory）"
+        continue-on-error: true
+        run: python scripts/check_shadowing.py .
+
+      # ── 门禁 4：检索质量基线输入对账（**不依赖真实栈**，非 0 即红）──────────
+      # 这是本次新增、也是本次最关键的一道：run_eval_baseline.py 需要真实栈，
+      # 托管 runner 起不动，于是它此前被 if:false 硬禁用 → 门禁红了多日无人执行。
+      # 本步骤把「基线输入有没有变」（config 默认值 / .env / 模型标识 / 语料指纹 /
+      # 阈值指纹 / 护栏常量同步）从真实栈里解耦出来，在 CI 里真跑：输入漂移而基线
+      # 未重钉 → 退出码 2 → 整个 workflow 红，并打印可直接照做的修复步骤。
+      - name: "门禁 4 · 检索质量基线输入对账（baseline 指纹 vs 当前仓库）"
+        run: python scripts/check_eval_baseline_freshness.py
+
+      # ── 门禁 2：全量 pytest（不依赖真实栈）─────────────────────────────────
+      - name: "门禁 2 · 全量 pytest"
+        run: python -m pytest tests -q --no-header -p no:cacheprovider
+
+      # ── 门禁 3：隔离 / 权限子集（安全回归，独立命名以便失败归因）───────────
+      # 这些用例只依赖纯逻辑（ACL / 租户 / 策略 / 五维 scope / 节点装配），
+      # 是"权限不出错"的最后一道闸；单列出来，红了能一眼看出是安全维度而非
+      # 某个功能模块。
+      - name: "门禁 3 · 隔离 / 权限子集"
+        run: |
+          python -m pytest -q --no-header -p no:cacheprovider \
+            tests/test_tenant_isolation.py \
+            tests/test_scope_isolation_tenant_set.py \
+            tests/test_security_policy.py \
+            tests/test_security_schema.py \
+            tests/test_security_level_consistency.py \
+            tests/test_no_unscoped_retrieval.py \
+            tests/test_scope_filter_equivalence.py \
+            tests/test_two_leg_scope_pushdown.py \
+            tests/test_need_to_know.py \
+            tests/test_project_dimension.py \
+            tests/test_prelaunch_isolation_fixes.py \
+            tests/test_access_level_object_sync.py \
+            tests/test_acl_payload_resync.py \
+            tests/test_generated_doc_acl.py \
+            tests/test_delete_company_cross_tenant.py \
+            tests/test_scope_cache_partition.py \
+            tests/test_citation_open_recheck.py
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Job 2：发布前「检索质量」门禁（真实栈）—— **不在 CI 里跑**
+  # ═══════════════════════════════════════════════════════════════════════════
+  #
+  # 为什么单独一个 job、且**默认不跑**
+  # ────────────────────────────────────────────
+  # scripts/run_eval_baseline.py 走的是**生产同一条检索链路**，依赖完整运行栈：
+  #   · postgres   —— 语料 + eval_runs 表（评测结果跨重启落库，基线才成立）
+  #   · qdrant     —— documents 向量集合
+  #   · ollama     —— 嵌入模型 + 多模态模型（CPU 推理，单图数十秒）
+  #   · keycloak   —— 有 audit.read 权限的账号与 JWT 验签
+  #   · RAG_EVAL_PASSWORD —— 评测账号口令（只能从 secrets 注入，不进仓库）
+  # 这些在 GitHub **托管** runner 上起不动（ollama 的 CPU 推理 + 私网服务 + 口令），
+  # 所以不放进自动 CI。它是一个**发布前门禁入口**：
+  #
+  #   在能起真实栈的发布机上显式执行（示例）：
+  #       docker exec -e RAG_EVAL_PASSWORD=… rag_backend \
+  #           python -u /tmp/run_eval_baseline.py --out /tmp/eval_baseline_report.json
+  #
+  #   退出码语义（**非 0 一律阻断发布**，这正是"非 0 即阻断"的落点）：
+  #       0 → 通过（且评测结果已落 eval_runs 表）
+  #       2 → 检索质量回归（任一 threshold 未达 / 负例未拒答 / 分带余量不足）
+  #       3 → 登录或配置失败（如缺 RAG_EVAL_PASSWORD）
+  #       4 → 金标解析失败（golden_v1.json 引用的文档不在库）
+  #       5 → 评测请求失败
+  #
+  # 触发方式（**不再是被注释掉的死代码**）：本 job 只在
+  #   Actions 页手动触发且勾选 run_eval_gate=true 时才会跑，
+  # 且必须落在带 `rag-eval` 标签的**自托管** runner 上（那里才有完整真实栈）。
+  # 托管 runner 永远不会进入本 job，因此不会把自动 CI 拖死。
+  # 前提：该 self-hosted runner 上已就绪 postgres/qdrant/ollama/keycloak，并配置
+  # 好 secrets.RAG_EVAL_PASSWORD（口令只从 secrets 注入，绝不进仓库）。
+  # 想串成"门禁不过不发版"：在发布 job 里加 `needs: eval-release-gate`。
+  eval-release-gate:
+    name: 发布前检索质量门禁（真实栈 · 非 0 阻断）
+    # 真跑条件：手动触发 + 显式勾选。默认 false → 绝不会被自动调度拖死。
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_eval_gate }}
+    needs: [gates]
+    # 需要带 rag-eval 标签的自托管 runner（托管 runner 起不动真实栈）
+    runs-on: [self-hosted, rag-eval]
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 真实栈评测（退出码非 0 即阻断发布）
+        env:
+          RAG_EVAL_PASSWORD: ${{ secrets.RAG_EVAL_PASSWORD }}
+          RAG_EVAL_USERNAME: ${{ vars.RAG_EVAL_USERNAME || 'admin' }}
+          RAG_BASE_URL: ${{ vars.RAG_BASE_URL || 'http://127.0.0.1:8000' }}
+        run: python -u scripts/run_eval_baseline.py --out /tmp/eval_baseline_report.json
+
+      - name: 上传评测回执（无论成败）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-baseline-report
+          path: /tmp/eval_baseline_report.json
+          if-no-files-found: ignore

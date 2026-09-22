@@ -120,6 +120,46 @@ def object_type_of_chunk(content_type: str | None, image_id: str | None) -> str:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+def parent_block_allows(
+    chunk: Any,
+    pred: ScopePredicate | None,
+    view_index: Mapping[str, Mapping[str, ObjectACLView]] | None,
+    materialized: Mapping[str, bool] | None = None,
+) -> bool:
+    """
+    small-to-big 回填的**父块正文**能否进上下文（发现问题 #14）.
+
+    为什么需要单独一道：对象级判定一向只看**子块**（``chunk_key`` → ``ci:`` / ``img:``），
+    而 ``context_builder`` / ``multimodal_context`` 会把命中子块的正文**替换成父块全文**
+    （整节）。父块若被单独提级 / 剔除，它的正文照样绕道进 LLM —— 判定覆盖不到的那一段。
+
+    父块对象行由入库期的 ``materialize_document_objects(parents=...)`` 物化，视图键
+    ``pc:{parent_id}``（键规则见 ``security_cascade.load_view_indexes``）。
+
+    缺行口径（**刻意不用文档级 ``materialized``**）：父块行是后来才加的，存量文档
+    一个 ``pc:`` 键都没有 —— 若按"已物化文档缺行即拒"处理，small-to-big 会对整个
+    存量语料集体静默失效。因此以**该文档是否已有任意父块行**为准：
+
+      · 有父块行却缺这一行 ⇒ 该父块被显式剔除过 ⇒ fail-closed，不展开；
+      · 一个父块行都没有 ⇒ 存量未回填 ⇒ 回退允许（跑一次父块回填即转为受管）。
+
+    两个组装入口共用本函数（而不是各写一份"父块该不该展开"），否则规则一分叉就是
+    一条只在某个开关下复现的旁路。``materialized`` 形参保留给调用方传文档级结论，
+    当前不参与判定，仅为签名对称。
+    """
+    if pred is None or not view_index:
+        return True
+    parent_id = getattr(chunk, "parent_id", None)
+    if not parent_id:
+        return True
+    doc_id = str(getattr(chunk, "document_id", "") or "")
+    doc_index = view_index.get(doc_id) or {}
+    view = doc_index.get(f"pc:{parent_id}")
+    if view is None:
+        return not any(str(k).startswith("pc:") for k in doc_index)
+    return allows(pred, view).allowed
+
+
 def build_permission_snapshot(
     view: ObjectACLView | None,
     pred: ScopePredicate | None,
@@ -335,24 +375,28 @@ async def run_final_check(
 
     每个被剔除的对象写一条 ``acl.drop.<stage>`` 审计（best-effort）。
     """
-    from app.services.security_cascade import (
-        document_is_materialized,
-        load_document_view_index,
-    )
+    from app.services.security_cascade import load_view_indexes
 
     doc_ids = {str(getattr(c, "document_id", "") or "") for c in chunks}
     doc_ids.discard("")
 
     view_index: dict[str, dict[str, ObjectACLView]] = {}
     materialized: dict[str, bool] = {}
-    for doc_id in doc_ids:
+    if doc_ids:
+        # 批量解析（**一条** SQL 取全部文档的对象行），替代此前的"每份文档两条
+        # SELECT"（`load_document_view_index` + `document_is_materialized`）——
+        # 一次提问命中 20 份文档时，旧写法是 40 次串行往返，全在用户请求路径上。
         try:
-            view_index[doc_id] = await load_document_view_index(doc_id, session=session)
-            materialized[doc_id] = await document_is_materialized(doc_id, session=session)
-        except Exception:      # noqa: BLE001 — 解析失败 → 该文档按"未物化"回退（不误伤）
-            logger.exception("run_final_check: view load failed for doc %s", doc_id)
-            view_index[doc_id] = {}
-            materialized[doc_id] = False
+            view_index, materialized = await load_view_indexes(sorted(doc_ids), session=session)
+        except Exception:      # noqa: BLE001
+            logger.exception("run_final_check: batch view load failed")
+            view_index, materialized = {}, {}
+        if not view_index and not materialized:
+            # 空返回是 `load_view_indexes` 的 **fail-closed 契约**（查询炸了才为空）。
+            # 此时按"未物化"回退而不是 fail-closed 丢弃：与旧的逐份 except 分支
+            # 同口径 —— 一次 DB 抖动不该把整批证据清空（缺行回退由文档级判定兜底）。
+            view_index = {d: {} for d in doc_ids}
+            materialized = {d: False for d in doc_ids}
 
     outcome = filter_chunks_by_acl(
         chunks, pred, view_index, materialized=materialized
@@ -456,6 +500,7 @@ __all__ = [
     "derive_parent_object_id",
     "filter_chunks_by_acl",
     "object_type_of_chunk",
+    "parent_block_allows",
     "pred_scope_fingerprint",
     "run_final_check",
 ]

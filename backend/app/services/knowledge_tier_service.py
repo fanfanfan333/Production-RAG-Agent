@@ -315,14 +315,51 @@ async def set_document_access_level(
             raise TierError("文档不存在或已被删除", status_code=404)
 
         previous = normalize_access_level(doc.access_level)
+
+        # ── 不变量收口：department ⇒ department_id 非空 ─────────────────────────
+        # 这是**唯一**能把 access_level 写成 department 的写点（发布 / 共享审批 /
+        # 部门转换都汇到这里）。以前这里 `(department_id or "").strip() or None`
+        # 会**静默写 NULL**，产出的文档对 owner 与部门同事都检索不到
+        # （tenancy.document_scope_clause 的 department 分支要求 department_id 相等，
+        # 且 owner 不在个人库分支里），界面表现为"列表看得见、提问搜不到"。
+        # 解析器 resolve_department_for_level 允许返回 None（供"只改层级、部门沿用"
+        # 的调用）——None 的语义在**这里**判定：只有 department 层级才必须有部门。
+        resolved_department = (department_id or "").strip() or None
+        if normalized == ACCESS_DEPARTMENT and resolved_department is None:
+            raise TierError(
+                "发布到部门知识库必须指定归属部门：未解析到有效的 department_id"
+                f"（document={document_id}, actor={actor_username or actor_id}）。"
+                "请确认文档已有部门归属，或操作者本人已分配部门。",
+                status_code=400,
+            )
+
         doc.access_level = normalized
         doc.department_id = (
-            (department_id or "").strip() or None
-            if normalized == ACCESS_DEPARTMENT
-            else None
+            resolved_department if normalized == ACCESS_DEPARTMENT else None
         )
         await session.flush()
         await session.refresh(doc)
+
+        # ── 对象级权限行同步（与 documents 行同一事务）─────────────────────────
+        # 关键：第 11 / 12 环的逐块 ``allows()`` 与「原文预览」读的**不是**
+        # documents 行，而是 ``document_objects`` 的 ``access_level`` /
+        # ``department_id``（入库时的一次性快照）。漏掉这一步时：文档已经发布到
+        # 部门库 / 公司库、列表可见、点得开、文档级判定全对，但
+        #   · 「原文预览」对除 owner 外的所有人返回 **0 条分块**
+        #     （界面显示成"该文档暂无索引内容（可能仍在处理中）"）
+        #   · 检索第 11 / 12 环把该文档的**全部 chunk 丢弃** → 表现为拒答
+        # 且只影响非 owner（owner 走 `_source_gate` 的 owner 分支恒放行），
+        # 因此文档作者自测永远正常 —— 必须换账号才复现。
+        # 详见 security_cascade.sync_access_level。向量副本那一半由下面的
+        # update_document_access_payload 负责，两者都做完才三处一致。
+        from app.services.security_cascade import sync_access_level
+
+        await sync_access_level(
+            document_id,
+            access_level=normalized,
+            department_id=doc.department_id,
+            session=session,
+        )
 
     # 向量载荷与 PG 同步（失败只告警，不阻断——PG 是判定权威）
     from app.services.vector_service import update_document_access_payload

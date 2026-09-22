@@ -1,7 +1,7 @@
 {
   "name": "golden-v1",
-  "revision": 3,
-  "revision_note": "rev3：补 5 条**多证据用例**（答案需要 2 个分片，且第二个分片的精排分明显低于头名）。rev1/rev2 的 11 例金标**全是精排第 1 名**，导致 gold/head ≡ 1.0 —— 『提高 RERANK_MIN_SCORE_RATIO 会不会误杀次要证据』在该集上恒测不出。补集后该问题第一次可测，并当场测出当前值 0.10 已经在误杀（见 multi_evidence.probe_result 与 band_headroom_measured）。",
+  "revision": 4,
+  "revision_note": "rev4：**只补文档说明，用例与 thresholds 零改动**（因此 rev3/rev4 的评测数字逐位可比）。原因：2026-09-21 首次真跑回归门禁时发现『紫罗兰计划』用例的两条标注位于**测试公司租户**，按『内容消费排除测试公司』规则对任何账号（含平台管理员）都不可检索 —— 实测 allows() 返回 gate='tenant' / reason='tenant_mismatch'。该用例因此在 admin 口径下不可达，harness 会整条剔除并登记到 unattainable（不判回归）。补 scope_note 是为了让下一个读到本文件的人不必重新踩一遍这个坑。",
   "description": "私有知识库 RAG 检索质量基线（16 条正例 = 11 单证据 + 5 多证据，3 条负例）。正例标注 (filename, chunk_index) 逻辑坐标，运行期解析为 document_id::chunk_index；负例用于验证“库里根本没有时必须拒答”。",
   "corpus": {
     "note": "口令化语料：6 份业务/制度文档 + 2 份 Python 手册，覆盖 private / department / tenant 三档可见性与 4 个租户。",
@@ -16,73 +16,135 @@
       "探测载体-1z5pp.txt",
       "探测载体-bjld8.txt"
     ],
-    "scope_limitation": "⚠️ 9 份语料里只有 4 份（研发部技术方案 / Python 手册 / 紫罗兰计划×2 / 探测载体×2）在 **admin 口径**下可检索。另外 3 份（A公司印章手册、B公司经营分析报告、B公司固定资产规范）的 access_level=private 且归属人分别是李四/王五/某某，按设计『个人库在所有 scope 组合下都只有归属人可见』，平台管理员也看不到 —— 这是**权限隔离生效**，不是检索缺陷（已用 unrestricted=True 对照验证：同一查询在这三份文档上能取到 0.99 分）。代价是本评测集**结构上覆盖不到另外 3 份文档**（约 21 个分片）。要覆盖它们需要按归属人 scope 分别评测，见 known_limitation。"
+    "scope_limitation": "⚠️ 现状（2026-09-21 实测复核）：9 份语料里只有 **3 份**在 **admin 口径**下可检索 —— 研发部技术方案 / Python 手册 / 企业知识库RAG手册（三者均 access_level=private 且 owner=admin）。其余 3 份归属他人（李四/王五/某某）的 private 文档按设计『个人库在所有 scope 组合下都只有归属人可见』，平台管理员也看不到 —— 这是**权限隔离生效**，不是检索缺陷。**新增变化**：紫罗兰计划×2 与 探测载体×2 共 4 份位于**测试公司租户**，按『测试公司内容任何人不可消费』规则被 `content_scope` 剔除 —— 因此从 rev4 起**admin 口径连它们也看不到**（rev1~rev3 时代 admin 可见）。代价：本评测集**结构上覆盖不到**归属他人的 private 文档（约 21 个分片）与测试公司文档；要覆盖需按归属人 / 测试公司成员 scope 分别评测（多 scope 评测尚未实现，见 known_limitation）。"
   },
   "cases": [
     {
       "query": "研发部技术方案里，数据层承担哪些职责？",
-      "expect": [{"filename": "研发部-2024年度技术方案-2e19.docx", "chunk_index": 1}],
+      "expect": [
+        {
+          "filename": "研发部-2024年度技术方案-2e19.docx",
+          "chunk_index": 1
+        }
+      ],
       "note": "章节级定位；命中块是“3 数据层设计”"
     },
     {
       "query": "这份技术方案采用的检索策略是什么？",
-      "expect": [{"filename": "研发部-2024年度技术方案-2e19.docx", "chunk_index": 2}],
+      "expect": [
+        {
+          "filename": "研发部-2024年度技术方案-2e19.docx",
+          "chunk_index": 2
+        }
+      ],
       "note": "“5 检索策略”"
     },
     {
       "query": "反幻觉机制在检索阶段具体做了什么？",
-      "expect": [{"filename": "研发部-2024年度技术方案-2e19.docx", "chunk_index": 3}],
+      "expect": [
+        {
+          "filename": "研发部-2024年度技术方案-2e19.docx",
+          "chunk_index": 3
+        }
+      ],
       "note": "“7 反幻觉机制”"
     },
     {
       "query": "项目的预算与资源投入是怎么安排的？",
-      "expect": [{"filename": "研发部-2024年度技术方案-2e19.docx", "chunk_index": 4}],
+      "expect": [
+        {
+          "filename": "研发部-2024年度技术方案-2e19.docx",
+          "chunk_index": 4
+        }
+      ],
       "note": "“9 预算与资源”"
     },
     {
       "query": "各期交付物和完成时间分别是什么？",
-      "expect": [{"filename": "研发部-2024年度技术方案-2e19.docx", "chunk_index": 5}],
+      "expect": [
+        {
+          "filename": "研发部-2024年度技术方案-2e19.docx",
+          "chunk_index": 5
+        }
+      ],
       "note": "回归哨兵：此块精排分仅 0.22，是“单候选跳过精排 + 阈值 0.25”双重 BUG 下被误杀的那一块。这条用例必须长期留在集里。"
     },
     {
       "query": "这份技术方案的文号和编制单位是什么？",
-      "expect": [{"filename": "研发部-2024年度技术方案-2e19.docx", "chunk_index": 0}],
+      "expect": [
+        {
+          "filename": "研发部-2024年度技术方案-2e19.docx",
+          "chunk_index": 0
+        }
+      ],
       "note": "文号类精确串（中科发〔2024〕7号），考 keyword 腿"
     },
     {
       "query": "python 里打开文件的 mode 有哪些，各自含义是什么？",
-      "expect": [{"filename": "Python AI大模型成神手册 (1).docx", "chunk_index": 2}],
+      "expect": [
+        {
+          "filename": "Python AI大模型成神手册 (1).docx",
+          "chunk_index": 2
+        }
+      ],
       "note": "纯中文查询命中英文术语密集块"
     },
     {
       "query": "pyecharts 怎么设置标题位置和图例？",
-      "expect": [{"filename": "Python AI大模型成神手册 (1).docx", "chunk_index": 3}],
+      "expect": [
+        {
+          "filename": "Python AI大模型成神手册 (1).docx",
+          "chunk_index": 3
+        }
+      ],
       "note": "专有名词 + 中文，考 BM25 与向量的互补"
     },
     {
       "query": "元组和字符串能不能被修改？",
-      "expect": [{"filename": "Python AI大模型成神手册 (1).docx", "chunk_index": 1}],
+      "expect": [
+        {
+          "filename": "Python AI大模型成神手册 (1).docx",
+          "chunk_index": 1
+        }
+      ],
       "note": "短查询，语义与关键词都稀薄"
     },
     {
       "query": "怎么提高 python 读入数据的效率？",
-      "expect": [{"filename": "Python AI大模型成神手册 (1).docx", "chunk_index": 0}],
+      "expect": [
+        {
+          "filename": "Python AI大模型成神手册 (1).docx",
+          "chunk_index": 0
+        }
+      ],
       "note": "“怎么做”型问题，考 HyDE/变体是否真的帮上忙"
     },
     {
       "query": "紫罗兰计划的年度预算是多少，由谁负责审批？",
       "expect": [
-        {"filename": "紫罗兰计划-1z5pp.txt", "chunk_index": 0},
-        {"filename": "紫罗兰计划-bjld8.txt", "chunk_index": 0}
+        {
+          "filename": "紫罗兰计划-1z5pp.txt",
+          "chunk_index": 0
+        },
+        {
+          "filename": "紫罗兰计划-bjld8.txt",
+          "chunk_index": 0
+        }
       ],
-      "note": "两份同内容文档分属不同租户/部门；平台管理员视角命中任一即算对（answer-bearing chunk 唯一）"
+      "note": "两份同内容文档分属不同租户/部门；平台管理员视角命中任一即算对（answer-bearing chunk 唯一）",
+      "scope_note": "⚠️ 本用例的两条标注（紫罗兰计划-1z5pp.txt / -bjld8.txt）位于**测试公司租户**（c8111de986583 / cfb08c53677c4，见 company_registry.test_tenant_ids）。按『测试公司文档任何人都检索不到、也不进任何内容消费』的产品规则，`request_security_scope` → `tenancy.content_scope` → `exclude_test_tenants` 会把这两个租户从调用者的 tenant_ids 里剔除 → **admin 口径下本用例不可达**（实测 gate='tenant' / reason='tenant_mismatch'）。scripts/run_eval_baseline.py 会把整条用例剔除、记入 unattainable，**不判为回归**。要真正覆盖『同内容文档分属不同租户』这一场景，需按**测试公司成员 scope**单独评测 —— 多 scope 评测尚未实现（见 known_limitation 第 1 条）。"
     },
-
     {
       "query": "这份技术方案里，数据层承担哪些职责？检索策略又是怎么设计的？",
       "expect": [
-        {"filename": "研发部-2024年度技术方案-2e19.docx", "chunk_index": 1},
-        {"filename": "研发部-2024年度技术方案-2e19.docx", "chunk_index": 2}
+        {
+          "filename": "研发部-2024年度技术方案-2e19.docx",
+          "chunk_index": 1
+        },
+        {
+          "filename": "研发部-2024年度技术方案-2e19.docx",
+          "chunk_index": 2
+        }
       ],
       "kind": "multi_evidence",
       "note": "多证据｜跨「3 数据层设计」与「5 检索策略」两个分节；两问并列，缺任一条答案只答一半。实测 头名 0.9981 / 次证 0.8984（比值 0.9001）"
@@ -90,8 +152,14 @@
     {
       "query": "反幻觉机制在检索阶段做了什么？项目的预算与资源投入又是怎么安排的？",
       "expect": [
-        {"filename": "研发部-2024年度技术方案-2e19.docx", "chunk_index": 3},
-        {"filename": "研发部-2024年度技术方案-2e19.docx", "chunk_index": 4}
+        {
+          "filename": "研发部-2024年度技术方案-2e19.docx",
+          "chunk_index": 3
+        },
+        {
+          "filename": "研发部-2024年度技术方案-2e19.docx",
+          "chunk_index": 4
+        }
       ],
       "kind": "multi_evidence",
       "note": "多证据｜跨「7 反幻觉机制」与「9 预算与资源」。实测 头名 0.9939 / 次证 0.9475（0.9533）"
@@ -99,8 +167,14 @@
     {
       "query": "这份技术方案的文号和编制单位是什么？各期交付物和完成时间分别是什么？",
       "expect": [
-        {"filename": "研发部-2024年度技术方案-2e19.docx", "chunk_index": 0},
-        {"filename": "研发部-2024年度技术方案-2e19.docx", "chunk_index": 5}
+        {
+          "filename": "研发部-2024年度技术方案-2e19.docx",
+          "chunk_index": 0
+        },
+        {
+          "filename": "研发部-2024年度技术方案-2e19.docx",
+          "chunk_index": 5
+        }
       ],
       "kind": "multi_evidence",
       "note": "多证据｜把已有的 0.22 哨兵（里程碑表）套进复合问句。实测 头名 0.8195 / 次证 0.0876（**比值 0.1069**）—— 这是分带的分水岭：ratio>0.1069 就砍掉里程碑整块，答不出『各期交付物和完成时间』。"
@@ -108,8 +182,14 @@
     {
       "query": "python 打开文件的 mode 有哪些、各自含义是什么？pyecharts 的标题位置怎么设置？",
       "expect": [
-        {"filename": "Python AI大模型成神手册 (1).docx", "chunk_index": 2},
-        {"filename": "Python AI大模型成神手册 (1).docx", "chunk_index": 3}
+        {
+          "filename": "Python AI大模型成神手册 (1).docx",
+          "chunk_index": 2
+        },
+        {
+          "filename": "Python AI大模型成神手册 (1).docx",
+          "chunk_index": 3
+        }
       ],
       "kind": "multi_evidence",
       "note": "多证据｜跨两个主题块（文件操作 / pyecharts），顺带覆盖父子块回填路径。实测 0.8536 / 0.7009（0.8211）"
@@ -117,8 +197,14 @@
     {
       "query": "元组能不能被修改？打开文件时怎么指定编码？",
       "expect": [
-        {"filename": "Python AI大模型成神手册 (1).docx", "chunk_index": 1},
-        {"filename": "Python AI大模型成神手册 (1).docx", "chunk_index": 2}
+        {
+          "filename": "Python AI大模型成神手册 (1).docx",
+          "chunk_index": 1
+        },
+        {
+          "filename": "Python AI大模型成神手册 (1).docx",
+          "chunk_index": 2
+        }
       ],
       "kind": "multi_evidence",
       "note": "分带哨兵（最重要的新增例）｜次证精排分只有 0.0685（过带后按同父衰减 0.85 落到 0.0582），比值 0.07。旧值 RERANK_MIN_SCORE_RATIO=0.10 会算出带 0.0832 > 0.0685，**把这条合法证据整条砍掉**（实测召回 2→1）。降到 0.05 后恢复正常。以后谁再把 ratio 抬到 0.082 以上，本用例的 recall@10 立刻掉到 0.5，回归门禁随即变红。"
@@ -160,11 +246,46 @@
       "method": "容器内进程复跑 retrieve_chunks（admin scope, top_k=10），两态对照：态 A = 生产配置（过滤开，ratio=0.10）；态 B = 关闭阈值过滤（RERANK_MIN_SCORE_FILTER=False, ratio=0）",
       "why_two_states": "只看态 A 会把『已被分带砍掉』的证据误读成『本来就不存在』—— 这正是旧集测不出分带风险的同一种盲区。",
       "measured": [
-        {"case": "研发部 1+2 （数据层/检索策略）", "head": 0.9981, "weakest_gold": 0.8984, "ratio": 0.9001, "态A召回": "2/2", "态B召回": "2/2"},
-        {"case": "研发部 3+4 （反幻觉/预算）", "head": 0.9939, "weakest_gold": 0.9475, "ratio": 0.9533, "态A召回": "2/2", "态B召回": "2/2"},
-        {"case": "研发部 0+5 （文号/里程碑）", "head": 0.8195, "weakest_gold": 0.0876, "ratio": 0.1069, "态A召回": "2/2", "态B召回": "2/2"},
-        {"case": "Python 2+3 （mode/pyecharts）", "head": 0.8536, "weakest_gold": 0.7009, "ratio": 0.8211, "态A召回": "2/2", "态B召回": "2/2"},
-        {"case": "Python 1+2 （元组/编码）", "head": 0.832, "weakest_gold": 0.0582, "ratio": 0.07, "态A召回": "**1/2**", "态B召回": "2/2"}
+        {
+          "case": "研发部 1+2 （数据层/检索策略）",
+          "head": 0.9981,
+          "weakest_gold": 0.8984,
+          "ratio": 0.9001,
+          "态A召回": "2/2",
+          "态B召回": "2/2"
+        },
+        {
+          "case": "研发部 3+4 （反幻觉/预算）",
+          "head": 0.9939,
+          "weakest_gold": 0.9475,
+          "ratio": 0.9533,
+          "态A召回": "2/2",
+          "态B召回": "2/2"
+        },
+        {
+          "case": "研发部 0+5 （文号/里程碑）",
+          "head": 0.8195,
+          "weakest_gold": 0.0876,
+          "ratio": 0.1069,
+          "态A召回": "2/2",
+          "态B召回": "2/2"
+        },
+        {
+          "case": "Python 2+3 （mode/pyecharts）",
+          "head": 0.8536,
+          "weakest_gold": 0.7009,
+          "ratio": 0.8211,
+          "态A召回": "2/2",
+          "态B召回": "2/2"
+        },
+        {
+          "case": "Python 1+2 （元组/编码）",
+          "head": 0.832,
+          "weakest_gold": 0.0582,
+          "ratio": 0.07,
+          "态A召回": "**1/2**",
+          "态B召回": "2/2"
+        }
       ],
       "verdict": "当前 RERANK_MIN_SCORE_RATIO=0.10 **已经在误杀合法次要证据**（Python 1+2 例：带 = 0.832×0.10 = 0.0832 > 次证 0.0685 → 整条被砍）。这不是理论风险，是实测到的召回损失。已把该参数降到 0.05。",
       "replaces_old_conclusion": "rev1/rev2 据此算出的『跨用例安全上界 = 0.22/0.9999 = 0.2200，推荐上界 0.165』只用了**主证据**口径，没有次要证据样本 → 偏乐观约 2.4 倍。含次要证据的实测上界是 0.07。"
