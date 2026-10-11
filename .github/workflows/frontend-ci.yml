@@ -1,0 +1,34 @@
+name: frontend-ci
+
+on:
+  push:
+    branches: [main, master]
+    paths: ["app/**", "components/**", "lib/**", "tests/**", "scripts/audit-dependencies.cjs", "package*.json", "*.config.*", "tsconfig.json", ".github/workflows/frontend-ci.yml"]
+  pull_request:
+    paths: ["app/**", "components/**", "lib/**", "tests/**", "scripts/audit-dependencies.cjs", "package*.json", "*.config.*", "tsconfig.json", ".github/workflows/frontend-ci.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: frontend-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - run: npm audit --omit=dev --audit-level=high --registry=https://registry.npmjs.org
+      - run: node scripts/audit-dependencies.cjs
+      - run: npm run lint
+      - run: npm test
+      - run: npx tsc --noEmit
+      - run: npm run build

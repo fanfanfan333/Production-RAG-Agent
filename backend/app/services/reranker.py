@@ -24,7 +24,6 @@ LLM 的证据越干净，幻觉与答非所问越少。
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import math
 import threading
 from typing import TYPE_CHECKING
@@ -87,11 +86,9 @@ def dedup_candidates(chunks: "list[RetrievedChunk]") -> "list[RetrievedChunk]":
     seen: set[str] = set()
     unique: "list[RetrievedChunk]" = []
     for c in chunks:
-        # 只哈希文本前 1000 字：足以识别重复块，又避免对超长文本全量哈希
-        fingerprint = hashlib.md5(c.text[:1000].encode("utf-8", "ignore")).hexdigest()
-        if fingerprint in seen:
+        if c.text in seen:
             continue
-        seen.add(fingerprint)
+        seen.add(c.text)
         unique.append(c)
     if len(unique) != len(chunks):
         logger.info("rerank dedup: %d candidates → %d unique", len(chunks), len(unique))
@@ -282,6 +279,8 @@ class ChunkReranker:
             raw = self._model.compute_score(
                 [[query, t] for t in texts], normalize=False
             )
+            if hasattr(raw, "tolist"):
+                raw = raw.tolist()
             # compute_score 对单条输入返回标量而非列表
             if not isinstance(raw, list):
                 raw = [raw]
@@ -289,8 +288,11 @@ class ChunkReranker:
 
         if self._backend == "cross_encoder":
             raw = self._model.predict(
-                [(query, t) for t in texts], show_progress_bar=False
+                [(query, t) for t in texts], show_progress_bar=False,
+                activation_fn=lambda logits: logits,  # Apply sigmoid exactly once below.
             )
+            if hasattr(raw, "tolist"):
+                raw = raw.tolist()
             if not isinstance(raw, list):
                 raw = [raw]
             return [_sigmoid(float(r)) for r in raw]
@@ -356,9 +358,8 @@ async def rerank_chunks(
     - chunk.score 被替换为归一化精排分（[0,1]，可直接用于
       RERANK_MIN_SCORE 幻觉守卫和前端"相关度 %"展示）。
     - **只有一个候选时也要打分**：直接返回会把粗排/关键词分留在 score 上，
-      造成量纲泄漏（详见函数内注释）。只有"精排不可用"（降级）才允许保留原分，
-      此时 except 分支会显式记录。
-    - 任一异常都降级为"保持粗排顺序"——精排失败不应让查询失败。
+      造成量纲泄漏（详见函数内注释）。
+    - 精排失败或输出非法时返回空证据，交给上游重试/拒答，不能用粗排分冒充精排分。
     """
     settings = get_settings()
     if not chunks:
@@ -405,6 +406,11 @@ async def rerank_chunks(
                 query, [c.text for c in unique_chunks], vector_scores
             )
 
+        if len(scores) != len(unique_chunks) or any(
+            not math.isfinite(s) or not 0.0 <= s <= 1.0 for s in scores
+        ):
+            raise ValueError("Reranker must return one finite [0, 1] score per candidate")
+
         ranked = list(zip(unique_chunks, scores))
         ranked.sort(key=lambda cs: cs[1], reverse=True)
 
@@ -436,5 +442,5 @@ async def rerank_chunks(
         )
         return reranked
     except Exception:
-        logger.exception("Rerank failed — keeping coarse ranking order")
-        return chunks[:top_k]
+        logger.exception("Rerank failed — returning no evidence for retry/refusal")
+        return []

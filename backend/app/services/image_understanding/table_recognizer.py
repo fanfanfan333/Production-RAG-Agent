@@ -605,7 +605,7 @@ def _from_rules_with_cell_ocr(
     if len(grid) < min_rows:
         return TableStructure(method="failed", meta={"reason": f"rows={len(grid)}<{min_rows}"})
     filled = sum(1 for row in grid for cell in row if cell.strip())
-    if filled < max(min_rows * min_cols, 3):
+    if filled < max(min_rows * min_cols, 3, len(grid) * cols * 0.5):
         return TableStructure(
             method="failed", meta={"reason": f"cells-filled={filled}"}
         )

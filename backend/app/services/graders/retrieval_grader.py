@@ -140,6 +140,7 @@ async def grade_retrieval(
             reasoning=False,
             num_predict=256,          # 需输出一个 verdicts 数组，比路由长
             num_ctx=settings.chat_num_ctx,
+            keep_alive=getattr(settings, "OLLAMA_KEEP_ALIVE_SECONDS", 300),
             num_gpu=settings.OLLAMA_NUM_GPU,
         )
 

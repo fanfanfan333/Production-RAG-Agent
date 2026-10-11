@@ -312,13 +312,18 @@ export async function streamQuery(options: StreamQueryOptions): Promise<void> {
         handleLine(line);
       }
     }
+    buffer += decoder.decode();
     if (buffer.trim()) handleLine(buffer.trim());
   } catch (err) {
     if ((err as Error).name === "AbortError") {
       return; // 用户主动停止
     }
     throw err;
+  } finally {
+    reader.releaseLock();
   }
 
-  onDoneOnce();
+  if (!finished) {
+    throw new ApiError(502, "回答连接中断，当前内容可能不完整，请重试");
+  }
 }

@@ -5,7 +5,7 @@ REM  说明见同目录 README-启动说明.md
 REM ─────────────────────────────────────────────────────────────────────────────
 setlocal
 set "NODE_HOME=D:\RAG项目依赖和环境\node"
-set "PROJ=D:\RAG\Production-RAG-Agent"
+set "PROJ=%~dp0"
 
 REM 让本窗口能用 node / npm（不依赖系统 PATH，换机器也能跑）
 set "PATH=%NODE_HOME%;%PATH%"
@@ -16,12 +16,14 @@ echo ============================================
 echo   RAG Agent 开发环境启动
 echo ============================================
 echo.
-echo [1/3] 启动后端依赖服务 (postgres / qdrant / keycloak / backend)
+echo [1/3] 构建最新后端并启动本机低内存配置 (postgres / qdrant / backend)
 pushd "%PROJ%\backend"
-docker compose up -d
+docker compose -f docker-compose.yml -f docker-compose.local.yml -f docker-compose.low-memory.yml up -d --build postgres qdrant backend
+set "START_RESULT=%ERRORLEVEL%"
 popd
-if errorlevel 1 (
+if not "%START_RESULT%"=="0" (
   echo.
+  exit /b 1
   echo [警告] docker compose 未成功。请确认 Docker Desktop 已启动。
   echo.
 )
@@ -31,7 +33,10 @@ echo [2/3] 等待后端健康检查...
 set /a _try=0
 :waitloop
 set /a _try+=1
-if %_try% GTR 30 goto waited
+if %_try% GTR 40 (
+  echo 后端健康检查失败，请查看 rag_backend 日志。
+  exit /b 1
+)
 curl -sf http://localhost:8000/health >nul 2>&1
 if errorlevel 1 (
   echo   ... 第 %_try% 次探测，后端尚未就绪

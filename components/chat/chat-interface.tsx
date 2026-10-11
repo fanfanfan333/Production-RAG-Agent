@@ -91,14 +91,14 @@ function pipelineLabel(pipeline: ChatMessage["intent"] | ChatMessage["mode"] | n
     case "list_documents":
       return "知识库文档清单";
     case "document_agent":
-      return "Document Agent（生成 Word 文档）";
+      return "文档生成";
     case "knowledge_qa":
     case "rag":
     case null:
     case undefined:
-      return "混合检索 + 精排重排序";
+      return "知识库问答";
     default:
-      return "混合检索 + 精排重排序";
+      return "知识库问答";
   }
 }
 
@@ -132,6 +132,13 @@ const MarkdownBlock = memo(function MarkdownBlock({
     <ReactMarkdown
       remarkPlugins={[remarkGfm, remarkMath]}
       rehypePlugins={[[rehypeKatex, { throwOnError: false, strict: false }]]}
+      components={{
+        table: ({ children }) => (
+          <div className="answer-table" role="region" aria-label="回答中的表格" tabIndex={0}>
+            <table>{children}</table>
+          </div>
+        ),
+      }}
     >
       {renderAnswerContent(content, hasSources, isStreaming)}
     </ReactMarkdown>
@@ -1266,7 +1273,7 @@ export function ChatInterface() {
               )}
             </form>
             <p className="mt-2 text-[11px] text-muted-foreground/70">
-              检索管线：查询改写 → 混合召回（向量 + BM25 RRF）→ Cross-Encoder 精排 → 图文分流（图片经 Vision 理解）→ 引用溯源生成
+              回答基于您有权访问的文档，请点击引用来源核对原文。
             </p>
           </div>
         </CardContent>

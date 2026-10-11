@@ -41,6 +41,7 @@ chart / diagram / screenshot），photo 默认不开。
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import re
 
 from app.config import get_settings
 from app.services.image_understanding.engines.base import EngineOutput
@@ -113,11 +114,12 @@ class FusionResult:
     rank: float = 0.0
     notes: list[str] = field(default_factory=list)
     channels: list[ChannelResult] = field(default_factory=list)
+    numeric_conflict: bool = False
 
     @property
     def agreed(self) -> bool:
-        """两个通道是否**都**通过了质检（= 交叉验证成功）."""
-        return bool(self.channels) and all(c.quality.ok for c in self.channels)
+        """通道质检均通过，且未发现表格数字分歧."""
+        return len(self.channels) >= 2 and not self.numeric_conflict and all(c.quality.ok for c in self.channels)
 
     def chosen_channel(self) -> ChannelResult | None:
         """被选中的那个通道（拿它的 quality 交给门控）."""
@@ -134,6 +136,7 @@ class FusionResult:
             "confidence": round(float(self.confidence), 4),
             "rank": round(float(self.rank), 4),
             "agreed": self.agreed,
+            "numeric_conflict": self.numeric_conflict,
             "notes": list(self.notes),
             "channels": [c.to_dict() for c in self.channels],
         }
@@ -234,7 +237,22 @@ def fuse_channels(
     vlm_side = by_channel.get(CHANNEL_VLM)
 
     if strategy == STRATEGY_COMPLEMENTARY:
-        return _fuse_complementary(image_type, ocr_side, vlm_side, channels)
+        result = _fuse_complementary(image_type, ocr_side, vlm_side, channels)
+        if image_type == "table" and ocr_side is not None and vlm_side is not None:
+            def numbers(text: str) -> list[list[str]]:
+                cells = [
+                    cell.strip() for line in text.splitlines()
+                    if line.strip().startswith("|") for cell in line.split("|")[1:-1]
+                ]
+                return [
+                    re.findall(r"[+-]?\d+(?:[.,]\d+)*(?:%|[A-Za-z]+)?", cell)
+                    for cell in cells if re.search(r"\d", cell)
+                ]
+            left, right = numbers(ocr_side.text), numbers(vlm_side.text)
+            if (left or right) and left != right:
+                result.numeric_conflict = True
+                result.notes.append("两通道表格数字、符号或单位不一致，需核对原图")
+        return result
     if strategy == STRATEGY_VISION_FIRST:
         return _fuse_vision_first(ocr_side, vlm_side, channels)
     return _fuse_ocr_first(ocr_side, vlm_side, channels)
@@ -291,7 +309,7 @@ def _fuse_complementary(
         notes.append("结构通道未通过质检，改用 VLM 产出")
         return _chosen(vlm_side, STRATEGY_COMPLEMENTARY, notes, channels)
     if _reliable(ocr_side) and vlm_side.quality.ok:
-        notes.append("双通道均通过质检（交叉验证成功）")
+        notes.append("双通道均通过各自质检")
         chosen = ocr_side if ocr_side.rank >= vlm_side.rank else vlm_side
         return _chosen(chosen, STRATEGY_COMPLEMENTARY, notes, channels)
 

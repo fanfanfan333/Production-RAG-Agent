@@ -49,6 +49,7 @@ class Settings(BaseSettings):
     OLLAMA_BASE_URL: str = "http://localhost:11434"
     OLLAMA_MODEL: str = "qwen3:8b"                    # chat / generation model
     OLLAMA_NUM_CTX: int = 8192                        # context window passed to llama-server.
+    OLLAMA_KEEP_ALIVE_SECONDS: int = 300              # 0 unloads each completed request on small machines.
                                                      # qwen3 Ollama 默认 num_ctx=40960，KV cache
                                                      # + compute buffer 需 ~1.5GB+ 常驻内存，小显存/
                                                      # 小内存机器会 OOM（llama-server 启动分配失败）。
@@ -445,7 +446,7 @@ class Settings(BaseSettings):
     # ── Document Summary（架构图 Document Summary 分支）─────────────────────────
     DOC_SUMMARY_ENABLED: bool = True
     DOC_SUMMARY_MAX_CHARS_PER_DOC: int = 12000  # 单文档摘要输入上限
-    DOC_SUMMARY_TIMEOUT_SECONDS: float = 60.0
+    DOC_SUMMARY_TIMEOUT_SECONDS: float = 120.0
     # 整库总结的文档覆盖上限。总结是逐文档 map-reduce（每份一次 LLM 调用），
     # 上限取的是"用户愿意等多久"而不是上下文装不装得下；被截断时答案末尾
     # 会明确告知"只覆盖了最近 N 份"，绝不静默漏文档（问题：总结所有文档

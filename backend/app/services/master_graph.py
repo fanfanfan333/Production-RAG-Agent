@@ -794,6 +794,7 @@ async def _generate_node(state: MasterState) -> dict:
     settings = get_settings()
     llm = _build_streaming_llm(settings)
 
+    sources = state.get("sources") or []
     context_text = state.get("multimodal_context") or ""
     if not context_text:
         # 兜底路径：multimodal_context 节点未产出上下文时，这里再组装一次 ——
@@ -808,6 +809,7 @@ async def _generate_node(state: MasterState) -> dict:
             materialized=materialized,
         )
         context_text = built.context
+        sources = built.sources
 
     focused_query = (
         f"[指令：只回答下面这个问题。"
@@ -821,6 +823,10 @@ async def _generate_node(state: MasterState) -> dict:
     ]
 
     answer = await _stream_llm_answer(llm, messages)
+    if any(source.get("manual_review") for source in sources):
+        warning = "\n\n> 图片识别结果需复核，请核对原文。"
+        emit_text(warning)
+        answer += warning
 
     # sources 以 multimodal_context 节点的为准（它带图文信息与 vision 结论）
     return {"answer": answer}
@@ -947,6 +953,7 @@ async def _summarize_node(state: MasterState) -> dict:
     for digest in digests:
         filename = str(digest.get("filename") or "未知文档")
         header = f"### {filename}\n\n"
+        header += "".join(f"> {warning}\n\n" for warning in (digest.get("warnings") or []))
         _emit(header)
         parts.append(header)
         try:
@@ -956,8 +963,7 @@ async def _summarize_node(state: MasterState) -> dict:
             )).strip()
         except asyncio.TimeoutError:
             # 单份超时：走兜底小节，不拖垮整批（DOC_SUMMARY_TIMEOUT_SECONDS 已配）。
-            # 实测单份摘要（CPU）约 33s（reasoning=False），60s 阈值留足余量；
-            # 若后续放开 reasoning，务必同步调高该阈值。
+            # CPU 冷启动可能超过 60s；默认 120s，部署时按模型与硬件校准。
             logger.warning(
                 "document_summary: per-doc summary timed out for %s (%.0fs)",
                 filename, get_settings().DOC_SUMMARY_TIMEOUT_SECONDS,
@@ -970,6 +976,7 @@ async def _summarize_node(state: MasterState) -> dict:
         if not body:
             body = "（这份文档的总结生成失败，可直接针对该文档提问获取具体内容。）"
             _emit(body)
+        _emit("\n\n")
         parts.append(body + "\n\n")
         sections.append((filename, body))
 
@@ -978,8 +985,9 @@ async def _summarize_node(state: MasterState) -> dict:
         _emit(header)
         parts.append(header)
         try:
-            overview = (await _stream_llm_answer(
-                overview_llm, build_overview_messages(query, sections)
+            overview = (await asyncio.wait_for(
+                _stream_llm_answer(overview_llm, build_overview_messages(query, sections)),
+                timeout=get_settings().DOC_SUMMARY_TIMEOUT_SECONDS,
             )).strip()
         except Exception:
             logger.exception("document_summary: overview generation failed")
@@ -1288,6 +1296,7 @@ def _build_streaming_llm(settings):
         reasoning=True,
         # 不传 num_ctx 时 Ollama 默认 40960 —— 小显存机器必 OOM 的元凶
         num_ctx=settings.chat_num_ctx,
+        keep_alive=getattr(settings, "OLLAMA_KEEP_ALIVE_SECONDS", 300),
         # 小显存机器可通过 OLLAMA_NUM_GPU=0 强制 CPU / 部分层 offload
         num_gpu=settings.OLLAMA_NUM_GPU,
     )

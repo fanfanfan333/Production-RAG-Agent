@@ -49,10 +49,7 @@
 #   2) 把最长的那一层从「下载 + 解包」压缩成「解包」，单层耗时回到 10 分钟以内；
 #   3) /wheels 只存在于 builder 阶段，不会进最终镜像（runtime 只 COPY /install）。
 #
-# 为什么仍然必须写 `torch==2.14.0+cpu`（PEP 440 本地版本标识）：
-#   `+cpu` 是 PEP 440 的 local version，`==2.14.0` **不匹配** `2.14.0+cpu`。
-#   若 requirements.txt 写成 `2.14.0`，pip 会跳过本地的 cpu wheel，转去拉
-#   554.6 MB 的 CUDA 版 torch（容器内无 GPU，纯属浪费流量）。
+# 显式钉 +cpu 以排除 CUDA 构建；PEP 440 的纯版本匹配本身也接受同版本 local wheel。
 #
 # 为什么用 wheel 完整直链 / --find-links 而不是让 pip 解析索引：
 #   阿里云 pytorch-wheels 这类镜像是**目录索引式**，不是标准 PEP 503 简单索引，
@@ -96,8 +93,7 @@ COPY constraints.txt .
 COPY _wheels /wheels
 
 # 离线安装：--no-index 表示完全不碰网络，--find-links /wheels 是唯一来源。
-RUN pip install --no-cache-dir --upgrade pip \
- && pip install --no-cache-dir --prefix=/install \
+RUN pip install --no-cache-dir --ignore-installed --prefix=/install \
       --no-index \
       --find-links /wheels \
       -c constraints.txt \
@@ -144,9 +140,14 @@ ENV HOME=/app/.cache \
     PADDLE_CACHE_DIR=/app/.cache/paddleocr
 RUN mkdir -p /app/.cache/paddleocr
 
+# Remove base tool metadata before copying pinned replacements.
+RUN python -m pip uninstall -y pip setuptools wheel
 COPY --from=builder /install /usr/local
 
 COPY app/ ./app/
+COPY scripts/ ./scripts/
+COPY eval/ ./eval/
+COPY requirements.txt constraints.txt ./
 COPY alembic/ ./alembic/
 COPY alembic.ini .
 

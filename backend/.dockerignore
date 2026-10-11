@@ -1,0 +1,7 @@
+.env*
+!.env.example
+uploads/
+.cache/
+**/__pycache__/
+.pytest_cache/
+_wheels/*.log

@@ -9,12 +9,13 @@ tenant** 的文档一起级联删除。可达路径：身份验证审核通过�
 修复后语义：**本租户文档照删，他租户文档只解绑归属（``owner_id=NULL``）不删**。
 
 运行方式（容器内，需可达数据库）：
-    docker exec -w /app -e PYTHONPATH=/app rag_backend \
+    docker exec -w /app -e PYTHONPATH=/app -e RUN_DB_INTEGRATION=1 rag_backend \
         python -m pytest tests/test_delete_company_cross_tenant.py -q -p no:cacheprovider
 """
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 import uuid
 from pathlib import Path
@@ -26,7 +27,7 @@ try:
 
     from app.db.company_models import Company
     from app.db.models import Document, DocumentStatus
-    from app.db.postgres import get_db_session
+    from app.db.postgres import get_db_session, dispose_engine
     from app.db.user_models import User
     from app.services.staff_service import (
         delete_company,
@@ -35,6 +36,8 @@ try:
 
     _IMPORT_OK = True
 except ImportError as exc:  # pragma: no cover — 宿主机缺依赖 → 跳过
+    if os.getenv("RUN_DB_INTEGRATION") == "1":
+        raise
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from _module_skip import skip_module
 
@@ -69,7 +72,7 @@ async def _scenario() -> None:
     async with get_db_session() as s:
         admin = await s.scalar(select(User).where(User.username == "admin").limit(1))
     if admin is None or not admin.is_admin:
-        pytest.skip("找不到平台管理员 admin — 跳过（需容器内数据库）")
+        pytest.fail("找不到平台管理员 admin，显式开启的数据库门禁不能跳过")
 
     try:
         cname = "跨租户回归公司_" + uuid.uuid4().hex[:6]
@@ -131,16 +134,18 @@ async def _scenario() -> None:
             assert await s.get(Company, tid) is None
     finally:
         await _cleanup(tid, other)
+        await dispose_engine()
 
 
+@pytest.mark.skipif(os.getenv("RUN_DB_INTEGRATION") != "1", reason="requires an isolated test database; set RUN_DB_INTEGRATION=1")
 def test_delete_company_unbinds_cross_tenant_document_without_deleting_it():
     if not _IMPORT_OK:
         return
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from _module_skip import skip_if_host_shimmed
+    from _module_skip import host_shimmed
 
     # 本用例必须连**真实 Postgres**。宿主机 asyncpg 被 conftest 哑桩顶替时，
     # 连库会抛 ``TypeError: object _Permissive can't be used in 'await' expression``
     # —— 那是环境缺失，**不是**跨租户级联误删缺陷。容器内依赖齐全 → 真跑。
-    skip_if_host_shimmed("asyncpg")
+    assert not host_shimmed("asyncpg"), "显式开启的数据库门禁必须安装真实 asyncpg"
     asyncio.run(_scenario())

@@ -29,8 +29,7 @@ export function getApiBase(): string {
 /**
  * Base URL for the SSE streaming endpoint (流式专用).
  *
- * Goes DIRECTLY to the FastAPI backend instead of through the Next.js
- * `/api` rewrite, so no proxy layer can ever buffer the token stream.
+ * Uses the same-origin API proxy so remote clients never connect to their own localhost.
  * A user-configured backend URL (localStorage) still wins.
  */
 export function getStreamApiBase(): string {
@@ -40,7 +39,7 @@ export function getStreamApiBase(): string {
   }
   return (
     process.env.NEXT_PUBLIC_API_URL?.replace(/\/$/, "") ||
-    "http://localhost:8000"
+    API_BASE
   );
 }
 

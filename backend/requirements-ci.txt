@@ -10,7 +10,8 @@
 #     python -m pytest tests -q
 # 全套用例仍能跑通 —— 因为 tests/conftest.py 有一层「宿主机轻依赖垫片」：仅在
 # 真实第三方包 import 失败时注入哑桩，且只在宿主机/CI 缺包时生效（容器里依赖齐全
-# 时完全不生效）。需要真 cv2 / python-pptx / asyncpg 的少数用例会经
+# 时完全不生效）。OpenCV 必须真实安装；需要真 asyncpg 的数据库集成测试显式启用。
+# 其它缺少可选重依赖的用例会经
 # _module_skip.skip_if_host_shimmed **运行期条件跳过**，不会假绿（见
 # tests/test_host_shim_guard.py 对这两个前提的守卫）。
 #
@@ -25,20 +26,20 @@
 # 维护：当 requirements.txt 里**纯逻辑路径**新增了顶层依赖时，同步在这里补一条，
 # 否则 CI 会因为缺包走垫片路径而漏测。
 
-fastapi==0.141.1
+fastapi==0.143.0
 starlette==1.6.0
-uvicorn==0.38.0
-pydantic==2.13.5
+uvicorn==0.32.1
+pydantic==2.14.0
 pydantic-settings==2.15.0
-bcrypt==5.0.0
+bcrypt==4.2.1
 httpx==0.28.1
 python-multipart==0.0.32
 python-dotenv==1.2.3
 PyYAML==6.0.3
-PyJWT==2.10.1
+PyJWT==2.15.1
 
 # Database（asyncpg 不在轻量集里 → 被垫片顶替；纯逻辑用 SQLAlchemy Core 即可）
-SQLAlchemy==2.0.54
+SQLAlchemy==2.0.36
 alembic==1.14.0
 
 # 文档 / 图片的**纯逻辑**路径
@@ -47,22 +48,24 @@ python-docx==1.2.0
 python-pptx==1.0.2
 openpyxl==3.1.5
 xlsxwriter==3.2.9
-numpy==2.5.3
+# Match the runtime OpenCV ABI; image preprocessing tests require real OpenCV.
+numpy==1.26.4
+opencv-python-headless==4.10.0.84
 
 # 向量客户端（构造 payload / point id 的单测用）
-qdrant-client==1.19.1
+qdrant-client==1.12.1
 
 # LangGraph / LangChain 编排（graph 装配、topology 单测用）
-langchain==0.3.30
-langchain-community==0.3.27
-langchain-core==0.3.86
-langchain-ollama==0.3.10
-langchain-text-splitters==0.3.11
-langgraph==1.0.1
-langgraph-checkpoint==3.0.1
-langgraph-prebuilt==1.0.1
-langgraph-sdk==0.2.15
+langchain-core==1.6.9
+langchain-ollama==1.1.0
+langgraph==1.2.14
+langgraph-checkpoint==4.2.0
+langgraph-prebuilt==1.1.0
+langgraph-sdk==0.4.6
 
 # 测试工具
 pytest==9.1.1
 pyflakes==3.4.0
+pip-audit==2.10.1
+multidict==6.9.1
+pip==26.2.1

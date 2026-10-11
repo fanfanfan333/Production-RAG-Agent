@@ -119,7 +119,7 @@ class PaddleOCREngine(ImageEngine):
         try:
             # 串行化：共享 predictor 并发调用会 SIGSEGV，见模块 docstring 坑 4
             with _predict_lock:
-                raw = ocr.ocr(_to_bgr(image), cls=False)
+                raw = paddle_common.ocr_result(ocr, _to_bgr(image))
         except Exception as exc:      # noqa: BLE001
             logger.warning("PaddleOCR inference failed: %s", exc)
             return EngineOutput(engine=self.name, ok=False, error=str(exc))
@@ -186,7 +186,15 @@ class PPStructureEngine(ImageEngine):
                     v3 = paddle_common.pp_structure_v3_class()
                     if v3 is not None:
                         try:
-                            _layout_instance = v3()
+                            _layout_instance = v3(
+                                device="cpu", enable_mkldnn=False,
+                                lang=paddle_common.paddle_lang(),
+                                ocr_version=paddle_common.paddle_ocr_version(),
+                                use_doc_orientation_classify=False, use_doc_unwarping=False,
+                                use_textline_orientation=False, use_table_recognition=False,
+                                use_formula_recognition=False, use_chart_recognition=False,
+                                use_seal_recognition=False, use_region_detection=False,
+                            )
                         except Exception as exc:      # noqa: BLE001
                             logger.warning("PP-StructureV3 init failed: %s", exc)
                             _layout_instance = None
@@ -212,7 +220,16 @@ class PPStructureEngine(ImageEngine):
         try:
             # 串行化：见模块 docstring 坑 4
             with _predict_lock:
-                regions_raw = struct(_to_bgr(image))
+                if hasattr(struct, "predict"):
+                    regions_raw = []
+                    for page in struct.predict(_to_bgr(image)):
+                        for block in page.get("parsing_res_list", []):
+                            if isinstance(block, dict):
+                                regions_raw.append({"bbox": block.get("block_bbox"), "type": block.get("block_label"), "res": block.get("block_content", "")})
+                            else:
+                                regions_raw.append({"bbox": block.bbox, "type": block.label, "res": block.content})
+                else:
+                    regions_raw = struct(_to_bgr(image))
         except Exception as exc:      # noqa: BLE001
             logger.warning("PP-Structure inference failed: %s", exc)
             return EngineOutput(engine=self.name, ok=False, error=str(exc))
@@ -277,7 +294,7 @@ class PaddleFormulaEngine(ImageEngine):
                     cls = paddle_common.formula_class()
                     if cls is not None:
                         try:
-                            _formula_instance = cls()
+                            _formula_instance = cls(device="cpu", enable_mkldnn=False)
                         except Exception as exc:      # noqa: BLE001
                             logger.warning("Formula engine init failed: %s", exc)
                             _formula_instance = None
@@ -291,7 +308,7 @@ class PaddleFormulaEngine(ImageEngine):
         try:
             # 串行化：见模块 docstring 坑 4
             with _predict_lock:
-                raw = engine(_to_bgr(image))
+                raw = list(engine.predict(_to_bgr(image))) if hasattr(engine, "predict") else engine(_to_bgr(image))
         except Exception as exc:      # noqa: BLE001
             logger.warning("Formula inference failed: %s", exc)
             return EngineOutput(engine=self.name, ok=False, error=str(exc))
@@ -301,7 +318,7 @@ class PaddleFormulaEngine(ImageEngine):
         if isinstance(raw, list) and raw:
             item = raw[0]
             if isinstance(item, dict):
-                latex = str(item.get("rec_text") or item.get("latex") or "")
+                latex = str(item.get("rec_formula") or item.get("rec_text") or item.get("latex") or "")
                 conf = float(item.get("rec_score") or item.get("score") or 0.0)
             elif isinstance(item, (list, tuple)) and item:
                 latex = str(item[0])

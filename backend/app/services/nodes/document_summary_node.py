@@ -59,6 +59,7 @@ _SINGLE_DOC_SYSTEM = """\
 
 规则：
 - 只基于给出的内容采样，严禁编造采样中不存在的事实、数字或结论。
+- 内容标记待复核时，明确提醒核对原文，不把有分歧的数值写成确定结论。
 - 采样只是文档的部分内容；内容不足以支撑某个部分时如实说明"采样内容较少"，
   不要硬编，也不要提及"采样"以外的获取渠道。
 - 不要输出 "###" 标题，不要写文档名作为开头（系统会加），不要提及其他文档。
@@ -471,8 +472,10 @@ def build_summary_llm(reasoning: bool | None = None):
         model=settings.OLLAMA_MODEL,
         base_url=settings.OLLAMA_BASE_URL,
         temperature=0.2,
+        num_predict=1024,
         streaming=True,
         reasoning=reasoning,
         num_ctx=settings.chat_num_ctx,
+        keep_alive=getattr(settings, "OLLAMA_KEEP_ALIVE_SECONDS", 300),
         num_gpu=settings.OLLAMA_NUM_GPU,
     )

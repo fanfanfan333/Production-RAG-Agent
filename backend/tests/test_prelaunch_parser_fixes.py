@@ -349,6 +349,7 @@ def test_document_summary_reasoning_defaults_to_off() -> None:
     """本机 qwen3:8b 是推理模型：逐份摘要属"抽取/结构化"类，开着思考会吃光
     ``num_predict`` 导致 content 空串，且实测 92s vs 33s。"""
     assert _settings_default("DOC_SUMMARY_REASONING") is False
+    assert float(_settings_default("DOC_SUMMARY_TIMEOUT_SECONDS")) >= 120
 
 
 def test_max_images_per_document_default_is_tightened() -> None:
@@ -376,13 +377,8 @@ def test_document_summary_timeout_is_not_a_dead_config() -> None:
     print(f"    · DOC_SUMMARY_TIMEOUT_SECONDS 读取处：{', '.join(referenced)}")
 
 
-def test_dual_channel_types_exclude_table() -> None:
-    """表格已有 TableTransformer + 规则法两条**模型无关**通路，再让 VLM 跑第三次
-    是性价比最低的一次调用。
-
-    ⚠️ 断言的是**生效值**（``get_settings()``，即 .env）。``config.py`` 的类默认值
-    目前**仍含 table**，只有 .env 去掉了 —— 属已知不一致，已记在本轮报告里。
-    """
+def test_dual_channel_types_include_table() -> None:
+    """检查生效配置：可靠网格仍可能误读单位和符号，需要表格交叉校验."""
     effective = (get_settings().IMAGE_DUAL_CHANNEL_TYPES or "").lower()
     names = {t.strip() for t in effective.split(",") if t.strip()}
-    assert "table" not in names, f"生效配置仍对表格开双通道：{effective}"
+    assert "table" in names, f"生效配置未对表格开双通道：{effective}"

@@ -22,8 +22,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import threading
 import time
+from collections import OrderedDict
 
 import httpx
 
@@ -69,6 +71,8 @@ class VisionService:
         self._probe_done = False
         self._available: bool | None = None
         self._probe_error: str | None = None
+        self._results = OrderedDict()
+        self._results_lock = threading.Lock()
         self._initialized = True
 
     # ── 配置 / 可用性 ──────────────────────────────────────────────────────
@@ -172,6 +176,15 @@ class VisionService:
         timeout: float,
     ) -> str | None:
         settings = get_settings()
+        # Cache pure image/prompt results, never retrieval results or original image bytes.
+        key = (settings.OLLAMA_BASE_URL, self.model, settings.chat_num_ctx,
+               hashlib.sha256(image_bytes).digest(), hashlib.sha256(prompt.encode()).digest())
+        with self._results_lock:
+            hit = self._results.get(key)
+            if hit and time.monotonic() - hit[0] < 300:
+                self._results.move_to_end(key)
+                return hit[1]
+            self._results.pop(key, None)
         b64 = base64.b64encode(image_bytes).decode("ascii")
         # 与 ChatOllama 各构造点同源：OLLAMA_NUM_GPU 是全局开关，这里直连
         # /api/generate（不经 langchain），所以必须自己带 num_gpu，否则漏掉
@@ -191,12 +204,19 @@ class VisionService:
                     "prompt": prompt,
                     "images": [b64],
                     "stream": False,
+                    "keep_alive": getattr(settings, "OLLAMA_KEEP_ALIVE_SECONDS", 300),
                     "options": options,
                 },
                 timeout=timeout,
             )
             resp.raise_for_status()
             text = str(resp.json().get("response", "")).strip()
+            if text and len(text) <= 64000:
+                with self._results_lock:
+                    self._results[key] = (time.monotonic(), text)
+                    self._results.move_to_end(key)
+                    while len(self._results) > 32:
+                        self._results.popitem(last=False)
             return text or None
         except Exception as exc:      # noqa: BLE001
             logger.warning("Vision generate failed (model=%s): %s", self.model, exc)

@@ -195,6 +195,8 @@ class ExtractedImage:
         没有 caption 时仍保留 OCR（聊胜于无，且删掉就等于这张图彻底检索不到）。
         """
         parts: list[str] = []
+        if (self.analyze_fusion or {}).get("numeric_conflict"):
+            parts.append("[待复核：表格识别的数字、符号或单位存在分歧，不能据此确定数值，请核对原图。]")
         structured = (self.structured_content or "").strip()
         if structured:
             parts.append(structured)

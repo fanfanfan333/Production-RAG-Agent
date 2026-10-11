@@ -316,7 +316,7 @@ export function ConversationSidebar() {
       {/* ── 底部标识（纯文字，无图标） ── */}
       <div className="border-t border-zinc-300/60 px-4 py-2.5">
         <p className="text-[10px] text-zinc-500">
-          粗排召回 + Cross-Encoder 精排 · 引用溯源
+          保留问答记录，随时回看引用来源
         </p>
       </div>
     </div>

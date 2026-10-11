@@ -49,6 +49,8 @@ jobs:
   gates:
     name: 静态门禁 + 全量 pytest + 隔离/权限子集
     runs-on: ubuntu-latest
+    env:
+      OLLAMA_BASE_URL: http://127.0.0.1:9
     defaults:
       run:
         working-directory: backend
@@ -70,6 +72,9 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements-ci.txt
+
+      - name: Python dependency security gate
+        run: python scripts/audit_python_dependencies.py --out /tmp/python-dependency-audit.json
 
       # ── 门禁 1：条件分支内 import 遮蔽模块级导入（UnboundLocalError 隐患）──
       - name: "门禁 1 · check_shadowed_imports"
@@ -168,17 +173,44 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Runtime Python dependency security gate
+        run: |
+          python -m venv /tmp/rag-dependency-auditor
+          /tmp/rag-dependency-auditor/bin/pip install pip-audit==2.10.1
+          python scripts/audit_python_dependencies.py --auditor-python /tmp/rag-dependency-auditor/bin/python --out /tmp/runtime-dependency-audit.json
+
+      - name: 生成复杂文档照片夹具
+        run: python scripts/make_doc_photo_fixture.py --out ../_doc_photo_fixtures
+
+      - name: 真实 OCR / 多模态 / 数据隔离门禁（缺依赖或模型不得跳过）
+        env:
+          RUN_REAL_VLM: "1"
+          RUN_DB_INTEGRATION: "1"
+        run: |
+          python -m pytest tests/test_docling_real.py -q --junitxml=/tmp/docling-report.xml
+          python -m pytest tests/test_ocr_photo_summary_real_vlm.py -q --junitxml=/tmp/complex-document-report.xml
+          python -m pytest tests/test_delete_company_cross_tenant.py -q --junitxml=/tmp/database-isolation-report.xml
+
       - name: 真实栈评测（退出码非 0 即阻断发布）
         env:
           RAG_EVAL_PASSWORD: ${{ secrets.RAG_EVAL_PASSWORD }}
           RAG_EVAL_USERNAME: ${{ vars.RAG_EVAL_USERNAME || 'admin' }}
           RAG_BASE_URL: ${{ vars.RAG_BASE_URL || 'http://127.0.0.1:8000' }}
-        run: python -u scripts/run_eval_baseline.py --out /tmp/eval_baseline_report.json
+        run: python -u scripts/run_eval_baseline.py --golden eval/golden_v1.json --out /tmp/eval_baseline_report.json
+
+      - name: 逐账号金标与跨租户探针
+        run: python -u scripts/eval_per_account.py --out /tmp/eval_per_account.md
 
       - name: 上传评测回执（无论成败）
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: eval-baseline-report
-          path: /tmp/eval_baseline_report.json
+          path: |
+            /tmp/eval_baseline_report.json
+            /tmp/runtime-dependency-audit.json
+            /tmp/complex-document-report.xml
+            /tmp/docling-report.xml
+            /tmp/database-isolation-report.xml
+            /tmp/eval_per_account.md
           if-no-files-found: ignore

@@ -157,6 +157,65 @@ def test_truncation_is_disclosed():
     assert "注：" in answer, answer
 
 
+def test_summary_stream_preserves_section_separators(monkeypatch):
+    async def stream(llm, messages):
+        emit_text("正文")
+        return "正文"
+
+    monkeypatch.setattr(mg, "build_summary_llm", lambda **kwargs: object())
+    monkeypatch.setattr(mg, "_stream_llm_answer", stream)
+    buf = []
+    token = bind_sink(buf)
+    try:
+        result = asyncio.run(mg._summarize_node({
+            "query": "总结", "digests": [
+                {"filename": "a.pdf", "text": "a"},
+                {"filename": "b.pdf", "text": "b"},
+            ],
+        }))
+    finally:
+        reset_sink(token)
+    assert "正文\n\n### b.pdf" in "".join(buf)
+    assert "".join(buf).strip() == result["answer"]
+
+
+def test_overview_timeout_cancels_generation_and_keeps_document_summaries(monkeypatch):
+    from types import SimpleNamespace
+
+    calls = 0
+    cancelled = []
+
+    async def stream(llm, messages):
+        nonlocal calls
+        calls += 1
+        if calls <= 2:
+            emit_text("文档要点")
+            return "文档要点"
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.append(True)
+
+    monkeypatch.setattr(mg, "build_summary_llm", lambda **kwargs: object())
+    monkeypatch.setattr(mg, "_stream_llm_answer", stream)
+    monkeypatch.setattr(mg, "get_settings", lambda: SimpleNamespace(DOC_SUMMARY_TIMEOUT_SECONDS=0.01))
+    buf = []
+    token = bind_sink(buf)
+    try:
+        result = asyncio.run(mg._summarize_node({
+            "query": "总结", "digests": [
+                {"filename": "a.pdf", "text": "a"},
+                {"filename": "b.pdf", "text": "b"},
+            ],
+        }))
+    finally:
+        reset_sink(token)
+    assert cancelled == [True]
+    assert result["answer"].count("文档要点") == 2
+    assert "总体概览生成失败" in result["answer"]
+    assert "".join(buf).strip() == result["answer"]
+
+
 if __name__ == "__main__":
     failed = 0
     for name, fn in sorted(globals().items()):

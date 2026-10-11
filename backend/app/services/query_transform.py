@@ -409,6 +409,7 @@ async def _rewrite_query_impl(
             # 本机实测每次重载 ≈11s。改小并不省内存（峰值由生成节点决定），
             # 只会让"辅助节点 ↔ 生成节点"来回交替时反复白等。见 config.chat_num_ctx。
             num_ctx=settings.chat_num_ctx,
+            keep_alive=getattr(settings, "OLLAMA_KEEP_ALIVE_SECONDS", 300),
             format="json",            # 让 Ollama 保证输出是 JSON，省掉一轮解析失败
         )
         if has_history:

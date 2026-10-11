@@ -31,6 +31,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from html import unescape
 from pathlib import Path
 
 from app.utils.logging import get_logger
@@ -79,10 +80,10 @@ def reset_probe_cache() -> None:
 
 _HTML_TABLE_RE = re.compile(r"<table\b.*?</table>", re.DOTALL | re.IGNORECASE)
 _HTML_ROW_RE = re.compile(r"<tr\b.*?</tr>", re.DOTALL | re.IGNORECASE)
-_HTML_CELL_RE = re.compile(r"<t[dh]\b[^>]*>(.*?)</t[dh]>", re.DOTALL | re.IGNORECASE)
+_HTML_CELL_RE = re.compile(r"<t[dh]\b([^>]*)>(.*?)</t[dh]>", re.DOTALL | re.IGNORECASE)
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
-_HTML_ROWSPAN_RE = re.compile(
-    r'<t[dh]\b[^>]*\browspan\s*=\s*"?(\d+)"?[^>]*>', re.IGNORECASE
+_HTML_SPAN_RE = re.compile(
+    r'''\b(rowspan|colspan)\s*=\s*(?:"(\d+)"|'(\d+)'|(\d+))''', re.IGNORECASE
 )
 
 
@@ -95,23 +96,43 @@ def html_table_to_markdown(html: str) -> str:
     表格还原、前端的表格预览）**只认 Markdown 表格**，直接落 HTML 会让表格
     退化成一段"看起来像文本"的普通段落 —— 表格检索和表格渲染同时失效。
 
-    处理能力刻意保守：去标签、按 ``<tr>/<td>`` 切分、补齐列宽。``rowspan``/``colspan``
-    的**合并语义不去还原**（还原需要完整网格推演，出错时会造出比原表更错的表，
-    违反"宁缺毋假"）；只需保证单元格文字与行列关系不丢。
+    合并单元格展开到覆盖的行列，重复标签以保留每行语义；限制展开规模以防异常输入耗尽内存。
     """
     def _one(match: re.Match) -> str:
-        rows: list[list[str]] = []
-        for row_html in _HTML_ROW_RE.findall(match.group(0)):
-            cells = [
-                _HTML_TAG_RE.sub("", c).strip().replace("|", "\\|").replace("\n", " ")
-                for c in _HTML_CELL_RE.findall(row_html)
-            ]
-            if cells:
-                rows.append(cells)
-        if not rows:
+        row_htmls = _HTML_ROW_RE.findall(match.group(0))
+        grid: list[dict[int, str]] = [{} for _ in row_htmls]
+        expanded = 0
+        for row_index, row_html in enumerate(row_htmls):
+            column = 0
+            for attrs, body in _HTML_CELL_RE.findall(row_html):
+                spans = {
+                    name.lower(): int(double or single or bare)
+                    for name, double, single, bare in _HTML_SPAN_RE.findall(attrs)
+                }
+                rowspan = spans.get("rowspan", 1)
+                if rowspan == 0:
+                    rowspan = len(grid) - row_index
+                rowspan = min(rowspan, len(grid) - row_index)
+                colspan = max(1, spans.get("colspan", 1))
+                while column in grid[row_index]:
+                    column += 1
+                expanded += rowspan * colspan
+                if column + colspan > 1000 or expanded > 100_000:
+                    raise ValueError("HTML table span exceeds safe grid size")
+                body = re.sub(r"<br\s*/?>", " ", body, flags=re.IGNORECASE)
+                text = unescape(_HTML_TAG_RE.sub("", body)).strip().replace("|", "\\|").replace("\n", " ")
+                for r in range(row_index, row_index + rowspan):
+                    for c in range(column, column + colspan):
+                        if c in grid[r]:
+                            raise ValueError("HTML table spans overlap")
+                        grid[r][c] = text
+                column += colspan
+        if not any(grid):
             return ""
-        width = max(len(r) for r in rows)
-        rows = [r + [""] * (width - len(r)) for r in rows]
+        width = max(max(row, default=-1) for row in grid) + 1
+        if width * len(grid) > 100_000:
+            raise ValueError("HTML table span exceeds safe grid size")
+        rows = [[row.get(c, "") for c in range(width)] for row in grid if row]
         out = ["| " + " | ".join(rows[0]) + " |"]
         out.append("| " + " | ".join("---" for _ in range(width)) + " |")
         for r in rows[1:]:
@@ -510,7 +531,7 @@ class DoclingProvider(StructureProvider):
 
     def _parse_bytes(self, content: bytes, filename: str) -> StructuredDocument | None:
         try:
-            from docling.document_converter import DocumentConverter
+            from app.services.image_understanding.engines.docling_engine import DoclingEngine
         except Exception:            # noqa: BLE001
             return None
 
@@ -519,7 +540,7 @@ class DoclingProvider(StructureProvider):
             src = Path(tmp) / f"input{suffix}"
             src.write_bytes(content)
             try:
-                result = DocumentConverter().convert(str(src))
+                result = DoclingEngine()._get_converter().convert(str(src))
                 doc = result.document
             except Exception as exc:     # noqa: BLE001
                 logger.warning("docling convert failed: %s", exc)

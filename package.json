@@ -6,7 +6,8 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "next lint",
+    "lint": "eslint app components lib next.config.ts",
+    "test": "node --test tests/*.test.cjs",
     "dev:api": "cd backend && docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d backend",
     "dev:api:logs": "cd backend && docker compose -f docker-compose.yml -f docker-compose.dev.yml logs -f backend",
     "dev:api:stop": "cd backend && docker compose -f docker-compose.yml -f docker-compose.dev.yml stop backend"
@@ -18,9 +19,9 @@
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "framer-motion": "^12.23.12",
-    "katex": "^0.16.47",
+    "katex": "^0.19.0",
     "lucide-react": "^0.542.0",
-    "next": "^15.5.2",
+    "next": "^15.5.27",
     "react": "^19.1.1",
     "react-dom": "^19.1.1",
     "react-markdown": "^10.1.0",
@@ -31,13 +32,18 @@
     "tailwind-merge": "^3.3.1"
   },
   "devDependencies": {
+    "@eslint/eslintrc": "^3.3.5",
     "@tailwindcss/postcss": "^4.1.12",
     "@types/node": "^24.3.0",
     "@types/react": "^19.1.12",
     "@types/react-dom": "^19.1.9",
     "eslint": "^9.34.0",
-    "eslint-config-next": "^15.5.2",
+    "eslint-config-next": "^15.5.27",
     "tailwindcss": "^4.1.12",
     "typescript": "^5.9.2"
+  },
+  "overrides": {
+    "katex": "$katex",
+    "postcss": "^8.5.29"
   }
 }

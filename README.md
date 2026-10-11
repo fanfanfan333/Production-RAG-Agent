@@ -11,7 +11,7 @@
 
 ![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python\&logoColor=white)
 
-![FastAPI](https://img.shields.io/badge/FastAPI-0.115-009688?logo=fastapi\&logoColor=white)
+![FastAPI](https://img.shields.io/badge/FastAPI-0.143-009688?logo=fastapi\&logoColor=white)
 
 ![Next.js](https://img.shields.io/badge/Next.js-15-000?logo=next.js)
 
@@ -30,6 +30,22 @@
 ![License](https://img.shields.io/badge/License-MIT-yellow)
 
 </div>
+
+### 最近升级与实测结果
+
+在现有 LangGraph、混合检索和权限体系上，完善复杂文档解析、推理稳定性与质量门禁：
+
+| 方向 | 本次改进 |
+| :-- | :-- |
+| 复杂文档 | 修复 HTML 表格跨行/跨列还原、OCR 表格路由和模型缓存；双通道数值/单位分歧标记待复核。真实 Docling 测试验证扫描表格页码及 Word 合并表头，2 GB 容器内通过 |
+| 检索质量 | 按完整证据去重，统一精排分数校准；推理异常返回空证据并触发重试/拒答，避免粗排分冒充精排结果 |
+| 权限与评测 | 原业务库 20 例逐账号金标 Recall@1/3/5/10、MRR 均为 1.0；10 个越权探针零命中。该结果仅代表当前小规模测试集 |
+| 图片问答延迟 | 新增最多 32 条、5 分钟的视觉缓存，权限检查先于缓存访问；本机相同问题两轮完整问答从 111.84 秒降至 72.42 秒，重复访问耗时减少约 35.2%，两轮引用校验通过 |
+| 前端与推理 | 同源流式接口、UTF-8/SSE 完整性处理、长任务代理超时；统一模型上下文和驻留设置，修复请求超过 2048 上下文的故障 |
+| 依赖与门禁 | 更新并锁定后端/前端依赖，加入依赖审计和前端 CI；真实 OCR/Docling、数据库隔离和逐账号金标纳入发布门禁入口 |
+
+本机完整运行依赖回归 68 项通过；详细环境、既往测试、限制及开发依赖例外见 [验收记录](docs/enterprise-readiness-2026-10-10.md)。首次图片问答仍较慢，以上结果不代表生产并发 SLA。低内存机器请串行运行重模型测试，并在测试后释放模型；检索压测默认并发为 1。
+
 
 ---
 
@@ -718,13 +734,13 @@ Evidence Gate 是它之后的**确定性兜底**——不看语义，只看证�
 | 层    | 选型                                                                                                                                       |
 | :--- | :--------------------------------------------------------------------------------------------------------------------------------------- |
 | 前端   | Next.js 15（App Router）· React 19 · TypeScript 5 · Tailwind CSS 4 · Radix UI · Framer Motion · react-markdown + remark-gfm · 原生 SSE 流式客户端 |
-| 后端   | FastAPI 0.115 · LangGraph · SQLAlchemy 2.0（async）+ asyncpg · Alembic · Pydantic 2 + Pydantic-Settings · PyJWT + cryptography（RS256 验签）+ bcrypt                   |
+| 后端   | FastAPI 0.143 · LangGraph · SQLAlchemy 2.0（async）+ asyncpg · Alembic · Pydantic 2 + Pydantic-Settings · PyJWT + cryptography（RS256 验签）+ bcrypt                   |
 | 身份认证 | Keycloak 26（OIDC · Authorization Code + PKCE）· JWKS 验签 · 多租户 claim（company_a / company_b）· 本地账号（HS256）双通路 |
 | 检索引擎 | 自研 BM25（字符 bigram，零依赖）· Qdrant 1.12 · RRF 融合 · bge-reranker 三级降级精排                                                                       |
 | 生成   | Ollama 本地推理（默认 qwen3:8b）· LangChain-Ollama · 流式输出 · 思考流分离                                                                                |
 | 向量化  | BGE 本地模型（bge-large-zh-v1.5，1024 维）· CPU-only torch · FlagEmbedding                                                                       |
-| 文档解析 | PyMuPDF · python-docx · python-pptx · openpyxl · pandas · markdown                                                                       |
-| OCR  | PaddleOCR 2.9 · Tesseract · OpenCV（headless）                                                                                             |
+| 文档解析 | Docling 2.137 · PyMuPDF · python-docx · python-pptx · openpyxl · pandas · markdown                                                                       |
+| OCR  | PaddleOCR 3.7 · PaddlePaddle 3.3 · Tesseract · OpenCV（headless）                                                                                             |
 | 数据存储 | PostgreSQL 16（元数据 · 对话 · 用户 · 审计 · 反馈）· Qdrant（向量 + payload）                                                                             |
 | 工程   | Docker 多阶段构建 · docker-compose · 非 root 容器 · 国内镜像加速                                                                                       |
 
@@ -740,7 +756,7 @@ Evidence Gate 是它之后的**确定性兜底**——不看语义，只看证�
 | Ollama                  | 最新版                        | [安装指南](https://ollama.com)                       |
 | Node.js                 | 18.18+（推荐 20 LTS）          | [安装指南](https://nodejs.org)                       |
 | Git                     | 任意版本                       | [安装指南](https://git-scm.com)                      |
-| Python                  | 3.12                       | 仅在不使用 Docker 运行后端时需要（PaddlePaddle 2.6 尚未适配 3.13） |
+| Python                  | 3.12                       | 与已验证的后端镜像一致；直接运行后端时使用锁定依赖 |
 
 ### 7.2 安装 Ollama 并拉取模型
 
@@ -758,7 +774,7 @@ ollama pull qwen3:8b
 ollama pull qwen2.5vl:7b
 ```
 
-内存小于 16 GB 的机器可在 `backend/.env` 中将 `OLLAMA_NUM_CTX` 由 8192 下调至 4096。
+低内存机器优先采用下方本机 CPU 配置，以较小模型、串行嵌入及推理后卸载模型节省内存。保留 `OLLAMA_NUM_CTX=8192`；只缩小上下文而不协调检索证据预算，会导致问答超限。
 
 ### 7.3 获取代码
 
@@ -788,7 +804,8 @@ cp .env.example .env
 
 其余配置项均有合理默认值，本地开发可直接使用。完整说明见 `backend/.env.example` 注释与本文第八节。
 
-> Linux 宿主机注意：Docker Engine 默认不提供 `host.docker.internal`。可在 compose 的 backend 服务中追加>   
+> Linux 宿主机注意：Docker Engine 默认不提供 `host.docker.internal`。可在 compose 的 backend 服务中追加
+>
 > `extra_hosts: ["host.docker.internal:host-gateway"]`，或直接在 `.env` 中填写宿主机内网 IP。
 
 ### 7.5 启动后端
@@ -815,6 +832,20 @@ docker compose logs -f backend      # 观察启动日志，首次会下载模型
 - 数据库表结构在应用启动时自动创建，无需手动执行迁移
 - Keycloak 首次启动约需 30–60 秒（`healthcheck` 通过后才算就绪）；控制台 `http://localhost:8080` 可用 `admin` / `admin` 登录
 - **企业统一身份登录**：打开 `http://localhost:3000/login` 点击「企业统一身份登录」，用内置演示账号（如 `zhangsan` / `Passw0rd!`）登录即可。想只用本地账号时，把 `backend/.env` 的 `KEYCLOAK_ENABLED` 设为 `false` 并 `docker compose stop keycloak`
+
+#### 本机低内存 CPU 配置
+
+先完成环境配置和模型缓存准备，再从仓库根目录启动：
+
+```bash
+ollama pull qwen3:4b-instruct-2507-q4_K_M
+ollama pull qwen2.5vl:3b
+docker compose -f backend/docker-compose.yml -f backend/docker-compose.local.yml -f backend/docker-compose.low-memory.yml up -d --build backend
+```
+
+在 `backend/.env` 中配置 `OLLAMA_VISION_MODEL=qwen2.5vl:3b`。该 Compose 覆盖仅调整本机运行参数：后端限制 3 GB / 2 CPU，嵌入并发为 1，8192 上下文，文本模型使用明确的 Instruct 4B，每次推理后卸载；正式配置默认模型保持不变。Ollama 在宿主运行，**其内存不受后端容器 3 GB 限制**，测试前需检查本机可用内存。
+
+该配置启用 Hugging Face / Transformers 离线模式，需提前缓存嵌入、精排及解析模型；缺少缓存时先按常规联网配置准备权重，再切换到此配置。真实 OCR/Docling 测试和推理压测分开串行运行，避免同时加载多个重模型。原有文档需重新入库才会使用新版解析结果。
 
 ### 7.6 开发模式：后端热重载
 
@@ -1170,3 +1201,17 @@ SSE 事件序列：`thinking` → `intent` → `sources` / `doc_digests` → `gr
 ## 十二、许可
 
 本项目以 [MIT](./LICENSE) 协议开源。
+# 本机运行配置
+
+Windows 下运行 `start-dev.cmd` 会先构建最新后端，启动原有数据卷上的 PostgreSQL、Qdrant 和后端，健康检查通过后再启动前端。构建或健康检查失败会退出，不再继续打开前端。离线构建需要 `backend/_wheels` 已准备完整。
+
+本机启动叠加 `backend/docker-compose.low-memory.yml`：后端上限 3 GB/2 CPU，数据库和向量库各 512 MB；采用已安装的 `qwen3:4b-instruct-2507-q4_K_M`，上下文 8192、嵌入并发 1。新机器需先安装该模型，并准备完整的 Hugging Face、PaddleOCR 与 Docling 缓存；本机配置直接读取已有缓存。优先保留检索证据，通过较小模型、串行处理及每次推理完成后卸载模型控制内存；重新加载会增加延迟。正式大内存部署仍使用主 Compose 配置。容器上限不约束宿主机 Ollama，剩余内存不足时不要运行多人请求。
+
+浏览器流式问答默认使用同源 `/api`，远程用户不再连接自己电脑的 `localhost:8000`。Next.js 代理空闲超时为 10 分钟，允许 CPU 检索、看图和文档总结超过默认 30 秒；显式配置的后端地址仍优先。
+
+单独启动后端：
+
+```powershell
+cd backend
+docker compose -f docker-compose.yml -f docker-compose.local.yml -f docker-compose.low-memory.yml up -d --build postgres qdrant backend
+```

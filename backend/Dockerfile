@@ -72,7 +72,7 @@ RUN set -eu; \
     libgl1 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
+COPY requirements.txt constraints.txt ./
 # 上游 PyPI 镜像同样会抖动（TUNA 直接连接被重置）：加 --retries 让 pip 自己重试，
 # 而不是一次抖动就废掉十几分钟的依赖安装层。
 #
@@ -80,8 +80,8 @@ COPY requirements.txt .
 #    `+cpu` 轮子，因此本配方要么指向内部 wheelhouse 镜像，要么改用 Dockerfile.local
 #    的离线 `--find-links /wheels` 路径。若在这里看到
 #    "No matching distribution found for torch==2.14.0+cpu"，就是走错了配方。
-RUN pip install --upgrade pip \
- && pip install --no-cache-dir --retries 5 --timeout 60 --prefix=/install -r requirements.txt
+RUN pip install --upgrade pip==26.2.1 \
+ && pip install --no-cache-dir --retries 5 --timeout 60 --ignore-installed --prefix=/install -c constraints.txt -r requirements.txt
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -146,10 +146,15 @@ ENV HOME=/app/.cache \
 RUN mkdir -p /app/.cache/paddleocr
 
 # Copy installed packages from builder
+# Remove base tool metadata before copying pinned replacements.
+RUN python -m pip uninstall -y pip setuptools wheel
 COPY --from=builder /install /usr/local
 
 # Copy application source and migrations
 COPY app/ ./app/
+COPY scripts/ ./scripts/
+COPY eval/ ./eval/
+COPY requirements.txt constraints.txt ./
 COPY alembic/ ./alembic/
 COPY alembic.ini .
 

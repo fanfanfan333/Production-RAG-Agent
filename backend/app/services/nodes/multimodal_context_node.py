@@ -520,6 +520,8 @@ async def build_multimodal_context(
             + f" (relevance: {block.score:.2f})"
             + (f" — {kind}" if kind else "")
         )
+        if (block.analyze_fusion or {}).get("numeric_conflict"):
+            header += " [待复核：数字、符号或单位存在分歧，不能据此确定数值]"
         parts.append(f"{header}\n{block.text}")
 
     context = "\n\n---\n\n".join(parts)

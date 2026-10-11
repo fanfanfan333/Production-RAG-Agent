@@ -279,6 +279,14 @@ async def collect_document_digests(
             )
             for point in points:
                 payload = point.payload or {}
+                fusion = payload.get("analyze_fusion")
+                review = ""
+                if isinstance(fusion, dict) and fusion.get("numeric_conflict"):
+                    review = "表格数字、符号或单位存在分歧，请核对原文"
+                elif payload.get("manual_review") is True:
+                    review = "图片识别结果需复核，请核对原文"
+                if review and review not in warning:
+                    warning.append(review)
                 sample.append(
                     (
                         int(payload.get("chunk_index", 0)),

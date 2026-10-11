@@ -26,7 +26,9 @@ from __future__ import annotations
 
 import io
 import threading
+from pathlib import Path
 
+from app.config import get_settings
 from app.services.image_understanding.engines.base import DocumentEngine, EngineKind
 from app.utils.logging import get_logger
 
@@ -111,10 +113,23 @@ class DoclingEngine(DocumentEngine):
             return _converter
         with _lock:
             if _converter is None:
-                from docling.document_converter import DocumentConverter  # noqa: PLC0415
+                from docling.document_converter import DocumentConverter, PdfFormatOption
+                from docling.datamodel.base_models import InputFormat
+                from docling.datamodel.pipeline_options import PdfPipelineOptions, RapidOcrOptions
+                import rapidocr.ch_ppocr_rec.main as rapidocr_rec
 
                 _apply_pipeline_hash_shim()
-                _converter = DocumentConverter()
+                cache_dir = Path(get_settings().PADDLE_CACHE_DIR) / "rapidocr"
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                # shortcut: RapidOCR ignores the dictionary cache; remove when upstream honors model_root_dir.
+                rapidocr_rec.DEFAULT_MODEL_PATH = cache_dir
+                ocr_options = RapidOcrOptions(
+                    backend="torch",
+                    rapidocr_params={"Global.model_root_dir": cache_dir},
+                )
+                _converter = DocumentConverter(format_options={
+                    InputFormat.PDF: PdfFormatOption(pipeline_options=PdfPipelineOptions(ocr_options=ocr_options)),
+                })
                 logger.info("Docling DocumentConverter initialized")
         return _converter
 

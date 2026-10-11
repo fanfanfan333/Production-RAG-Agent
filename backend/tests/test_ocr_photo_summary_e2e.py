@@ -403,6 +403,14 @@ def test_table_photo_is_also_summarised() -> None:
     print("  ok test_table_photo_is_also_summarised")
 
 
+def test_review_warning_survives_digest_sampling() -> None:
+    payload = build_image_chunks([_photo()])[0].to_dict()
+    payload["analyze_fusion"] = {"numeric_conflict": True}
+    payload["text"] = "no warning in the sampled text"
+    digests, _ = _collect({DOC_ID: [payload]})
+    assert "表格数字、符号或单位存在分歧，请核对原文" in digests[0].warnings
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # ④ 提示词组装：必须出现在送给 LLM 的输入里
 # ═════════════════════════════════════════════════════════════════════════════

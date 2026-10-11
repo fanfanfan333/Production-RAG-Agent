@@ -14,7 +14,7 @@ import numpy as np
 from PIL import Image
 
 from app.services.ocr.base import OCRLine, OCRProvider
-from app.utils.paddle_env import build_paddle_ocr, predict_lock
+from app.utils.paddle_env import build_paddle_ocr, ocr_result, predict_lock
 
 # 构造失败后的冷却时间（秒）。见 PaddleOCRProvider._ensure 的说明。
 _FAILURE_RETRY_COOLDOWN_S = 60.0
@@ -92,7 +92,7 @@ class PaddleOCRProvider(OCRProvider):
         # 串行化：Paddle 的 predictor 不是线程安全的，并发推理会 SIGSEGV
         # （整个进程消失，try/except 抓不住）。详见 app/utils/paddle_env.py 坑 4。
         with predict_lock():
-            result = ocr.ocr(img_arr, cls=False)
+            result = ocr_result(ocr, img_arr)
         if not result or not result[0]:
             return "", []
 

@@ -175,6 +175,12 @@ def build_paddle_ocr():
     if module is None:
         return None
     try:
+        if int(getattr(module, "__version__", "2").split(".")[0]) >= 3:
+            return module.PaddleOCR(
+                lang=paddle_lang(), ocr_version=paddle_ocr_version(), device="cpu",
+                use_doc_orientation_classify=False, use_doc_unwarping=False,
+                use_textline_orientation=False, enable_mkldnn=False,
+            )
         return module.PaddleOCR(
             use_angle_cls=False,
             lang=paddle_lang(),
@@ -184,6 +190,19 @@ def build_paddle_ocr():
     except Exception as exc:      # noqa: BLE001
         logger.warning("PaddleOCR init failed (lang=%s): %s", paddle_lang(), exc)
         return None
+
+
+def ocr_result(ocr, image):
+    """Normalize PaddleOCR 3 results to the existing text/box/score contract."""
+    if not hasattr(ocr, "predict"):
+        return ocr.ocr(image, cls=False)
+    lines = []
+    for page in ocr.predict(image):
+        texts, scores, polygons = page["rec_texts"], page["rec_scores"], page["rec_polys"]
+        if not (len(texts) == len(scores) == len(polygons)):
+            raise ValueError("PaddleOCR result has mismatched text, score and polygon counts")
+        lines.extend([polygon, (text, score)] for polygon, text, score in zip(polygons, texts, scores))
+    return [lines]
 
 
 def paddle_available() -> bool:
@@ -242,6 +261,7 @@ __all__ = [
     "predict_lock",
     "import_paddleocr",
     "build_paddle_ocr",
+    "ocr_result",
     "paddle_available",
     "pp_structure_v3_class",
     "pp_structure_v2_class",

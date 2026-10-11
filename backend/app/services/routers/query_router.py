@@ -165,6 +165,7 @@ async def route_query(
             reasoning=False,
             num_predict=64,
             num_ctx=settings.chat_num_ctx,
+            keep_alive=getattr(settings, "OLLAMA_KEEP_ALIVE_SECONDS", 300),
             num_gpu=settings.OLLAMA_NUM_GPU,
         )
 

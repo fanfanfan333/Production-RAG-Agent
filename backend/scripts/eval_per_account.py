@@ -12,7 +12,7 @@
 口径（与生产检索链路一致）
 ────────────────────────
     scope = tenancy.content_scope(user)   # 检索是内容消费路径
-    retrieve = retrieve_chunks(query, top_k=10, **scope.acl_kwargs())
+    retrieve = retrieve_chunks_scoped(query, top_k=10, scope=security_scope)
 
 指标：recall@1/3/5/10、precision@1/3/5/10、MRR、MAP；逐例 rank/hit 明细 + 探针结果。
 
@@ -67,7 +67,8 @@ async def _load_doc_ids(names: set[str]) -> dict[str, list[str]]:
 
 async def run_account(account: str) -> dict:
     from app.services.evaluation import EvalCase, EvalSet, evaluate, item_from_chunk
-    from app.services.retrieval_service import retrieve_chunks
+    from app.services.retrieval_service import retrieve_chunks_scoped
+    from app.services.security_scope import request_security_scope
     from app.services.tenancy import content_scope, request_scope
 
     gold = json.loads((GOLD_DIR / f"{account}.json").read_text(encoding="utf-8"))
@@ -109,6 +110,7 @@ async def run_account(account: str) -> dict:
 
     req = await request_scope(user)
     scope = await content_scope(user)
+    security_scope = await request_security_scope(user)
 
     # ── scope 口径断言 ───────────────────────────────────────────────────────
     exp = gold.get("expected_scope", {})
@@ -128,7 +130,7 @@ async def run_account(account: str) -> dict:
 
     # ── 评测 ─────────────────────────────────────────────────────────────────
     async def _retrieve(query: str):
-        chunks = await retrieve_chunks(query, top_k=TOP_K, **scope.acl_kwargs())
+        chunks = await retrieve_chunks_scoped(query, top_k=TOP_K, scope=security_scope)
         return [item_from_chunk(c) for c in chunks]
 
     eval_set = EvalSet(name=f"gold-{account}", cases=tuple(cases),
@@ -141,7 +143,7 @@ async def run_account(account: str) -> dict:
         forbidden_ids: set[str] = set()
         for name in probe["forbidden_docs"]:
             forbidden_ids.update(_resolve_ids(by_name, name))
-        chunks = await retrieve_chunks(probe["query"], top_k=TOP_K, **scope.acl_kwargs())
+        chunks = await retrieve_chunks_scoped(probe["query"], top_k=TOP_K, scope=security_scope)
         got_ids = {str(c.document_id) for c in chunks}
         leaked_ids = got_ids & forbidden_ids
         leaked_names = sorted(
@@ -188,7 +190,7 @@ def render_markdown(results: list[dict]) -> str:
     lines.append("# 逐账号检索金标评测（T3）")
     lines.append("")
     lines.append(f"- 生成时间：{datetime.now(tz=timezone.utc).isoformat()}")
-    lines.append("- 口径：`scope = tenancy.content_scope(user)`；`retrieve_chunks(query, top_k=10, **scope.acl_kwargs())`")
+    lines.append("- 口径：`security_scope = request_security_scope(user)`；`retrieve_chunks_scoped(query, top_k=10, scope=security_scope)`")
     lines.append("- 金标定义：`backend/eval/gold/<account>.json`（(filename, chunk_index) 逻辑坐标）")
     lines.append("- 探针：跨公司 / 测试公司 / 他人个人库内容**必须零命中**，计入断言")
     lines.append("")
@@ -312,6 +314,9 @@ async def main() -> int:
 
     failed = any(
         (r.get("error") is not None)
+        or bool(r.get("problems"))
+        or (not r.get("error") and r["report"].scored_cases == 0)
+        or (not r.get("error") and (r["report"].recall.get(10, 0) < 1.0 or r["report"].mrr < 0.95))
         or any(not c["ok"] for c in r.get("scope_checks", []))
         or any(not p["ok"] for p in r.get("probes", []))
         for r in results

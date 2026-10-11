@@ -125,6 +125,7 @@ def _silence_audit(monkeypatch):
         calls.append((action, kwargs))
 
     monkeypatch.setattr("app.services.grant_service.record_audit", _fake)
+    monkeypatch.setattr("app.services.grant_service._now", lambda: FIXED_NOW)
     return calls
 
 

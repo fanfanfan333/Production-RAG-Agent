@@ -68,6 +68,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
 from PIL import Image
@@ -513,6 +514,11 @@ def understand_image(
         result.route = ROUTE_OCR
         result.meta["route_downgraded"] = True
 
+    if result.fusion.get("numeric_conflict"):
+        result.manual_review = True
+        result.decision = DECISION_MANUAL
+        result.meta["manual_review_reason"] = "两通道表格数字、符号或单位不一致，需核对原图"
+
     logger.info(
         "Image pipeline%s: type=%s route=%s mode=%s engine=%s conf=%.2f decision=%s "
         "quality=%.2f noise=%s",
@@ -730,17 +736,22 @@ def _table_primary(
     result: ImageUnderstanding,
 ) -> EngineOutput:
     """
-    表格专用引擎：Table Transformer 优先，规则表格兜底.
+    表格专用引擎：可靠框线网格优先，无框线或规则失败时使用 Table Transformer.
 
     Table Transformer 是"研究型方案"：对无边框表、跨行跨列更稳，但需要模型。
     规则方案（框线投影）零依赖且对有线表格又快又准。两者是**互补**关系，
-    所以这里不是"二选一"而是"能上就上，上不了就退"。
+    框线已给出真实行列时，不用模型检测覆盖它，避免把相邻数值列合并。
     """
     settings = get_settings()
     registry = get_registry()
     ocr_fn = _cell_ocr_fn()
+    structure = recognize_table_safe(
+        image, lines=ocr_out.lines, page_number=page_number, ocr_fn=ocr_fn,
+    )
 
-    if getattr(settings, "TABLE_TRANSFORMER_ENABLED", True):
+    if getattr(settings, "TABLE_TRANSFORMER_ENABLED", True) and not (
+        structure.ok and structure.method.startswith("rules")
+    ):
         engine = registry.get("table-transformer")
         if engine is not None and engine.is_available():
             out = engine.process(image, ocr_fn=ocr_fn)
@@ -760,9 +771,6 @@ def _table_primary(
                 return out
             logger.info("Table Transformer produced nothing — falling back to rules")
 
-    structure = recognize_table_safe(
-        image, lines=ocr_out.lines, page_number=page_number, ocr_fn=ocr_fn,
-    )
     result.table = structure
     if structure.ok:
         return EngineOutput(
@@ -1017,6 +1025,21 @@ def _apply_output(result: ImageUnderstanding, out: EngineOutput) -> None:
         return
     if result.image_type in (IMAGE_TYPE_TABLE, IMAGE_TYPE_CODE, IMAGE_TYPE_FORMULA):
         result.structured_content = text
+        if result.image_type == IMAGE_TYPE_TABLE and _is_vision_engine(out.engine):
+            # Vision rescue replaces the detected grid; its metadata must follow the chosen text.
+            grid = []
+            for line in text.splitlines():
+                line = line.strip()
+                if not (line.startswith("|") and line.endswith("|")):
+                    continue
+                cells = [c.strip().replace("\\|", "|") for c in re.split(r"(?<!\\)\|", line[1:-1])]
+                if cells and not all(re.fullmatch(r":?-{3,}:?", c) for c in cells):
+                    grid.append(cells)
+            result.table = TableStructure(
+                markdown=text, rows=len(grid), cols=len(grid[0]) if grid else 0,
+                header=grid[0] if grid else [], method="vision", engine=out.engine,
+            )
+            result.meta["table_engine"] = out.engine
     elif _is_vision_engine(out.engine):
         result.vision_caption = text
     elif not (result.ocr_text or "").strip():
