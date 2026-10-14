@@ -12,11 +12,15 @@ import uuid
 from datetime import datetime
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, HTTPException
+from sqlalchemy import select
+from sqlalchemy.orm import aliased
 from pydantic import BaseModel, Field
 
 from app.services.permissions import require_permission, require_platform_admin
 from app.db.feedback_models import AnswerFeedback
+from app.db.conversation_models import Conversation, Message
+from app.services.tenancy import home_tenant_id, DEFAULT_TENANT_ID
 from app.db.postgres import get_db_session
 from app.db.user_models import User
 from app.services.audit_service import record_audit
@@ -34,6 +38,7 @@ class FeedbackRequest(BaseModel):
     question: str = Field(min_length=1, max_length=8000)
     answer: str = Field(max_length=20000)
     conversation_id: uuid.UUID | None = None
+    message_id: uuid.UUID | None = None
     comment: str | None = Field(default=None, max_length=2000)
 
 
@@ -69,6 +74,30 @@ async def submit_feedback(
     user: Annotated[User, Depends(require_permission("feedback.write"))],
 ) -> dict:
     async with get_db_session() as session:
+        conversation = await session.get(Conversation, body.conversation_id) if body.conversation_id else None
+        if (conversation is None or conversation.owner_id != user.id
+                or conversation.tenant_id != (home_tenant_id(user) or DEFAULT_TENANT_ID)):
+            raise HTTPException(404, "回答记录不存在或不可访问")
+        statement = select(Message).where(
+            Message.conversation_id == conversation.id, Message.role == "assistant",
+        )
+        if body.message_id:
+            statement = statement.where(Message.id == body.message_id)
+        else:
+            user_message = aliased(Message)
+            statement = statement.join(user_message, (user_message.conversation_id == Message.conversation_id)
+                & (user_message.created_at == Message.created_at) & (user_message.role == "user")).where(
+                    Message.content == body.answer, user_message.content == body.question)
+        message = await session.scalar(statement.order_by(Message.created_at.desc()).limit(1))
+        if message is None or message.content != body.answer:
+            raise HTTPException(409, "请刷新会话后，对已完成的真实回答提交反馈")
+        question = await session.scalar(select(Message).where(
+            Message.conversation_id == conversation.id, Message.role == "user",
+            Message.created_at == message.created_at,
+        ).limit(1))
+        if question is None or question.content != body.question:
+            raise HTTPException(409, "反馈问题与回答记录不一致")
+        body.question, body.answer = question.content, message.content
         row = AnswerFeedback(
             user_id=user.id,
             conversation_id=body.conversation_id,
@@ -76,6 +105,7 @@ async def submit_feedback(
             question=body.question[:8000],
             answer=(body.answer or "")[:20000],
             comment=body.comment,
+            message_id=message.id,
         )
         session.add(row)
         await session.commit()
@@ -111,7 +141,7 @@ async def submit_feedback(
         "Feedback recorded: user=%s rating=%s conv=%s",
         user.username, body.rating, body.conversation_id,
     )
-    return {"recorded": True, "rating": body.rating}
+    return {"recorded": True, "rating": body.rating, "message_id": str(message.id)}
 
 
 # ── GET /feedback ─────────────────────────────────────────────────────────────

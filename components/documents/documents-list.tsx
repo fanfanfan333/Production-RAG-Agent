@@ -22,6 +22,8 @@ import {
   Users,
 } from "lucide-react";
 import { toast } from "sonner";
+import { GraphIndexControl } from "@/components/documents/graph-index-control";
+import { apiFetch } from "@/lib/api/client";
 import { deleteDocument, getDocumentChunks } from "@/lib/api/documents";
 import {
   fetchAccessibleCompanies,
@@ -482,6 +484,9 @@ export function DocumentsList() {
                     <Eye className="size-4" />
                   </Button>
 
+                  {doc.isOwner && doc.status === "processing" && <Button size="sm" variant="outline" onClick={async () => {try {await apiFetch(`/documents/${doc.id}/cancel-ingestion`, {method: "POST"}); toast.success("当前解析阶段完成后取消，可重新上传继续");} catch (error) {toast.error(error instanceof Error ? error.message : "取消失败");}}}>取消入库</Button>}
+                  {doc.status === "failed" && <p className="max-w-64 break-words text-xs text-destructive" role="status">{doc.error || "入库失败"}。重新上传同一文件即可重试</p>}
+                  {doc.isOwner && user?.permissions?.some((permission) => permission === "document.write" || permission === "*") && canView && <GraphIndexControl documentId={doc.id} />}
                   {/* 总结此文档：只总结这一份（不带上其他文档） */}
                   <Button
                     variant="ghost"

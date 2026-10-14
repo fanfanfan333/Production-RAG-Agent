@@ -5,3 +5,5 @@ uploads/
 **/__pycache__/
 .pytest_cache/
 _wheels/*.log
+_qa_pylibs/
+.venv/

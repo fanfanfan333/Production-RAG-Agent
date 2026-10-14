@@ -13,6 +13,8 @@ from pydantic import BaseModel, Field
 class QueryRequest(BaseModel):
     """Body accepted by POST /query."""
 
+    retrieval_strategy: Literal["hybrid", "hybrid_graph"] = "hybrid"
+
     query: str = Field(
         ...,
         min_length=1,

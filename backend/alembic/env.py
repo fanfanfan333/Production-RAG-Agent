@@ -12,6 +12,7 @@ from alembic import context
 from app.config import get_settings
 from app.db.models import Base
 from app.db.conversation_models import Conversation, Message  # Ensure Alembic sees these models
+from app.db import user_models, feedback_models, professional_models  # noqa: F401
 
 config = context.config
 

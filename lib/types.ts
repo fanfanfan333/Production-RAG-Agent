@@ -102,6 +102,7 @@ export interface Collection {
 }
 
 export interface QuerySource {
+  chunkIndex?: number;
   documentId?: string;
   documentName?: string;
   chunkText?: string;
@@ -341,6 +342,7 @@ export type ChatPipeline =
 import type { OutputGuardInfo } from "@/lib/api/query";
 
 export interface ChatMessage {
+  graphRetrieval?: { notice: string; paths: { subject: string; predicate: string; object: string; document_id: string; chunk_index: number; evidence: string }[] };
   id: string;
   role: "user" | "assistant";
   content: string;
@@ -365,7 +367,7 @@ export interface ChatMessage {
   /** Citation Verifier 的五项引用校验结论。 */
   citationCheck?: CitationCheckInfo;
   /** Local-only feedback state (👍/👎). */
-  feedback?: FeedbackRating;
+  feedback?: FeedbackRating | "pending";
   /** Conversation id at the time this answer finished streaming. */
   conversationId?: string;
   /** 答复性质：拒答时来源不作为依据（避免"拒答 + 引用"自相矛盾）。 */
@@ -389,6 +391,7 @@ export interface ConversationSummary {
  * 不见了" —— 现在按原样还原到界面上。
  */
 export interface ConversationMessage {
+  graphRetrieval?: ChatMessage["graphRetrieval"];
   role: "user" | "assistant";
   content: string;
   createdAt?: string;

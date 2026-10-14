@@ -1,0 +1,3090 @@
+{
+  "name": "professional-fixture-v1",
+  "license": "self-authored",
+  "truth_origin": "explicit fixture facts and arithmetic; not model answers",
+  "business_validation": "not a substitute for reviewed enterprise documents",
+  "documents": {
+    "fact-00.md": "# ABX-100 产品手册\n额定功率为1000瓦。维护周期为30天。",
+    "fact-01.md": "# ABX-101 产品手册\n额定功率为1025瓦。维护周期为31天。",
+    "fact-02.md": "# ABX-102 产品手册\n额定功率为1050瓦。维护周期为32天。",
+    "fact-03.md": "# ABX-103 产品手册\n额定功率为1075瓦。维护周期为33天。",
+    "fact-04.md": "# ABX-104 产品手册\n额定功率为1100瓦。维护周期为34天。",
+    "fact-05.md": "# ABX-105 产品手册\n额定功率为1125瓦。维护周期为35天。",
+    "fact-06.md": "# ABX-106 产品手册\n额定功率为1150瓦。维护周期为36天。",
+    "fact-07.md": "# ABX-107 产品手册\n额定功率为1175瓦。维护周期为37天。",
+    "fact-08.md": "# ABX-108 产品手册\n额定功率为1200瓦。维护周期为38天。",
+    "fact-09.md": "# ABX-109 产品手册\n额定功率为1225瓦。维护周期为39天。",
+    "fact-10.md": "# ABX-110 产品手册\n额定功率为1250瓦。维护周期为40天。",
+    "fact-11.md": "# ABX-111 产品手册\n额定功率为1275瓦。维护周期为41天。",
+    "fact-12.md": "# ABX-112 产品手册\n额定功率为1300瓦。维护周期为42天。",
+    "fact-13.md": "# ABX-113 产品手册\n额定功率为1325瓦。维护周期为43天。",
+    "fact-14.md": "# ABX-114 产品手册\n额定功率为1350瓦。维护周期为44天。",
+    "fact-15.md": "# ABX-115 产品手册\n额定功率为1375瓦。维护周期为45天。",
+    "fact-16.md": "# ABX-116 产品手册\n额定功率为1400瓦。维护周期为46天。",
+    "fact-17.md": "# ABX-117 产品手册\n额定功率为1425瓦。维护周期为47天。",
+    "fact-18.md": "# ABX-118 产品手册\n额定功率为1450瓦。维护周期为48天。",
+    "fact-19.md": "# ABX-119 产品手册\n额定功率为1475瓦。维护周期为49天。",
+    "table-00.md": "# 2020预算\n| 部门 | 预算（万元） |\n|---|---|\n| 部门1 | 100 |\n| 部门2 | 107 |\n| 部门3 | 114 |\n| 部门4 | 121 |\n| 部门5 | 128 |",
+    "table-01.md": "# 2021预算\n| 部门 | 预算（万元） |\n|---|---|\n| 部门1 | 200 |\n| 部门2 | 207 |\n| 部门3 | 214 |\n| 部门4 | 221 |\n| 部门5 | 228 |",
+    "table-02.md": "# 2022预算\n| 部门 | 预算（万元） |\n|---|---|\n| 部门1 | 300 |\n| 部门2 | 307 |\n| 部门3 | 314 |\n| 部门4 | 321 |\n| 部门5 | 328 |",
+    "table-03.md": "# 2023预算\n| 部门 | 预算（万元） |\n|---|---|\n| 部门1 | 400 |\n| 部门2 | 407 |\n| 部门3 | 414 |\n| 部门4 | 421 |\n| 部门5 | 428 |",
+    "table-04.md": "# 2024预算\n| 部门 | 预算（万元） |\n|---|---|\n| 部门1 | 500 |\n| 部门2 | 507 |\n| 部门3 | 514 |\n| 部门4 | 521 |\n| 部门5 | 528 |",
+    "image-00.png": "图表1\n项目代号 VIZ-100\n收入 500 万元\n统计年份 2025",
+    "image-01.png": "图表2\n项目代号 VIZ-101\n收入 531 万元\n统计年份 2025",
+    "image-02.png": "图表3\n项目代号 VIZ-102\n收入 562 万元\n统计年份 2025",
+    "image-03.png": "图表4\n项目代号 VIZ-103\n收入 593 万元\n统计年份 2025",
+    "image-04.png": "图表5\n项目代号 VIZ-104\n收入 624 万元\n统计年份 2025",
+    "image-05.png": "图表6\n项目代号 VIZ-105\n收入 655 万元\n统计年份 2025",
+    "image-06.png": "图表7\n项目代号 VIZ-106\n收入 686 万元\n统计年份 2025",
+    "image-07.png": "图表8\n项目代号 VIZ-107\n收入 717 万元\n统计年份 2025",
+    "image-08.png": "图表9\n项目代号 VIZ-108\n收入 748 万元\n统计年份 2025",
+    "image-09.png": "图表10\n项目代号 VIZ-109\n收入 779 万元\n统计年份 2025",
+    "image-10.png": "图表11\n项目代号 VIZ-110\n收入 810 万元\n统计年份 2025",
+    "image-11.png": "图表12\n项目代号 VIZ-111\n收入 841 万元\n统计年份 2025",
+    "image-12.png": "图表13\n项目代号 VIZ-112\n收入 872 万元\n统计年份 2025",
+    "image-13.png": "图表14\n项目代号 VIZ-113\n收入 903 万元\n统计年份 2025",
+    "image-14.png": "图表15\n项目代号 VIZ-114\n收入 934 万元\n统计年份 2025",
+    "relation-00-a.md": "# 企业投资\n企业甲0投资企业乙0。",
+    "relation-00-b.md": "# 企业地址\n企业乙0位于园区0。",
+    "relation-01-a.md": "# 企业投资\n企业甲1投资企业乙1。",
+    "relation-01-b.md": "# 企业地址\n企业乙1位于园区1。",
+    "relation-02-a.md": "# 企业投资\n企业甲2投资企业乙2。",
+    "relation-02-b.md": "# 企业地址\n企业乙2位于园区2。",
+    "relation-03-a.md": "# 企业投资\n企业甲3投资企业乙3。",
+    "relation-03-b.md": "# 企业地址\n企业乙3位于园区3。",
+    "relation-04-a.md": "# 企业投资\n企业甲4投资企业乙4。",
+    "relation-04-b.md": "# 企业地址\n企业乙4位于园区4。",
+    "relation-05-a.md": "# 企业投资\n企业甲5投资企业乙5。",
+    "relation-05-b.md": "# 企业地址\n企业乙5位于园区5。",
+    "relation-06-a.md": "# 企业投资\n企业甲6投资企业乙6。",
+    "relation-06-b.md": "# 企业地址\n企业乙6位于园区6。",
+    "relation-07-a.md": "# 企业投资\n企业甲7投资企业乙7。",
+    "relation-07-b.md": "# 企业地址\n企业乙7位于园区7。",
+    "relation-08-a.md": "# 企业投资\n企业甲8投资企业乙8。",
+    "relation-08-b.md": "# 企业地址\n企业乙8位于园区8。",
+    "relation-09-a.md": "# 企业投资\n企业甲9投资企业乙9。",
+    "relation-09-b.md": "# 企业地址\n企业乙9位于园区9。",
+    "relation-10-a.md": "# 企业投资\n企业甲10投资企业乙10。",
+    "relation-10-b.md": "# 企业地址\n企业乙10位于园区10。",
+    "relation-11-a.md": "# 企业投资\n企业甲11投资企业乙11。",
+    "relation-11-b.md": "# 企业地址\n企业乙11位于园区11。",
+    "relation-12-a.md": "# 企业投资\n企业甲12投资企业乙12。",
+    "relation-12-b.md": "# 企业地址\n企业乙12位于园区12。",
+    "relation-13-a.md": "# 企业投资\n企业甲13投资企业乙13。",
+    "relation-13-b.md": "# 企业地址\n企业乙13位于园区13。",
+    "relation-14-a.md": "# 企业投资\n企业甲14投资企业乙14。",
+    "relation-14-b.md": "# 企业地址\n企业乙14位于园区14。",
+    "relation-15-a.md": "# 企业投资\n企业甲15投资企业乙15。",
+    "relation-15-b.md": "# 企业地址\n企业乙15位于园区15。",
+    "relation-16-a.md": "# 企业投资\n企业甲16投资企业乙16。",
+    "relation-16-b.md": "# 企业地址\n企业乙16位于园区16。",
+    "relation-17-a.md": "# 企业投资\n企业甲17投资企业乙17。",
+    "relation-17-b.md": "# 企业地址\n企业乙17位于园区17。",
+    "relation-18-a.md": "# 企业投资\n企业甲18投资企业乙18。",
+    "relation-18-b.md": "# 企业地址\n企业乙18位于园区18。",
+    "relation-19-a.md": "# 企业投资\n企业甲19投资企业乙19。",
+    "relation-19-b.md": "# 企业地址\n企业乙19位于园区19。",
+    "conflict-00-a.md": "# 未注明日期的记录甲\n项目冲突0预算为100万元。",
+    "conflict-00-b.md": "# 未注明日期的记录乙\n项目冲突0预算为200万元。",
+    "conflict-01-a.md": "# 未注明日期的记录甲\n项目冲突1预算为101万元。",
+    "conflict-01-b.md": "# 未注明日期的记录乙\n项目冲突1预算为201万元。",
+    "conflict-02-a.md": "# 未注明日期的记录甲\n项目冲突2预算为102万元。",
+    "conflict-02-b.md": "# 未注明日期的记录乙\n项目冲突2预算为202万元。",
+    "conflict-03-a.md": "# 未注明日期的记录甲\n项目冲突3预算为103万元。",
+    "conflict-03-b.md": "# 未注明日期的记录乙\n项目冲突3预算为203万元。",
+    "conflict-04-a.md": "# 未注明日期的记录甲\n项目冲突4预算为104万元。",
+    "conflict-04-b.md": "# 未注明日期的记录乙\n项目冲突4预算为204万元。",
+    "conflict-05-a.md": "# 未注明日期的记录甲\n项目冲突5预算为105万元。",
+    "conflict-05-b.md": "# 未注明日期的记录乙\n项目冲突5预算为205万元。",
+    "conflict-06-a.md": "# 未注明日期的记录甲\n项目冲突6预算为106万元。",
+    "conflict-06-b.md": "# 未注明日期的记录乙\n项目冲突6预算为206万元。",
+    "conflict-07-a.md": "# 未注明日期的记录甲\n项目冲突7预算为107万元。",
+    "conflict-07-b.md": "# 未注明日期的记录乙\n项目冲突7预算为207万元。",
+    "conflict-08-a.md": "# 未注明日期的记录甲\n项目冲突8预算为108万元。",
+    "conflict-08-b.md": "# 未注明日期的记录乙\n项目冲突8预算为208万元。",
+    "conflict-09-a.md": "# 未注明日期的记录甲\n项目冲突9预算为109万元。",
+    "conflict-09-b.md": "# 未注明日期的记录乙\n项目冲突9预算为209万元。"
+  },
+  "cases": [
+    {
+      "id": "fact-01",
+      "category": "fact",
+      "query": "ABX-100的额定功率是多少？",
+      "answer": "1000瓦",
+      "expect_sources": [
+        "fact-00.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "fact-00.md",
+          "page_number": 1,
+          "evidence": "# ABX-100 产品手册\n额定功率为1000瓦。维护周期为30天。"
+        }
+      ]
+    },
+    {
+      "id": "fact-02",
+      "category": "fact",
+      "query": "ABX-100每隔多少天维护？",
+      "answer": "30天",
+      "expect_sources": [
+        "fact-00.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "fact-00.md",
+          "page_number": 1,
+          "evidence": "# ABX-100 产品手册\n额定功率为1000瓦。维护周期为30天。"
+        }
+      ]
+    },
+    {
+      "id": "fact-03",
+      "category": "fact",
+      "query": "ABX-101的额定功率是多少？",
+      "answer": "1025瓦",
+      "expect_sources": [
+        "fact-01.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "fact-01.md",
+          "page_number": 1,
+          "evidence": "# ABX-101 产品手册\n额定功率为1025瓦。维护周期为31天。"
+        }
+      ]
+    },
+    {
+      "id": "fact-04",
+      "category": "fact",
+      "query": "ABX-101每隔多少天维护？",
+      "answer": "31天",
+      "expect_sources": [
+        "fact-01.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "fact-01.md",
+          "page_number": 1,
+          "evidence": "# ABX-101 产品手册\n额定功率为1025瓦。维护周期为31天。"
+        }
+      ]
+    },
+    {
+      "id": "fact-05",
+      "category": "fact",
+      "query": "ABX-102的额定功率是多少？",
+      "answer": "1050瓦",
+      "expect_sources": [
+        "fact-02.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "fact-02.md",
+          "page_number": 1,
+          "evidence": "# ABX-102 产品手册\n额定功率为1050瓦。维护周期为32天。"
+        }
+      ]
+    },
+    {
+      "id": "fact-06",
+      "category": "fact",
+      "query": "ABX-102每隔多少天维护？",
+      "answer": "32天",
+      "expect_sources": [
+        "fact-02.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "fact-02.md",
+          "page_number": 1,
+          "evidence": "# ABX-102 产品手册\n额定功率为1050瓦。维护周期为32天。"
+        }
+      ]
+    },
+    {
+      "id": "fact-07",
+      "category": "fact",
+      "query": "ABX-103的额定功率是多少？",
+      "answer": "1075瓦",
+      "expect_sources": [
+        "fact-03.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "fact-03.md",
+          "page_number": 1,
+          "evidence": "# ABX-103 产品手册\n额定功率为1075瓦。维护周期为33天。"
+        }
+      ]
+    },
+    {
+      "id": "fact-08",
+      "category": "fact",
+      "query": "ABX-103每隔多少天维护？",
+      "answer": "33天",
+      "expect_sources": [
+        "fact-03.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "fact-03.md",
+          "page_number": 1,
+          "evidence": "# ABX-103 产品手册\n额定功率为1075瓦。维护周期为33天。"
+        }
+      ]
+    },
+    {
+      "id": "fact-09",
+      "category": "fact",
+      "query": "ABX-104的额定功率是多少？",
+      "answer": "1100瓦",
+      "expect_sources": [
+        "fact-04.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "fact-04.md",
+          "page_number": 1,
+          "evidence": "# ABX-104 产品手册\n额定功率为1100瓦。维护周期为34天。"
+        }
+      ]
+    },
+    {
+      "id": "fact-10",
+      "category": "fact",
+      "query": "ABX-104每隔多少天维护？",
+      "answer": "34天",
+      "expect_sources": [
+        "fact-04.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "fact-04.md",
+          "page_number": 1,
+          "evidence": "# ABX-104 产品手册\n额定功率为1100瓦。维护周期为34天。"
+        }
+      ]
+    },
+    {
+      "id": "fact-11",
+      "category": "fact",
+      "query": "ABX-105的额定功率是多少？",
+      "answer": "1125瓦",
+      "expect_sources": [
+        "fact-05.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "fact-05.md",
+          "page_number": 1,
+          "evidence": "# ABX-105 产品手册\n额定功率为1125瓦。维护周期为35天。"
+        }
+      ]
+    },
+    {
+      "id": "fact-12",
+      "category": "fact",
+      "query": "ABX-105每隔多少天维护？",
+      "answer": "35天",
+      "expect_sources": [
+        "fact-05.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "fact-05.md",
+          "page_number": 1,
+          "evidence": "# ABX-105 产品手册\n额定功率为1125瓦。维护周期为35天。"
+        }
+      ]
+    },
+    {
+      "id": "fact-13",
+      "category": "fact",
+      "query": "ABX-106的额定功率是多少？",
+      "answer": "1150瓦",
+      "expect_sources": [
+        "fact-06.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "fact-06.md",
+          "page_number": 1,
+          "evidence": "# ABX-106 产品手册\n额定功率为1150瓦。维护周期为36天。"
+        }
+      ]
+    },
+    {
+      "id": "fact-14",
+      "category": "fact",
+      "query": "ABX-106每隔多少天维护？",
+      "answer": "36天",
+      "expect_sources": [
+        "fact-06.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "fact-06.md",
+          "page_number": 1,
+          "evidence": "# ABX-106 产品手册\n额定功率为1150瓦。维护周期为36天。"
+        }
+      ]
+    },
+    {
+      "id": "fact-15",
+      "category": "fact",
+      "query": "ABX-107的额定功率是多少？",
+      "answer": "1175瓦",
+      "expect_sources": [
+        "fact-07.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "fact-07.md",
+          "page_number": 1,
+          "evidence": "# ABX-107 产品手册\n额定功率为1175瓦。维护周期为37天。"
+        }
+      ]
+    },
+    {
+      "id": "fact-16",
+      "category": "fact",
+      "query": "ABX-107每隔多少天维护？",
+      "answer": "37天",
+      "expect_sources": [
+        "fact-07.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "fact-07.md",
+          "page_number": 1,
+          "evidence": "# ABX-107 产品手册\n额定功率为1175瓦。维护周期为37天。"
+        }
+      ]
+    },
+    {
+      "id": "fact-17",
+      "category": "fact",
+      "query": "ABX-108的额定功率是多少？",
+      "answer": "1200瓦",
+      "expect_sources": [
+        "fact-08.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "fact-08.md",
+          "page_number": 1,
+          "evidence": "# ABX-108 产品手册\n额定功率为1200瓦。维护周期为38天。"
+        }
+      ]
+    },
+    {
+      "id": "fact-18",
+      "category": "fact",
+      "query": "ABX-108每隔多少天维护？",
+      "answer": "38天",
+      "expect_sources": [
+        "fact-08.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "fact-08.md",
+          "page_number": 1,
+          "evidence": "# ABX-108 产品手册\n额定功率为1200瓦。维护周期为38天。"
+        }
+      ]
+    },
+    {
+      "id": "fact-19",
+      "category": "fact",
+      "query": "ABX-109的额定功率是多少？",
+      "answer": "1225瓦",
+      "expect_sources": [
+        "fact-09.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "fact-09.md",
+          "page_number": 1,
+          "evidence": "# ABX-109 产品手册\n额定功率为1225瓦。维护周期为39天。"
+        }
+      ]
+    },
+    {
+      "id": "fact-20",
+      "category": "fact",
+      "query": "ABX-109每隔多少天维护？",
+      "answer": "39天",
+      "expect_sources": [
+        "fact-09.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "fact-09.md",
+          "page_number": 1,
+          "evidence": "# ABX-109 产品手册\n额定功率为1225瓦。维护周期为39天。"
+        }
+      ]
+    },
+    {
+      "id": "fact-21",
+      "category": "fact",
+      "query": "ABX-110的额定功率是多少？",
+      "answer": "1250瓦",
+      "expect_sources": [
+        "fact-10.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "fact-10.md",
+          "page_number": 1,
+          "evidence": "# ABX-110 产品手册\n额定功率为1250瓦。维护周期为40天。"
+        }
+      ]
+    },
+    {
+      "id": "fact-22",
+      "category": "fact",
+      "query": "ABX-110每隔多少天维护？",
+      "answer": "40天",
+      "expect_sources": [
+        "fact-10.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "fact-10.md",
+          "page_number": 1,
+          "evidence": "# ABX-110 产品手册\n额定功率为1250瓦。维护周期为40天。"
+        }
+      ]
+    },
+    {
+      "id": "fact-23",
+      "category": "fact",
+      "query": "ABX-111的额定功率是多少？",
+      "answer": "1275瓦",
+      "expect_sources": [
+        "fact-11.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "fact-11.md",
+          "page_number": 1,
+          "evidence": "# ABX-111 产品手册\n额定功率为1275瓦。维护周期为41天。"
+        }
+      ]
+    },
+    {
+      "id": "fact-24",
+      "category": "fact",
+      "query": "ABX-111每隔多少天维护？",
+      "answer": "41天",
+      "expect_sources": [
+        "fact-11.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "fact-11.md",
+          "page_number": 1,
+          "evidence": "# ABX-111 产品手册\n额定功率为1275瓦。维护周期为41天。"
+        }
+      ]
+    },
+    {
+      "id": "fact-25",
+      "category": "fact",
+      "query": "ABX-112的额定功率是多少？",
+      "answer": "1300瓦",
+      "expect_sources": [
+        "fact-12.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "fact-12.md",
+          "page_number": 1,
+          "evidence": "# ABX-112 产品手册\n额定功率为1300瓦。维护周期为42天。"
+        }
+      ]
+    },
+    {
+      "id": "fact-26",
+      "category": "fact",
+      "query": "ABX-112每隔多少天维护？",
+      "answer": "42天",
+      "expect_sources": [
+        "fact-12.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "fact-12.md",
+          "page_number": 1,
+          "evidence": "# ABX-112 产品手册\n额定功率为1300瓦。维护周期为42天。"
+        }
+      ]
+    },
+    {
+      "id": "fact-27",
+      "category": "fact",
+      "query": "ABX-113的额定功率是多少？",
+      "answer": "1325瓦",
+      "expect_sources": [
+        "fact-13.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "fact-13.md",
+          "page_number": 1,
+          "evidence": "# ABX-113 产品手册\n额定功率为1325瓦。维护周期为43天。"
+        }
+      ]
+    },
+    {
+      "id": "fact-28",
+      "category": "fact",
+      "query": "ABX-113每隔多少天维护？",
+      "answer": "43天",
+      "expect_sources": [
+        "fact-13.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "fact-13.md",
+          "page_number": 1,
+          "evidence": "# ABX-113 产品手册\n额定功率为1325瓦。维护周期为43天。"
+        }
+      ]
+    },
+    {
+      "id": "fact-29",
+      "category": "fact",
+      "query": "ABX-114的额定功率是多少？",
+      "answer": "1350瓦",
+      "expect_sources": [
+        "fact-14.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "fact-14.md",
+          "page_number": 1,
+          "evidence": "# ABX-114 产品手册\n额定功率为1350瓦。维护周期为44天。"
+        }
+      ]
+    },
+    {
+      "id": "fact-30",
+      "category": "fact",
+      "query": "ABX-114每隔多少天维护？",
+      "answer": "44天",
+      "expect_sources": [
+        "fact-14.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "fact-14.md",
+          "page_number": 1,
+          "evidence": "# ABX-114 产品手册\n额定功率为1350瓦。维护周期为44天。"
+        }
+      ]
+    },
+    {
+      "id": "fact-31",
+      "category": "fact",
+      "query": "ABX-115的额定功率是多少？",
+      "answer": "1375瓦",
+      "expect_sources": [
+        "fact-15.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "fact-15.md",
+          "page_number": 1,
+          "evidence": "# ABX-115 产品手册\n额定功率为1375瓦。维护周期为45天。"
+        }
+      ]
+    },
+    {
+      "id": "fact-32",
+      "category": "fact",
+      "query": "ABX-115每隔多少天维护？",
+      "answer": "45天",
+      "expect_sources": [
+        "fact-15.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "fact-15.md",
+          "page_number": 1,
+          "evidence": "# ABX-115 产品手册\n额定功率为1375瓦。维护周期为45天。"
+        }
+      ]
+    },
+    {
+      "id": "fact-33",
+      "category": "fact",
+      "query": "ABX-116的额定功率是多少？",
+      "answer": "1400瓦",
+      "expect_sources": [
+        "fact-16.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "fact-16.md",
+          "page_number": 1,
+          "evidence": "# ABX-116 产品手册\n额定功率为1400瓦。维护周期为46天。"
+        }
+      ]
+    },
+    {
+      "id": "fact-34",
+      "category": "fact",
+      "query": "ABX-116每隔多少天维护？",
+      "answer": "46天",
+      "expect_sources": [
+        "fact-16.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "fact-16.md",
+          "page_number": 1,
+          "evidence": "# ABX-116 产品手册\n额定功率为1400瓦。维护周期为46天。"
+        }
+      ]
+    },
+    {
+      "id": "fact-35",
+      "category": "fact",
+      "query": "ABX-117的额定功率是多少？",
+      "answer": "1425瓦",
+      "expect_sources": [
+        "fact-17.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "fact-17.md",
+          "page_number": 1,
+          "evidence": "# ABX-117 产品手册\n额定功率为1425瓦。维护周期为47天。"
+        }
+      ]
+    },
+    {
+      "id": "fact-36",
+      "category": "fact",
+      "query": "ABX-117每隔多少天维护？",
+      "answer": "47天",
+      "expect_sources": [
+        "fact-17.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "fact-17.md",
+          "page_number": 1,
+          "evidence": "# ABX-117 产品手册\n额定功率为1425瓦。维护周期为47天。"
+        }
+      ]
+    },
+    {
+      "id": "fact-37",
+      "category": "fact",
+      "query": "ABX-118的额定功率是多少？",
+      "answer": "1450瓦",
+      "expect_sources": [
+        "fact-18.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "fact-18.md",
+          "page_number": 1,
+          "evidence": "# ABX-118 产品手册\n额定功率为1450瓦。维护周期为48天。"
+        }
+      ]
+    },
+    {
+      "id": "fact-38",
+      "category": "fact",
+      "query": "ABX-118每隔多少天维护？",
+      "answer": "48天",
+      "expect_sources": [
+        "fact-18.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "fact-18.md",
+          "page_number": 1,
+          "evidence": "# ABX-118 产品手册\n额定功率为1450瓦。维护周期为48天。"
+        }
+      ]
+    },
+    {
+      "id": "fact-39",
+      "category": "fact",
+      "query": "ABX-119的额定功率是多少？",
+      "answer": "1475瓦",
+      "expect_sources": [
+        "fact-19.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "fact-19.md",
+          "page_number": 1,
+          "evidence": "# ABX-119 产品手册\n额定功率为1475瓦。维护周期为49天。"
+        }
+      ]
+    },
+    {
+      "id": "fact-40",
+      "category": "fact",
+      "query": "ABX-119每隔多少天维护？",
+      "answer": "49天",
+      "expect_sources": [
+        "fact-19.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "fact-19.md",
+          "page_number": 1,
+          "evidence": "# ABX-119 产品手册\n额定功率为1475瓦。维护周期为49天。"
+        }
+      ]
+    },
+    {
+      "id": "table-01",
+      "category": "table",
+      "query": "2020年部门1预算是多少？",
+      "answer": "100万元",
+      "expect_sources": [
+        "table-00.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "table-00.md",
+          "page_number": 1,
+          "evidence": "# 2020预算\n| 部门 | 预算（万元） |\n|---|---|\n| 部门1 | 100 |\n| 部门2 | 107 |\n| 部门3 | 114 |\n| 部门4 | 121 |\n| 部门5 | 128 |"
+        }
+      ]
+    },
+    {
+      "id": "table-02",
+      "category": "table",
+      "query": "2020年部门2预算是多少？",
+      "answer": "107万元",
+      "expect_sources": [
+        "table-00.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "table-00.md",
+          "page_number": 1,
+          "evidence": "# 2020预算\n| 部门 | 预算（万元） |\n|---|---|\n| 部门1 | 100 |\n| 部门2 | 107 |\n| 部门3 | 114 |\n| 部门4 | 121 |\n| 部门5 | 128 |"
+        }
+      ]
+    },
+    {
+      "id": "table-03",
+      "category": "table",
+      "query": "2020年部门3预算是多少？",
+      "answer": "114万元",
+      "expect_sources": [
+        "table-00.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "table-00.md",
+          "page_number": 1,
+          "evidence": "# 2020预算\n| 部门 | 预算（万元） |\n|---|---|\n| 部门1 | 100 |\n| 部门2 | 107 |\n| 部门3 | 114 |\n| 部门4 | 121 |\n| 部门5 | 128 |"
+        }
+      ]
+    },
+    {
+      "id": "table-04",
+      "category": "table",
+      "query": "2020年部门4预算是多少？",
+      "answer": "121万元",
+      "expect_sources": [
+        "table-00.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "table-00.md",
+          "page_number": 1,
+          "evidence": "# 2020预算\n| 部门 | 预算（万元） |\n|---|---|\n| 部门1 | 100 |\n| 部门2 | 107 |\n| 部门3 | 114 |\n| 部门4 | 121 |\n| 部门5 | 128 |"
+        }
+      ]
+    },
+    {
+      "id": "table-05",
+      "category": "table",
+      "query": "2020年部门5预算是多少？",
+      "answer": "128万元",
+      "expect_sources": [
+        "table-00.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "table-00.md",
+          "page_number": 1,
+          "evidence": "# 2020预算\n| 部门 | 预算（万元） |\n|---|---|\n| 部门1 | 100 |\n| 部门2 | 107 |\n| 部门3 | 114 |\n| 部门4 | 121 |\n| 部门5 | 128 |"
+        }
+      ]
+    },
+    {
+      "id": "table-06",
+      "category": "table",
+      "query": "2021年部门1预算是多少？",
+      "answer": "200万元",
+      "expect_sources": [
+        "table-01.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "table-01.md",
+          "page_number": 1,
+          "evidence": "# 2021预算\n| 部门 | 预算（万元） |\n|---|---|\n| 部门1 | 200 |\n| 部门2 | 207 |\n| 部门3 | 214 |\n| 部门4 | 221 |\n| 部门5 | 228 |"
+        }
+      ]
+    },
+    {
+      "id": "table-07",
+      "category": "table",
+      "query": "2021年部门2预算是多少？",
+      "answer": "207万元",
+      "expect_sources": [
+        "table-01.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "table-01.md",
+          "page_number": 1,
+          "evidence": "# 2021预算\n| 部门 | 预算（万元） |\n|---|---|\n| 部门1 | 200 |\n| 部门2 | 207 |\n| 部门3 | 214 |\n| 部门4 | 221 |\n| 部门5 | 228 |"
+        }
+      ]
+    },
+    {
+      "id": "table-08",
+      "category": "table",
+      "query": "2021年部门3预算是多少？",
+      "answer": "214万元",
+      "expect_sources": [
+        "table-01.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "table-01.md",
+          "page_number": 1,
+          "evidence": "# 2021预算\n| 部门 | 预算（万元） |\n|---|---|\n| 部门1 | 200 |\n| 部门2 | 207 |\n| 部门3 | 214 |\n| 部门4 | 221 |\n| 部门5 | 228 |"
+        }
+      ]
+    },
+    {
+      "id": "table-09",
+      "category": "table",
+      "query": "2021年部门4预算是多少？",
+      "answer": "221万元",
+      "expect_sources": [
+        "table-01.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "table-01.md",
+          "page_number": 1,
+          "evidence": "# 2021预算\n| 部门 | 预算（万元） |\n|---|---|\n| 部门1 | 200 |\n| 部门2 | 207 |\n| 部门3 | 214 |\n| 部门4 | 221 |\n| 部门5 | 228 |"
+        }
+      ]
+    },
+    {
+      "id": "table-10",
+      "category": "table",
+      "query": "2021年部门5预算是多少？",
+      "answer": "228万元",
+      "expect_sources": [
+        "table-01.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "table-01.md",
+          "page_number": 1,
+          "evidence": "# 2021预算\n| 部门 | 预算（万元） |\n|---|---|\n| 部门1 | 200 |\n| 部门2 | 207 |\n| 部门3 | 214 |\n| 部门4 | 221 |\n| 部门5 | 228 |"
+        }
+      ]
+    },
+    {
+      "id": "table-11",
+      "category": "table",
+      "query": "2022年部门1预算是多少？",
+      "answer": "300万元",
+      "expect_sources": [
+        "table-02.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "table-02.md",
+          "page_number": 1,
+          "evidence": "# 2022预算\n| 部门 | 预算（万元） |\n|---|---|\n| 部门1 | 300 |\n| 部门2 | 307 |\n| 部门3 | 314 |\n| 部门4 | 321 |\n| 部门5 | 328 |"
+        }
+      ]
+    },
+    {
+      "id": "table-12",
+      "category": "table",
+      "query": "2022年部门2预算是多少？",
+      "answer": "307万元",
+      "expect_sources": [
+        "table-02.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "table-02.md",
+          "page_number": 1,
+          "evidence": "# 2022预算\n| 部门 | 预算（万元） |\n|---|---|\n| 部门1 | 300 |\n| 部门2 | 307 |\n| 部门3 | 314 |\n| 部门4 | 321 |\n| 部门5 | 328 |"
+        }
+      ]
+    },
+    {
+      "id": "table-13",
+      "category": "table",
+      "query": "2022年部门3预算是多少？",
+      "answer": "314万元",
+      "expect_sources": [
+        "table-02.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "table-02.md",
+          "page_number": 1,
+          "evidence": "# 2022预算\n| 部门 | 预算（万元） |\n|---|---|\n| 部门1 | 300 |\n| 部门2 | 307 |\n| 部门3 | 314 |\n| 部门4 | 321 |\n| 部门5 | 328 |"
+        }
+      ]
+    },
+    {
+      "id": "table-14",
+      "category": "table",
+      "query": "2022年部门4预算是多少？",
+      "answer": "321万元",
+      "expect_sources": [
+        "table-02.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "table-02.md",
+          "page_number": 1,
+          "evidence": "# 2022预算\n| 部门 | 预算（万元） |\n|---|---|\n| 部门1 | 300 |\n| 部门2 | 307 |\n| 部门3 | 314 |\n| 部门4 | 321 |\n| 部门5 | 328 |"
+        }
+      ]
+    },
+    {
+      "id": "table-15",
+      "category": "table",
+      "query": "2022年部门5预算是多少？",
+      "answer": "328万元",
+      "expect_sources": [
+        "table-02.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "table-02.md",
+          "page_number": 1,
+          "evidence": "# 2022预算\n| 部门 | 预算（万元） |\n|---|---|\n| 部门1 | 300 |\n| 部门2 | 307 |\n| 部门3 | 314 |\n| 部门4 | 321 |\n| 部门5 | 328 |"
+        }
+      ]
+    },
+    {
+      "id": "table-16",
+      "category": "table",
+      "query": "2023年部门1预算是多少？",
+      "answer": "400万元",
+      "expect_sources": [
+        "table-03.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "table-03.md",
+          "page_number": 1,
+          "evidence": "# 2023预算\n| 部门 | 预算（万元） |\n|---|---|\n| 部门1 | 400 |\n| 部门2 | 407 |\n| 部门3 | 414 |\n| 部门4 | 421 |\n| 部门5 | 428 |"
+        }
+      ]
+    },
+    {
+      "id": "table-17",
+      "category": "table",
+      "query": "2023年部门2预算是多少？",
+      "answer": "407万元",
+      "expect_sources": [
+        "table-03.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "table-03.md",
+          "page_number": 1,
+          "evidence": "# 2023预算\n| 部门 | 预算（万元） |\n|---|---|\n| 部门1 | 400 |\n| 部门2 | 407 |\n| 部门3 | 414 |\n| 部门4 | 421 |\n| 部门5 | 428 |"
+        }
+      ]
+    },
+    {
+      "id": "table-18",
+      "category": "table",
+      "query": "2023年部门3预算是多少？",
+      "answer": "414万元",
+      "expect_sources": [
+        "table-03.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "table-03.md",
+          "page_number": 1,
+          "evidence": "# 2023预算\n| 部门 | 预算（万元） |\n|---|---|\n| 部门1 | 400 |\n| 部门2 | 407 |\n| 部门3 | 414 |\n| 部门4 | 421 |\n| 部门5 | 428 |"
+        }
+      ]
+    },
+    {
+      "id": "table-19",
+      "category": "table",
+      "query": "2023年部门4预算是多少？",
+      "answer": "421万元",
+      "expect_sources": [
+        "table-03.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "table-03.md",
+          "page_number": 1,
+          "evidence": "# 2023预算\n| 部门 | 预算（万元） |\n|---|---|\n| 部门1 | 400 |\n| 部门2 | 407 |\n| 部门3 | 414 |\n| 部门4 | 421 |\n| 部门5 | 428 |"
+        }
+      ]
+    },
+    {
+      "id": "table-20",
+      "category": "table",
+      "query": "2023年部门5预算是多少？",
+      "answer": "428万元",
+      "expect_sources": [
+        "table-03.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "table-03.md",
+          "page_number": 1,
+          "evidence": "# 2023预算\n| 部门 | 预算（万元） |\n|---|---|\n| 部门1 | 400 |\n| 部门2 | 407 |\n| 部门3 | 414 |\n| 部门4 | 421 |\n| 部门5 | 428 |"
+        }
+      ]
+    },
+    {
+      "id": "table-21",
+      "category": "table",
+      "query": "2024年部门1预算是多少？",
+      "answer": "500万元",
+      "expect_sources": [
+        "table-04.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "table-04.md",
+          "page_number": 1,
+          "evidence": "# 2024预算\n| 部门 | 预算（万元） |\n|---|---|\n| 部门1 | 500 |\n| 部门2 | 507 |\n| 部门3 | 514 |\n| 部门4 | 521 |\n| 部门5 | 528 |"
+        }
+      ]
+    },
+    {
+      "id": "table-22",
+      "category": "table",
+      "query": "2024年部门2预算是多少？",
+      "answer": "507万元",
+      "expect_sources": [
+        "table-04.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "table-04.md",
+          "page_number": 1,
+          "evidence": "# 2024预算\n| 部门 | 预算（万元） |\n|---|---|\n| 部门1 | 500 |\n| 部门2 | 507 |\n| 部门3 | 514 |\n| 部门4 | 521 |\n| 部门5 | 528 |"
+        }
+      ]
+    },
+    {
+      "id": "table-23",
+      "category": "table",
+      "query": "2024年部门3预算是多少？",
+      "answer": "514万元",
+      "expect_sources": [
+        "table-04.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "table-04.md",
+          "page_number": 1,
+          "evidence": "# 2024预算\n| 部门 | 预算（万元） |\n|---|---|\n| 部门1 | 500 |\n| 部门2 | 507 |\n| 部门3 | 514 |\n| 部门4 | 521 |\n| 部门5 | 528 |"
+        }
+      ]
+    },
+    {
+      "id": "table-24",
+      "category": "table",
+      "query": "2024年部门4预算是多少？",
+      "answer": "521万元",
+      "expect_sources": [
+        "table-04.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "table-04.md",
+          "page_number": 1,
+          "evidence": "# 2024预算\n| 部门 | 预算（万元） |\n|---|---|\n| 部门1 | 500 |\n| 部门2 | 507 |\n| 部门3 | 514 |\n| 部门4 | 521 |\n| 部门5 | 528 |"
+        }
+      ]
+    },
+    {
+      "id": "table-25",
+      "category": "table",
+      "query": "2024年部门5预算是多少？",
+      "answer": "528万元",
+      "expect_sources": [
+        "table-04.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "table-04.md",
+          "page_number": 1,
+          "evidence": "# 2024预算\n| 部门 | 预算（万元） |\n|---|---|\n| 部门1 | 500 |\n| 部门2 | 507 |\n| 部门3 | 514 |\n| 部门4 | 521 |\n| 部门5 | 528 |"
+        }
+      ]
+    },
+    {
+      "id": "image-01",
+      "category": "image",
+      "query": "图表1的项目收入是多少？",
+      "answer": "500万元",
+      "expect_sources": [
+        "image-00.png"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "image-00.png",
+          "page_number": 1,
+          "evidence": "图表1\n项目代号 VIZ-100\n收入 500 万元\n统计年份 2025"
+        }
+      ]
+    },
+    {
+      "id": "image-02",
+      "category": "image",
+      "query": "图表2的项目收入是多少？",
+      "answer": "531万元",
+      "expect_sources": [
+        "image-01.png"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "image-01.png",
+          "page_number": 1,
+          "evidence": "图表2\n项目代号 VIZ-101\n收入 531 万元\n统计年份 2025"
+        }
+      ]
+    },
+    {
+      "id": "image-03",
+      "category": "image",
+      "query": "图表3的项目收入是多少？",
+      "answer": "562万元",
+      "expect_sources": [
+        "image-02.png"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "image-02.png",
+          "page_number": 1,
+          "evidence": "图表3\n项目代号 VIZ-102\n收入 562 万元\n统计年份 2025"
+        }
+      ]
+    },
+    {
+      "id": "image-04",
+      "category": "image",
+      "query": "图表4的项目收入是多少？",
+      "answer": "593万元",
+      "expect_sources": [
+        "image-03.png"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "image-03.png",
+          "page_number": 1,
+          "evidence": "图表4\n项目代号 VIZ-103\n收入 593 万元\n统计年份 2025"
+        }
+      ]
+    },
+    {
+      "id": "image-05",
+      "category": "image",
+      "query": "图表5的项目收入是多少？",
+      "answer": "624万元",
+      "expect_sources": [
+        "image-04.png"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "image-04.png",
+          "page_number": 1,
+          "evidence": "图表5\n项目代号 VIZ-104\n收入 624 万元\n统计年份 2025"
+        }
+      ]
+    },
+    {
+      "id": "image-06",
+      "category": "image",
+      "query": "图表6的项目收入是多少？",
+      "answer": "655万元",
+      "expect_sources": [
+        "image-05.png"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "image-05.png",
+          "page_number": 1,
+          "evidence": "图表6\n项目代号 VIZ-105\n收入 655 万元\n统计年份 2025"
+        }
+      ]
+    },
+    {
+      "id": "image-07",
+      "category": "image",
+      "query": "图表7的项目收入是多少？",
+      "answer": "686万元",
+      "expect_sources": [
+        "image-06.png"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "image-06.png",
+          "page_number": 1,
+          "evidence": "图表7\n项目代号 VIZ-106\n收入 686 万元\n统计年份 2025"
+        }
+      ]
+    },
+    {
+      "id": "image-08",
+      "category": "image",
+      "query": "图表8的项目收入是多少？",
+      "answer": "717万元",
+      "expect_sources": [
+        "image-07.png"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "image-07.png",
+          "page_number": 1,
+          "evidence": "图表8\n项目代号 VIZ-107\n收入 717 万元\n统计年份 2025"
+        }
+      ]
+    },
+    {
+      "id": "image-09",
+      "category": "image",
+      "query": "图表9的项目收入是多少？",
+      "answer": "748万元",
+      "expect_sources": [
+        "image-08.png"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "image-08.png",
+          "page_number": 1,
+          "evidence": "图表9\n项目代号 VIZ-108\n收入 748 万元\n统计年份 2025"
+        }
+      ]
+    },
+    {
+      "id": "image-10",
+      "category": "image",
+      "query": "图表10的项目收入是多少？",
+      "answer": "779万元",
+      "expect_sources": [
+        "image-09.png"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "image-09.png",
+          "page_number": 1,
+          "evidence": "图表10\n项目代号 VIZ-109\n收入 779 万元\n统计年份 2025"
+        }
+      ]
+    },
+    {
+      "id": "image-11",
+      "category": "image",
+      "query": "图表11的项目收入是多少？",
+      "answer": "810万元",
+      "expect_sources": [
+        "image-10.png"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "image-10.png",
+          "page_number": 1,
+          "evidence": "图表11\n项目代号 VIZ-110\n收入 810 万元\n统计年份 2025"
+        }
+      ]
+    },
+    {
+      "id": "image-12",
+      "category": "image",
+      "query": "图表12的项目收入是多少？",
+      "answer": "841万元",
+      "expect_sources": [
+        "image-11.png"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "image-11.png",
+          "page_number": 1,
+          "evidence": "图表12\n项目代号 VIZ-111\n收入 841 万元\n统计年份 2025"
+        }
+      ]
+    },
+    {
+      "id": "image-13",
+      "category": "image",
+      "query": "图表13的项目收入是多少？",
+      "answer": "872万元",
+      "expect_sources": [
+        "image-12.png"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "image-12.png",
+          "page_number": 1,
+          "evidence": "图表13\n项目代号 VIZ-112\n收入 872 万元\n统计年份 2025"
+        }
+      ]
+    },
+    {
+      "id": "image-14",
+      "category": "image",
+      "query": "图表14的项目收入是多少？",
+      "answer": "903万元",
+      "expect_sources": [
+        "image-13.png"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "image-13.png",
+          "page_number": 1,
+          "evidence": "图表14\n项目代号 VIZ-113\n收入 903 万元\n统计年份 2025"
+        }
+      ]
+    },
+    {
+      "id": "image-15",
+      "category": "image",
+      "query": "图表15的项目收入是多少？",
+      "answer": "934万元",
+      "expect_sources": [
+        "image-14.png"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "image-14.png",
+          "page_number": 1,
+          "evidence": "图表15\n项目代号 VIZ-114\n收入 934 万元\n统计年份 2025"
+        }
+      ]
+    },
+    {
+      "id": "multihop-01",
+      "category": "multihop",
+      "query": "企业甲0投资的企业位于哪个园区？",
+      "answer": "园区0",
+      "expect_sources": [
+        "relation-00-a.md",
+        "relation-00-b.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "relation-00-a.md",
+          "page_number": 1,
+          "evidence": "# 企业投资\n企业甲0投资企业乙0。"
+        },
+        {
+          "filename": "relation-00-b.md",
+          "page_number": 1,
+          "evidence": "# 企业地址\n企业乙0位于园区0。"
+        }
+      ]
+    },
+    {
+      "id": "multihop-02",
+      "category": "multihop",
+      "query": "企业甲1投资的企业位于哪个园区？",
+      "answer": "园区1",
+      "expect_sources": [
+        "relation-01-a.md",
+        "relation-01-b.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "relation-01-a.md",
+          "page_number": 1,
+          "evidence": "# 企业投资\n企业甲1投资企业乙1。"
+        },
+        {
+          "filename": "relation-01-b.md",
+          "page_number": 1,
+          "evidence": "# 企业地址\n企业乙1位于园区1。"
+        }
+      ]
+    },
+    {
+      "id": "multihop-03",
+      "category": "multihop",
+      "query": "企业甲2投资的企业位于哪个园区？",
+      "answer": "园区2",
+      "expect_sources": [
+        "relation-02-a.md",
+        "relation-02-b.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "relation-02-a.md",
+          "page_number": 1,
+          "evidence": "# 企业投资\n企业甲2投资企业乙2。"
+        },
+        {
+          "filename": "relation-02-b.md",
+          "page_number": 1,
+          "evidence": "# 企业地址\n企业乙2位于园区2。"
+        }
+      ]
+    },
+    {
+      "id": "multihop-04",
+      "category": "multihop",
+      "query": "企业甲3投资的企业位于哪个园区？",
+      "answer": "园区3",
+      "expect_sources": [
+        "relation-03-a.md",
+        "relation-03-b.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "relation-03-a.md",
+          "page_number": 1,
+          "evidence": "# 企业投资\n企业甲3投资企业乙3。"
+        },
+        {
+          "filename": "relation-03-b.md",
+          "page_number": 1,
+          "evidence": "# 企业地址\n企业乙3位于园区3。"
+        }
+      ]
+    },
+    {
+      "id": "multihop-05",
+      "category": "multihop",
+      "query": "企业甲4投资的企业位于哪个园区？",
+      "answer": "园区4",
+      "expect_sources": [
+        "relation-04-a.md",
+        "relation-04-b.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "relation-04-a.md",
+          "page_number": 1,
+          "evidence": "# 企业投资\n企业甲4投资企业乙4。"
+        },
+        {
+          "filename": "relation-04-b.md",
+          "page_number": 1,
+          "evidence": "# 企业地址\n企业乙4位于园区4。"
+        }
+      ]
+    },
+    {
+      "id": "multihop-06",
+      "category": "multihop",
+      "query": "企业甲5投资的企业位于哪个园区？",
+      "answer": "园区5",
+      "expect_sources": [
+        "relation-05-a.md",
+        "relation-05-b.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "relation-05-a.md",
+          "page_number": 1,
+          "evidence": "# 企业投资\n企业甲5投资企业乙5。"
+        },
+        {
+          "filename": "relation-05-b.md",
+          "page_number": 1,
+          "evidence": "# 企业地址\n企业乙5位于园区5。"
+        }
+      ]
+    },
+    {
+      "id": "multihop-07",
+      "category": "multihop",
+      "query": "企业甲6投资的企业位于哪个园区？",
+      "answer": "园区6",
+      "expect_sources": [
+        "relation-06-a.md",
+        "relation-06-b.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "relation-06-a.md",
+          "page_number": 1,
+          "evidence": "# 企业投资\n企业甲6投资企业乙6。"
+        },
+        {
+          "filename": "relation-06-b.md",
+          "page_number": 1,
+          "evidence": "# 企业地址\n企业乙6位于园区6。"
+        }
+      ]
+    },
+    {
+      "id": "multihop-08",
+      "category": "multihop",
+      "query": "企业甲7投资的企业位于哪个园区？",
+      "answer": "园区7",
+      "expect_sources": [
+        "relation-07-a.md",
+        "relation-07-b.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "relation-07-a.md",
+          "page_number": 1,
+          "evidence": "# 企业投资\n企业甲7投资企业乙7。"
+        },
+        {
+          "filename": "relation-07-b.md",
+          "page_number": 1,
+          "evidence": "# 企业地址\n企业乙7位于园区7。"
+        }
+      ]
+    },
+    {
+      "id": "multihop-09",
+      "category": "multihop",
+      "query": "企业甲8投资的企业位于哪个园区？",
+      "answer": "园区8",
+      "expect_sources": [
+        "relation-08-a.md",
+        "relation-08-b.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "relation-08-a.md",
+          "page_number": 1,
+          "evidence": "# 企业投资\n企业甲8投资企业乙8。"
+        },
+        {
+          "filename": "relation-08-b.md",
+          "page_number": 1,
+          "evidence": "# 企业地址\n企业乙8位于园区8。"
+        }
+      ]
+    },
+    {
+      "id": "multihop-10",
+      "category": "multihop",
+      "query": "企业甲9投资的企业位于哪个园区？",
+      "answer": "园区9",
+      "expect_sources": [
+        "relation-09-a.md",
+        "relation-09-b.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "relation-09-a.md",
+          "page_number": 1,
+          "evidence": "# 企业投资\n企业甲9投资企业乙9。"
+        },
+        {
+          "filename": "relation-09-b.md",
+          "page_number": 1,
+          "evidence": "# 企业地址\n企业乙9位于园区9。"
+        }
+      ]
+    },
+    {
+      "id": "multihop-11",
+      "category": "multihop",
+      "query": "企业甲10投资的企业位于哪个园区？",
+      "answer": "园区10",
+      "expect_sources": [
+        "relation-10-a.md",
+        "relation-10-b.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "relation-10-a.md",
+          "page_number": 1,
+          "evidence": "# 企业投资\n企业甲10投资企业乙10。"
+        },
+        {
+          "filename": "relation-10-b.md",
+          "page_number": 1,
+          "evidence": "# 企业地址\n企业乙10位于园区10。"
+        }
+      ]
+    },
+    {
+      "id": "multihop-12",
+      "category": "multihop",
+      "query": "企业甲11投资的企业位于哪个园区？",
+      "answer": "园区11",
+      "expect_sources": [
+        "relation-11-a.md",
+        "relation-11-b.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "relation-11-a.md",
+          "page_number": 1,
+          "evidence": "# 企业投资\n企业甲11投资企业乙11。"
+        },
+        {
+          "filename": "relation-11-b.md",
+          "page_number": 1,
+          "evidence": "# 企业地址\n企业乙11位于园区11。"
+        }
+      ]
+    },
+    {
+      "id": "multihop-13",
+      "category": "multihop",
+      "query": "企业甲12投资的企业位于哪个园区？",
+      "answer": "园区12",
+      "expect_sources": [
+        "relation-12-a.md",
+        "relation-12-b.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "relation-12-a.md",
+          "page_number": 1,
+          "evidence": "# 企业投资\n企业甲12投资企业乙12。"
+        },
+        {
+          "filename": "relation-12-b.md",
+          "page_number": 1,
+          "evidence": "# 企业地址\n企业乙12位于园区12。"
+        }
+      ]
+    },
+    {
+      "id": "multihop-14",
+      "category": "multihop",
+      "query": "企业甲13投资的企业位于哪个园区？",
+      "answer": "园区13",
+      "expect_sources": [
+        "relation-13-a.md",
+        "relation-13-b.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "relation-13-a.md",
+          "page_number": 1,
+          "evidence": "# 企业投资\n企业甲13投资企业乙13。"
+        },
+        {
+          "filename": "relation-13-b.md",
+          "page_number": 1,
+          "evidence": "# 企业地址\n企业乙13位于园区13。"
+        }
+      ]
+    },
+    {
+      "id": "multihop-15",
+      "category": "multihop",
+      "query": "企业甲14投资的企业位于哪个园区？",
+      "answer": "园区14",
+      "expect_sources": [
+        "relation-14-a.md",
+        "relation-14-b.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "relation-14-a.md",
+          "page_number": 1,
+          "evidence": "# 企业投资\n企业甲14投资企业乙14。"
+        },
+        {
+          "filename": "relation-14-b.md",
+          "page_number": 1,
+          "evidence": "# 企业地址\n企业乙14位于园区14。"
+        }
+      ]
+    },
+    {
+      "id": "multihop-16",
+      "category": "multihop",
+      "query": "企业甲15投资的企业位于哪个园区？",
+      "answer": "园区15",
+      "expect_sources": [
+        "relation-15-a.md",
+        "relation-15-b.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "relation-15-a.md",
+          "page_number": 1,
+          "evidence": "# 企业投资\n企业甲15投资企业乙15。"
+        },
+        {
+          "filename": "relation-15-b.md",
+          "page_number": 1,
+          "evidence": "# 企业地址\n企业乙15位于园区15。"
+        }
+      ]
+    },
+    {
+      "id": "multihop-17",
+      "category": "multihop",
+      "query": "企业甲16投资的企业位于哪个园区？",
+      "answer": "园区16",
+      "expect_sources": [
+        "relation-16-a.md",
+        "relation-16-b.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "relation-16-a.md",
+          "page_number": 1,
+          "evidence": "# 企业投资\n企业甲16投资企业乙16。"
+        },
+        {
+          "filename": "relation-16-b.md",
+          "page_number": 1,
+          "evidence": "# 企业地址\n企业乙16位于园区16。"
+        }
+      ]
+    },
+    {
+      "id": "multihop-18",
+      "category": "multihop",
+      "query": "企业甲17投资的企业位于哪个园区？",
+      "answer": "园区17",
+      "expect_sources": [
+        "relation-17-a.md",
+        "relation-17-b.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "relation-17-a.md",
+          "page_number": 1,
+          "evidence": "# 企业投资\n企业甲17投资企业乙17。"
+        },
+        {
+          "filename": "relation-17-b.md",
+          "page_number": 1,
+          "evidence": "# 企业地址\n企业乙17位于园区17。"
+        }
+      ]
+    },
+    {
+      "id": "multihop-19",
+      "category": "multihop",
+      "query": "企业甲18投资的企业位于哪个园区？",
+      "answer": "园区18",
+      "expect_sources": [
+        "relation-18-a.md",
+        "relation-18-b.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "relation-18-a.md",
+          "page_number": 1,
+          "evidence": "# 企业投资\n企业甲18投资企业乙18。"
+        },
+        {
+          "filename": "relation-18-b.md",
+          "page_number": 1,
+          "evidence": "# 企业地址\n企业乙18位于园区18。"
+        }
+      ]
+    },
+    {
+      "id": "multihop-20",
+      "category": "multihop",
+      "query": "企业甲19投资的企业位于哪个园区？",
+      "answer": "园区19",
+      "expect_sources": [
+        "relation-19-a.md",
+        "relation-19-b.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "relation-19-a.md",
+          "page_number": 1,
+          "evidence": "# 企业投资\n企业甲19投资企业乙19。"
+        },
+        {
+          "filename": "relation-19-b.md",
+          "page_number": 1,
+          "evidence": "# 企业地址\n企业乙19位于园区19。"
+        }
+      ]
+    },
+    {
+      "id": "negative-01",
+      "category": "negative",
+      "query": "不存在的设备 MISSING-0保修几年？",
+      "answer": null,
+      "expect_sources": [],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": true,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": []
+    },
+    {
+      "id": "negative-02",
+      "category": "negative",
+      "query": "不存在的设备 MISSING-1保修几年？",
+      "answer": null,
+      "expect_sources": [],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": true,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": []
+    },
+    {
+      "id": "negative-03",
+      "category": "negative",
+      "query": "不存在的设备 MISSING-2保修几年？",
+      "answer": null,
+      "expect_sources": [],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": true,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": []
+    },
+    {
+      "id": "negative-04",
+      "category": "negative",
+      "query": "不存在的设备 MISSING-3保修几年？",
+      "answer": null,
+      "expect_sources": [],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": true,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": []
+    },
+    {
+      "id": "negative-05",
+      "category": "negative",
+      "query": "不存在的设备 MISSING-4保修几年？",
+      "answer": null,
+      "expect_sources": [],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": true,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": []
+    },
+    {
+      "id": "negative-06",
+      "category": "negative",
+      "query": "不存在的设备 MISSING-5保修几年？",
+      "answer": null,
+      "expect_sources": [],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": true,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": []
+    },
+    {
+      "id": "negative-07",
+      "category": "negative",
+      "query": "不存在的设备 MISSING-6保修几年？",
+      "answer": null,
+      "expect_sources": [],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": true,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": []
+    },
+    {
+      "id": "negative-08",
+      "category": "negative",
+      "query": "不存在的设备 MISSING-7保修几年？",
+      "answer": null,
+      "expect_sources": [],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": true,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": []
+    },
+    {
+      "id": "negative-09",
+      "category": "negative",
+      "query": "不存在的设备 MISSING-8保修几年？",
+      "answer": null,
+      "expect_sources": [],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": true,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": []
+    },
+    {
+      "id": "negative-10",
+      "category": "negative",
+      "query": "不存在的设备 MISSING-9保修几年？",
+      "answer": null,
+      "expect_sources": [],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": true,
+      "expect_conflict_notice": false,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": []
+    },
+    {
+      "id": "negative-11",
+      "category": "negative",
+      "query": "项目冲突0预算究竟是多少？",
+      "answer": "材料冲突，无法确定",
+      "expect_sources": [
+        "conflict-00-a.md",
+        "conflict-00-b.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": true,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "conflict-00-a.md",
+          "page_number": 1,
+          "evidence": "# 未注明日期的记录甲\n项目冲突0预算为100万元。"
+        },
+        {
+          "filename": "conflict-00-b.md",
+          "page_number": 1,
+          "evidence": "# 未注明日期的记录乙\n项目冲突0预算为200万元。"
+        }
+      ]
+    },
+    {
+      "id": "negative-12",
+      "category": "negative",
+      "query": "项目冲突1预算究竟是多少？",
+      "answer": "材料冲突，无法确定",
+      "expect_sources": [
+        "conflict-01-a.md",
+        "conflict-01-b.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": true,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "conflict-01-a.md",
+          "page_number": 1,
+          "evidence": "# 未注明日期的记录甲\n项目冲突1预算为101万元。"
+        },
+        {
+          "filename": "conflict-01-b.md",
+          "page_number": 1,
+          "evidence": "# 未注明日期的记录乙\n项目冲突1预算为201万元。"
+        }
+      ]
+    },
+    {
+      "id": "negative-13",
+      "category": "negative",
+      "query": "项目冲突2预算究竟是多少？",
+      "answer": "材料冲突，无法确定",
+      "expect_sources": [
+        "conflict-02-a.md",
+        "conflict-02-b.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": true,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "conflict-02-a.md",
+          "page_number": 1,
+          "evidence": "# 未注明日期的记录甲\n项目冲突2预算为102万元。"
+        },
+        {
+          "filename": "conflict-02-b.md",
+          "page_number": 1,
+          "evidence": "# 未注明日期的记录乙\n项目冲突2预算为202万元。"
+        }
+      ]
+    },
+    {
+      "id": "negative-14",
+      "category": "negative",
+      "query": "项目冲突3预算究竟是多少？",
+      "answer": "材料冲突，无法确定",
+      "expect_sources": [
+        "conflict-03-a.md",
+        "conflict-03-b.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": true,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "conflict-03-a.md",
+          "page_number": 1,
+          "evidence": "# 未注明日期的记录甲\n项目冲突3预算为103万元。"
+        },
+        {
+          "filename": "conflict-03-b.md",
+          "page_number": 1,
+          "evidence": "# 未注明日期的记录乙\n项目冲突3预算为203万元。"
+        }
+      ]
+    },
+    {
+      "id": "negative-15",
+      "category": "negative",
+      "query": "项目冲突4预算究竟是多少？",
+      "answer": "材料冲突，无法确定",
+      "expect_sources": [
+        "conflict-04-a.md",
+        "conflict-04-b.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": true,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "conflict-04-a.md",
+          "page_number": 1,
+          "evidence": "# 未注明日期的记录甲\n项目冲突4预算为104万元。"
+        },
+        {
+          "filename": "conflict-04-b.md",
+          "page_number": 1,
+          "evidence": "# 未注明日期的记录乙\n项目冲突4预算为204万元。"
+        }
+      ]
+    },
+    {
+      "id": "negative-16",
+      "category": "negative",
+      "query": "项目冲突5预算究竟是多少？",
+      "answer": "材料冲突，无法确定",
+      "expect_sources": [
+        "conflict-05-a.md",
+        "conflict-05-b.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": true,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "conflict-05-a.md",
+          "page_number": 1,
+          "evidence": "# 未注明日期的记录甲\n项目冲突5预算为105万元。"
+        },
+        {
+          "filename": "conflict-05-b.md",
+          "page_number": 1,
+          "evidence": "# 未注明日期的记录乙\n项目冲突5预算为205万元。"
+        }
+      ]
+    },
+    {
+      "id": "negative-17",
+      "category": "negative",
+      "query": "项目冲突6预算究竟是多少？",
+      "answer": "材料冲突，无法确定",
+      "expect_sources": [
+        "conflict-06-a.md",
+        "conflict-06-b.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": true,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "conflict-06-a.md",
+          "page_number": 1,
+          "evidence": "# 未注明日期的记录甲\n项目冲突6预算为106万元。"
+        },
+        {
+          "filename": "conflict-06-b.md",
+          "page_number": 1,
+          "evidence": "# 未注明日期的记录乙\n项目冲突6预算为206万元。"
+        }
+      ]
+    },
+    {
+      "id": "negative-18",
+      "category": "negative",
+      "query": "项目冲突7预算究竟是多少？",
+      "answer": "材料冲突，无法确定",
+      "expect_sources": [
+        "conflict-07-a.md",
+        "conflict-07-b.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": true,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "conflict-07-a.md",
+          "page_number": 1,
+          "evidence": "# 未注明日期的记录甲\n项目冲突7预算为107万元。"
+        },
+        {
+          "filename": "conflict-07-b.md",
+          "page_number": 1,
+          "evidence": "# 未注明日期的记录乙\n项目冲突7预算为207万元。"
+        }
+      ]
+    },
+    {
+      "id": "negative-19",
+      "category": "negative",
+      "query": "项目冲突8预算究竟是多少？",
+      "answer": "材料冲突，无法确定",
+      "expect_sources": [
+        "conflict-08-a.md",
+        "conflict-08-b.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": true,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "conflict-08-a.md",
+          "page_number": 1,
+          "evidence": "# 未注明日期的记录甲\n项目冲突8预算为108万元。"
+        },
+        {
+          "filename": "conflict-08-b.md",
+          "page_number": 1,
+          "evidence": "# 未注明日期的记录乙\n项目冲突8预算为208万元。"
+        }
+      ]
+    },
+    {
+      "id": "negative-20",
+      "category": "negative",
+      "query": "项目冲突9预算究竟是多少？",
+      "answer": "材料冲突，无法确定",
+      "expect_sources": [
+        "conflict-09-a.md",
+        "conflict-09-b.md"
+      ],
+      "scope": {
+        "tenant": "fixture-alpha",
+        "owner": "fixture-editor"
+      },
+      "expect_refusal": false,
+      "expect_conflict_notice": true,
+      "review": "fixture_fact_verified",
+      "human_review": "pending_business_review",
+      "source_locations": [
+        {
+          "filename": "conflict-09-a.md",
+          "page_number": 1,
+          "evidence": "# 未注明日期的记录甲\n项目冲突9预算为109万元。"
+        },
+        {
+          "filename": "conflict-09-b.md",
+          "page_number": 1,
+          "evidence": "# 未注明日期的记录乙\n项目冲突9预算为209万元。"
+        }
+      ]
+    }
+  ]
+}

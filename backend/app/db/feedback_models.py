@@ -44,6 +44,9 @@ class AnswerFeedback(Base):
     rating: Mapped[str] = mapped_column(
         String(8), nullable=False,  # "up" | "down"
     )
+    message_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("messages.id", ondelete="SET NULL"), nullable=True,
+    )
     # Q&A snapshot — the answer text lives in `messages`, but snapshots keep
     # feedback self-contained even after the conversation is deleted.
     question: Mapped[str] = mapped_column(Text, nullable=False)

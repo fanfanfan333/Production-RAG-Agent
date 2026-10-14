@@ -1,0 +1,229 @@
+import asyncio
+import uuid
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
+
+import pytest
+from app.services import graph_retrieval as graph
+from app.services.training_data import TrainingDraft, export_examples
+from app.services.retrieval_service import RetrievedChunk
+
+
+def edge(left, right, left_type="organization", right_type="organization"):
+    return graph.GraphEdge(left, left_type, right, right_type, "投资",
+                           RetrievedChunk("doc", "test.txt", 1, 0, f"{left}投资{right}", .5), f"{left}投资{right}")
+
+
+def test_graph_expansion_is_two_hops_and_type_sensitive():
+    edges = [edge("甲", "乙"), edge("乙", "丙"), edge("丙", "丁"), edge("乙", "地点", "person", "location")]
+    assert graph.expand("甲有哪些间接关联", edges) == edges[:2]
+    assert len(graph.expand("甲", [edge("甲", str(i)) for i in range(100)])) == 50
+
+
+def test_graph_quotes_and_predicate_must_be_grounded():
+    item = dict(subject="甲", subject_type="organization", predicate="投资", object="乙", object_type="organization", evidence="甲投资乙")
+    assert graph.validated_relations([item], "甲投资乙") == [item]
+    assert graph.validated_relations([{**item, "evidence": "甲投资丙"}], "甲投资乙") == []
+    assert graph.validated_relations([{**item, "predicate": "收购"}], "甲投资乙") == []
+    with pytest.raises(ValueError):
+        graph.validated_relations({}, "甲投资乙")
+
+
+def test_acl_denial_precedes_source_fetch(monkeypatch):
+    async def views(*args):
+        return {"doc": {}}, {"doc": True}
+    monkeypatch.setattr(graph, "load_view_indexes", views)
+    monkeypatch.setattr(graph, "allows", lambda *args: SimpleNamespace(allowed=False))
+    monkeypatch.setattr(graph, "get_qdrant_client", lambda: pytest.fail("denied source was fetched"))
+    assert asyncio.run(graph.source_chunks([("doc", 0, "point")], SimpleNamespace(predicate=lambda: None))) == {}
+    with pytest.raises(graph.GraphPermissionError):
+        asyncio.run(graph.source_chunks([], None))
+
+
+def example(index=0, **changes):
+    data = dict(prompt=f"项目{index}收入是多少？", evidence=[dict(source_id=f"synthetic:doc{index}", text="收入100万元", location="第1页")],
+                chosen="收入100万元。[Source 1]", rejected="收入200万元。", source_group=f"doc{index}",
+                source_kind="synthetic", license="self-authored")
+    data.update(changes)
+    return SimpleNamespace(**data, status="approved", reviewed_by=uuid.uuid4())
+
+
+def test_training_formats_split_sources_and_reject_unreviewed_data():
+    rows = [example(i) for i in range(30)]
+    result = export_examples(rows, "dpo")
+    assert result["ready_for_training"]
+    assert set(result["train"][0]) == {"prompt", "chosen", "rejected"}
+    train_sources = {s for record in result["manifest"] if record["split"] == "train" for s in record["sources"]}
+    validation_sources = {s for record in result["manifest"] if record["split"] == "validation" for s in record["sources"]}
+    assert not train_sources & validation_sources
+    row = example(31)
+    row.status = "pending"
+    assert len(export_examples(rows + [row], "sft")["manifest"]) == 30
+    assert export_examples(rows, "sft")["train"][0]["messages"][-1]["role"] == "assistant"
+
+
+def test_shared_evidence_cannot_cross_splits_and_answers_version_the_dataset():
+    shared = [dict(source_id="synthetic:shared", text="收入100万元", location="第1页")]
+    rows = [example(i, evidence=shared) for i in range(8)]
+    result = export_examples(rows, "sft")
+    assert len({record["split"] for record in result["manifest"]}) == 1
+    assert not result["ready_for_training"]
+    changed = export_examples([example(0, chosen="收入为100万元。[Source 1]")], "sft")
+    assert changed["dataset_version"] != export_examples([example(0)], "sft")["dataset_version"]
+    with pytest.raises(ValueError, match="冲突"):
+        export_examples([example(0), example(0, chosen="收入为200万元")], "sft")
+
+
+@pytest.mark.parametrize("changes", [dict(chosen="联系手机号13800138000"), dict(source_kind="private"),
+    dict(rejected="收入100万元。[Source 1]"), dict(source_kind="public", license="CC0",
+    evidence=[dict(source_id="https://192.168.1.1/doc", text="收入100万元", location="第1页")])])
+def test_private_invalid_or_identical_preferences_rejected(changes):
+    with pytest.raises(ValueError):
+        TrainingDraft.model_validate(vars(example(**changes)))
+
+
+def test_feedback_rejects_foreign_conversations_and_forged_answers(monkeypatch):
+    from app.api import feedback
+    owner = uuid.uuid4()
+    conversation = SimpleNamespace(id=uuid.uuid4(), owner_id=uuid.uuid4(), tenant_id="tenant")
+    class Session:
+        async def get(self, *args):
+            return conversation
+        async def scalar(self, *args):
+            return None
+    @asynccontextmanager
+    async def session():
+        yield Session()
+    monkeypatch.setattr(feedback, "get_db_session", session)
+    monkeypatch.setattr(feedback, "home_tenant_id", lambda user: "tenant")
+    body = feedback.FeedbackRequest(rating="up", question="真问题", answer="伪造答案", conversation_id=conversation.id)
+    with pytest.raises(feedback.HTTPException) as error:
+        asyncio.run(feedback.submit_feedback(body, SimpleNamespace(id=owner)))
+    assert error.value.status_code == 404
+    conversation.owner_id = owner
+    with pytest.raises(feedback.HTTPException) as error:
+        asyncio.run(feedback.submit_feedback(body, SimpleNamespace(id=owner)))
+    assert error.value.status_code == 409
+
+
+def test_offline_training_checks_tampering_without_loading_models():
+    from scripts.train_rag_offline import validate_bundle
+    bundle = export_examples([example(i) for i in range(30)], "dpo")
+    assert validate_bundle(bundle) == "dpo"
+    bundle["train"][0]["chosen"][0]["content"] = "tampered"
+    with pytest.raises(ValueError, match="重新审核"):
+        validate_bundle(bundle)
+
+
+def test_fixture_golden_has_120_grounded_cases():
+    from scripts.make_professional_golden import make_golden, verify
+    golden = make_golden()
+    verify(golden)
+    assert len(golden["cases"]) == 120
+
+
+@pytest.mark.parametrize("quote", ["甲未投资乙", "甲考虑投资乙", "甲投资丙，乙投资丁", "乙投资甲"])
+def test_uncertain_mismatched_or_reversed_relations_rejected(quote):
+    item = dict(subject="甲", subject_type="organization", predicate="投资", object="乙", object_type="organization", evidence=quote)
+    assert graph.validated_relations([item], quote) == []
+
+
+def test_entity_prefix_does_not_seed_other_entities():
+    edges = [edge("企业甲1", "企业乙1"), edge("企业甲10", "企业乙10")]
+    assert graph.expand("企业甲10投资谁", edges) == edges[1:]
+
+
+def test_export_version_is_order_independent_and_url_aliases_share_split():
+    rows = [example(i) for i in range(30)]
+    assert export_examples(rows, "sft") == export_examples(rows[::-1], "sft")
+    aliases = [example(i, source_kind="public", license="CC0", evidence=[dict(source_id=url, text="收入100万元", location="正文")])
+               for i, url in enumerate(["https://example.org/doc#section", "https://example.org/doc?utm_source=test"])]
+    assert len({r["split"] for r in export_examples(aliases, "sft")["manifest"]}) == 1
+
+
+def test_training_rejects_truncation_and_sft_uses_completion():
+    from scripts.train_rag_offline import training_samples
+    bundle = export_examples([example(i) for i in range(30)], "sft")
+    tokenizer = SimpleNamespace(apply_chat_template=lambda sequence, **kwargs: list(range(100 * len(sequence))))
+    assert training_samples(bundle, tokenizer)["train"][0]["completion"][0]["role"] == "assistant"
+    with pytest.raises(ValueError, match="截断"):
+        training_samples(bundle, tokenizer, max_length=50)
+
+
+def test_professional_report_counts_all_multihop_sources_and_errors():
+    from scripts.evaluate_professional import score, aggregate
+    case = dict(id="multi", category="multihop", expect_sources=["a.md", "b.md"], answer="100万元")
+    events = [dict(type="sources", sources=[dict(filename="a.md")]), dict(type="chunk", content="100 万元"),
+              dict(type="citation_check", total=2, passed=1), dict(type="stage_timing", stage="retrieve", duration_ms=100), dict(type="done")]
+    result = score(case, events, 1000, 200)
+    assert result["recall@5"] == .5 and result["numeric_unit_match"]
+    assert aggregate([result])["citation_support_rate"] == .5
+    assert not score(case, events + [dict(type="error", message="truncated")], 1000, 200)["answer_literal_match"]
+
+
+def test_ingestion_cancel_waits_for_checkpoint_and_records_retryable_failure(monkeypatch):
+    from app.services import document_service as ingestion
+    doc_id = uuid.uuid4()
+    saved = []
+    async def run(*args, **kwargs):
+        assert ingestion.cancel_ingestion(doc_id)
+        await ingestion._update_document(doc_id, current_stage="next")
+    class Session:
+        async def execute(self, statement):
+            saved.append(statement.compile().params)
+    @asynccontextmanager
+    async def session(): yield Session()
+    monkeypatch.setattr(ingestion, "get_db_session", session)
+    monkeypatch.setattr(ingestion, "_run_ingestion", run)
+    async def check():
+        task = asyncio.create_task(ingestion._ingestion_runner(doc_id, None, "test.md", b"", None, None, None))
+        ingestion._ingestion_tasks[doc_id] = task
+        await task
+    asyncio.run(check())
+    assert saved[-1]["current_stage"] == "cancelled"
+    assert doc_id not in ingestion._cancelled_ingestions
+
+
+def test_graph_report_gates_reject_regression_and_incomparable_scope():
+    from scripts.compare_professional_reports import compare
+    from copy import deepcopy
+    baseline = dict(gold="fixed", collection_id="kb", account_scope={"id": "u"}, condition="warm", strategy="hybrid",
+        cases=[dict(id="a", category="multihop", answer_literal_match=False), dict(id="b", category="fact", answer_literal_match=True)],
+        summary={"retrieval_p95_ms": 100, "recall@5": 1, "citation_support_rate": 1, "errors": 0})
+    result = deepcopy(baseline); result["strategy"] = "hybrid_graph"; result["cases"][0]["answer_literal_match"] = True
+    assert compare(baseline, result)["multihop_gate"]
+    result["cases"][1]["answer_literal_match"] = False
+    assert not compare(baseline, result)["ordinary_no_regression"]
+    result["account_scope"] = {"id": "other"}
+    with pytest.raises(ValueError, match="不可比较"): compare(baseline, result)
+
+
+def test_training_rejects_blank_answers_and_conflicting_source_licenses():
+    with pytest.raises(ValueError, match="空白"):
+        TrainingDraft.model_validate(vars(example(chosen="   ")))
+    evidence = [dict(source_id="https://example.org/doc", text="收入100万元", location="正文")]
+    rows = [example(i, source_kind="public", license=license, evidence=evidence) for i, license in enumerate(("CC0", "CC-BY-4.0"))]
+    with pytest.raises(ValueError, match="许可不一致"):
+        export_examples(rows, "sft")
+
+
+def test_graph_oversized_source_fails_before_inference(monkeypatch):
+    monkeypatch.setattr(graph, "get_settings", lambda: SimpleNamespace(chat_num_ctx=2048))
+    monkeypatch.setattr(graph.httpx, "AsyncClient", lambda **kwargs: pytest.fail("oversized prompt reached model"))
+    with pytest.raises(graph.GraphExtractionError, match="上下文"):
+        asyncio.run(graph.extract("原文" * 2000))
+
+
+@pytest.mark.parametrize("result", [dict(done=True, done_reason="length", response='{"relations":[]}'),
+    dict(done=False, response='{"relations":[]}'), dict(done=True, done_reason="stop", response="[]")])
+def test_graph_incomplete_or_invalid_model_output_is_not_success(monkeypatch, result):
+    settings = SimpleNamespace(chat_num_ctx=8192, OLLAMA_BASE_URL="http://localhost:11434", OLLAMA_MODEL="local",
+                               OLLAMA_KEEP_ALIVE_SECONDS=0, OLLAMA_NUM_GPU=0)
+    class Client:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+        async def post(self, *args, **kwargs):
+            return SimpleNamespace(status_code=200, raise_for_status=lambda: None, json=lambda: result)
+    monkeypatch.setattr(graph, "get_settings", lambda: settings)
+    monkeypatch.setattr(graph.httpx, "AsyncClient", lambda **kwargs: Client())
+    with pytest.raises(graph.GraphExtractionError): asyncio.run(graph.extract("甲投资乙"))

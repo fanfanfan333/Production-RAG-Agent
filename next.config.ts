@@ -1,7 +1,7 @@
 import type { NextConfig } from "next";
 
 const backendUrl =
-  process.env.BACKEND_URL?.replace(/\/$/, "") || "http://localhost:8000";
+  process.env.BACKEND_URL?.replace(/\/$/, "") || "http://127.0.0.1:8000";
 
 const nextConfig: NextConfig = {
   // CPU retrieval and document summaries can be silent for over 30 seconds.

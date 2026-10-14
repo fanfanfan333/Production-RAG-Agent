@@ -159,6 +159,9 @@ _INTERNAL_LLM_NODES = INTERNAL_LLM_NODES
 # ── State ────────────────────────────────────────────────────────────────────
 
 class MasterState(TypedDict):
+    retrieval_strategy: str
+    graph_paths: list[dict]
+    retrieval_notice: str
     """Shared mutable state threaded through every node of the master graph."""
 
     # 输入
@@ -434,6 +437,28 @@ async def _retrieve_node(state: MasterState) -> dict:
         extra_vector_queries=[safe_hyde] if safe_hyde else None,
     )
 
+    graph_paths, retrieval_notice = [], ""
+    if state.get("retrieval_strategy") == "hybrid_graph":
+        if not get_settings().GRAPH_RETRIEVAL_ENABLED:
+            retrieval_notice = "关联检索尚处于实验阶段，本次使用普通混合检索。"
+        else:
+            from app.services.graph_retrieval import graph_candidates, GraphPermissionError
+            from app.services.reranker import rerank_chunks
+            try:
+                candidates, graph_paths = await graph_candidates(safe_query, state.get("user_scope"), state.get("collection_id"))
+                if candidates:
+                    unique = {(chunk.document_id, chunk.chunk_index): chunk for chunk in [*chunks, *candidates]}
+                    chunks = await rerank_chunks(safe_query, list(unique.values()), top_k=state["top_k"])
+                    kept = {(chunk.document_id, chunk.chunk_index) for chunk in chunks}
+                    graph_paths = [path for path in graph_paths if (path["document_id"], path["chunk_index"]) in kept]
+                else:
+                    retrieval_notice = "暂无可用的关联证据，本次使用普通混合检索。"
+            except GraphPermissionError:
+                raise
+            except Exception:
+                logger.exception("Graph retrieval unavailable; using scoped hybrid results")
+                graph_paths, retrieval_notice = [], "关联检索暂不可用，本次使用普通混合检索。"
+
     sources = [
         {
             "document_id": c.document_id,
@@ -477,7 +502,7 @@ async def _retrieve_node(state: MasterState) -> dict:
         len(chunks), state.get("retry_count", 0),
         (state.get("rewritten_query") or state["query"])[:80],
     )
-    return {"chunks": chunks, "sources": sources}
+    return {"chunks": chunks, "sources": sources, "graph_paths": graph_paths, "retrieval_notice": retrieval_notice}
 
 
 async def _grade_node(state: MasterState) -> dict:
@@ -1236,6 +1261,7 @@ def _build_turn_meta(state: MasterState) -> dict:
     has_sources = bool(state.get("sources"))
     return {
         # 管线徽章：重新打开历史时仍能显示"这轮走的哪条链路"
+        "graph_retrieval": {"paths": state.get("graph_paths", []), "notice": state.get("retrieval_notice", "")},
         "intent": state.get("intent") or "",
         # 引用来源（含图片对象：image_url / image_type / vision）
         "sources": state.get("sources") or [],
@@ -1503,6 +1529,7 @@ async def stream_master(
     owns_tenant_ids: frozenset[str] = frozenset(),
     conversation_tenant_id: str | None = None,
     user_scope: UserScope | None = None,
+    retrieval_strategy: str = "hybrid",
 ) -> AsyncGenerator[dict, None]:
     """
     执行 master graph 并产出 SSE 事件字典.
@@ -1537,6 +1564,9 @@ async def stream_master(
         {"type": "error", "message": "..."}
     """
     initial_state: MasterState = {
+        "retrieval_strategy": retrieval_strategy,
+        "graph_paths": [],
+        "retrieval_notice": "",
         "query": query,
         "conversation_id": conversation_id,
         "history_messages": history_messages,
@@ -1599,6 +1629,7 @@ async def stream_master(
     # 节点用 stream_channel.emit_text 追加，这里在**每个事件到达时先冲刷**
     # 再处理事件：节标题因此一定排在该节正文（首个 LLM token）之前。
     deterministic_buf: list[str] = []
+    stage_started: dict[str, float] = {}
     _sink_token = bind_sink(deterministic_buf)
 
     try:
@@ -1613,6 +1644,11 @@ async def stream_master(
 
             kind = event["event"]
             name = event.get("name", "")
+            if kind == "on_chain_start" and name in {"route", "retrieve", "multimodal_context", "evidence_gate", "generate", "citation_verifier"}:
+                stage_started[name] = time.perf_counter()
+            elif kind == "on_chain_end" and name in stage_started:
+                yield {"type": "stage_timing", "stage": name,
+                       "duration_ms": round((time.perf_counter() - stage_started.pop(name)) * 1000, 2)}
 
             # ── 追踪 LLM 节点的进入/退出 ────────────────────────────────────
             # LLM 的 on_chat_model_stream 事件嵌套在节点的 on_chain_start /
@@ -1646,6 +1682,9 @@ async def stream_master(
             # ── 检索结果 ─────────────────────────────────────────────────────
             elif kind == "on_chain_end" and name == "retrieve":
                 output = event["data"].get("output", {}) or {}
+                if retrieval_strategy == "hybrid_graph":
+                    yield {"type": "graph_retrieval", "paths": output.get("graph_paths", []),
+                           "notice": output.get("retrieval_notice", "")}
                 sources = output.get("sources", [])
                 if sources:
                     final_sources = sources

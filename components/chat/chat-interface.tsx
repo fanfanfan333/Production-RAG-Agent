@@ -36,6 +36,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { ApiError } from "@/lib/api/client";
+import { submitFeedback } from "@/lib/api/feedback";
 import { streamQuery, type OutputGuardInfo } from "@/lib/api/query";
 import { downloadGeneratedDocument } from "@/lib/api/documents";
 import { getConversationMessages } from "@/lib/api/conversations";
@@ -256,6 +257,7 @@ export function ChatInterface() {
   } = useApp();
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
+  const [graphRetrieval, setGraphRetrieval] = useState(false);
   const [isStreaming, setIsStreaming] = useState(false);
   const [lastQuery, setLastQuery] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
@@ -548,6 +550,7 @@ export function ChatInterface() {
             // 依据快照：不还原这几项，历史里的"数据来源"就是空的
             intent: m.intent,
             sources: m.sources,
+            graphRetrieval: m.graphRetrieval,
             citationCheck: m.citationCheck,
             evidence: m.evidence,
             multimodal: m.multimodal,
@@ -653,6 +656,8 @@ export function ChatInterface() {
 
       try {
         await streamQuery({
+          retrievalStrategy: graphRetrieval ? "hybrid_graph" : "hybrid",
+          onGraphRetrieval: (info) => setMessages((previous) => previous.map((message) => message.id === assistantId ? {...message, graphRetrieval: info} : message)),
           query: query.trim(),
           collectionId: activeCollectionId,
           conversationId: activeConversationId,
@@ -822,12 +827,28 @@ export function ChatInterface() {
     },
     [
       activeCollectionId,
+      graphRetrieval,
       activeConversationId,
       isStreaming,
       notifyConversationChanged,
       setActiveConversationId,
     ]
   );
+
+  async function rateAnswer(message: ChatMessage, rating: "up" | "down") {
+    const index = messages.findIndex((item) => item.id === message.id);
+    const question = messages.slice(0, index).reverse().find((item) => item.role === "user");
+    if (!question || !activeConversationId) return;
+    setMessages((previous) => previous.map((item) => item.id === message.id ? {...item, feedback: "pending"} : item));
+    try {
+      await submitFeedback({rating, question: question.content, answer: message.content, conversationId: activeConversationId});
+      setMessages((previous) => previous.map((item) => item.id === message.id ? {...item, feedback: rating} : item));
+      toast.success("反馈已记录");
+    } catch (error) {
+      setMessages((previous) => previous.map((item) => item.id === message.id ? {...item, feedback: undefined} : item));
+      toast.error(error instanceof Error ? error.message : "反馈提交失败");
+    }
+  }
 
   const stopGeneration = () => {
     abortRef.current?.abort();
@@ -1174,6 +1195,12 @@ export function ChatInterface() {
                         </div>
                       )}
 
+                      {message.graphRetrieval?.notice && <p className="mt-2 text-sm text-muted-foreground" role="status">{message.graphRetrieval.notice}</p>}
+                      {!!message.graphRetrieval?.paths.length && <details className="mt-2 text-sm"><summary className="cursor-pointer">关联证据路径（实验）</summary>{message.graphRetrieval.paths.map((path, index) => {
+                        const sourceIndex = message.sources?.findIndex((source) => source.documentId === path.document_id && source.chunkIndex === path.chunk_index) ?? -1;
+                        return <p key={index} className="mt-1">{path.subject} → {path.predicate} → {path.object}{sourceIndex >= 0 && <a className="ml-2 underline" href={`#source-${sourceIndex + 1}`}>查看来源</a>}</p>;
+                      })}</details>}
+                      {message.role === "assistant" && !message.isStreaming && !message.error && message.content && activeConversationId && <div className="mt-2 flex gap-2"><Button variant="ghost" size="sm" disabled={!!message.feedback} onClick={() => rateAnswer(message, "up")}>有帮助</Button><Button variant="ghost" size="sm" disabled={!!message.feedback} onClick={() => rateAnswer(message, "down")}>需改进</Button>{message.feedback && <span className="self-center text-xs text-muted-foreground">{message.feedback === "pending" ? "提交中…" : "已反馈"}</span>}</div>}
                       {message.sources && message.sources.length > 0 && (
                         <SourceCitations
                           sources={message.sources}
@@ -1272,6 +1299,7 @@ export function ChatInterface() {
                 </Button>
               )}
             </form>
+            <label className="mt-2 flex items-center gap-2 text-xs text-muted-foreground"><input type="checkbox" checked={graphRetrieval} disabled={isStreaming} onChange={(event) => setGraphRetrieval(event.target.checked)} />关联检索（实验，需文档图索引）</label>
             <p className="mt-2 text-[11px] text-muted-foreground/70">
               回答基于您有权访问的文档，请点击引用来源核对原文。
             </p>

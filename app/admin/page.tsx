@@ -1,6 +1,7 @@
 "use client";
 
 import { ShieldCheck, Users } from "lucide-react";
+import Link from "next/link";
 import { useAuth } from "@/lib/context/auth-context";
 import { AppShell } from "@/components/layout/app-shell";
 import { MemberPanel } from "@/components/staff/member-panel";
@@ -31,6 +32,7 @@ export default function AdminPage() {
 
   return (
     <AppShell activePath="/admin">
+      {isPlatformAdmin && <Link className="mb-4 inline-block text-sm underline" href="/admin/training">训练样本审核与 SFT / DPO 数据导出</Link>}
       <div className="mb-8">
         <div className="flex flex-wrap items-center gap-3">
           <h1 className="text-2xl font-bold tracking-tight sm:text-3xl">

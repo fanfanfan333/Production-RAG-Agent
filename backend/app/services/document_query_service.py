@@ -436,6 +436,8 @@ async def delete_document(
     doc_tenant_id = doc.tenant_id
 
     logger.info("Deleting document id=%s filename='%s'", doc_id_str, filename)
+    from app.services.document_service import stop_ingestion_before_delete
+    await stop_ingestion_before_delete(document_id)
 
     # ── 2. Delete vectors from Qdrant (fail-safe first) ───────────────────────
     try:

@@ -27,6 +27,7 @@ from app.api.feedback import router as feedback_router
 from app.api.health import router as health_router
 from app.api.kb_collections import router as kb_collections_router
 from app.api.projects import router as projects_router
+from app.api.professional import router as professional_router
 from app.api.quality import router as quality_router
 from app.api.query import router as query_router
 from app.api.security import router as security_router
@@ -251,6 +252,7 @@ def create_app() -> FastAPI:
     app.include_router(projects_router)          # 五维隔离 — /projects 项目维度 + 成员（含临时成员）
     app.include_router(security_router)          # 五维隔离 — /security need-to-know + 密级管理面
 
+    app.include_router(professional_router)
     return app
 
 

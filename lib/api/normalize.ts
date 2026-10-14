@@ -308,6 +308,7 @@ export function normalizeSources(raw: unknown): QuerySource[] {
     const obj = item as Record<string, unknown>;
     return {
       documentId: pick<string>(obj, ["document_id", "documentId", "id"]),
+      chunkIndex: pick<number>(obj, ["chunk_index", "chunkIndex"]),
       documentName: pick<string>(obj, [
         "document_name",
         "documentName",
@@ -537,6 +538,7 @@ export function normalizeGeneratedDocument(
 
 /** 一条回答的完整依据快照（messages.meta）→ 界面所需的各个字段。 */
 export function normalizeTurnMeta(raw: unknown): {
+  graphRetrieval?: import("@/lib/types").ChatMessage["graphRetrieval"];
   intent?: ChatPipeline;
   sources?: QuerySource[];
   citationCheck?: CitationCheckInfo;
@@ -552,6 +554,7 @@ export function normalizeTurnMeta(raw: unknown): {
   const sources = normalizeSources(meta.sources);
   return {
     intent: intent ? (intent as ChatPipeline) : undefined,
+    graphRetrieval: isNonEmptyObject(meta.graph_retrieval) ? meta.graph_retrieval as import("@/lib/types").ChatMessage["graphRetrieval"] : undefined,
     sources: sources.length ? sources : undefined,
     citationCheck: normalizeCitationCheck(meta.citation_check),
     evidence: normalizeEvidence(meta.evidence),

@@ -64,6 +64,8 @@ export interface OutputGuardInfo {
 }
 
 export interface StreamQueryOptions {
+  retrievalStrategy?: "hybrid" | "hybrid_graph";
+  onGraphRetrieval?: (info: { notice: string; paths: { subject: string; predicate: string; object: string; document_id: string; chunk_index: number; evidence: string }[] }) => void;
   query: string;
   collectionId?: string | null;
   conversationId?: string | null;
@@ -119,6 +121,7 @@ type SseHandler = Pick<
   | "onMultimodal"
   | "onDocument"
   | "onAnswerStatus"
+  | "onGraphRetrieval"
 >;
 
 /** 把单个 SSE data 行分发到对应回调。 */
@@ -154,6 +157,10 @@ function dispatchSseData(data: string, handlers: SseHandler) {
     if (type === "output_guard") {
       const guard = normalizeOutputGuard(parsed);
       if (guard) handlers.onOutputGuard?.(guard);
+      return;
+    }
+    if (type === "graph_retrieval") {
+      handlers.onGraphRetrieval?.({notice: String(parsed.notice ?? ""), paths: Array.isArray(parsed.paths) ? parsed.paths : []});
       return;
     }
     if (type === "sources" || parsed.sources) {
@@ -239,6 +246,7 @@ export async function streamQuery(options: StreamQueryOptions): Promise<void> {
         collection_id: options.collectionId ?? undefined,
         conversation_id: options.conversationId ?? undefined,
         mode: options.mode ?? undefined,
+        retrieval_strategy: options.retrievalStrategy ?? "hybrid",
         stream: true,
       }),
       signal: options.signal,

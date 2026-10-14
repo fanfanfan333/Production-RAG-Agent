@@ -115,6 +115,8 @@ async def _update_document(
     **kwargs,
 ) -> None:
     """Patch a document row with arbitrary fields + bump updated_at."""
+    if doc_id in _cancelled_ingestions:
+        raise asyncio.CancelledError("用户取消入库")
     async with get_db_session() as session:
         kwargs["updated_at"] = datetime.now(tz=timezone.utc)
         await session.execute(
@@ -152,6 +154,22 @@ class PreparedUpload:
 # 必须持有 Task 的强引用：asyncio 对 create_task 的返回值只保留弱引用，若没有
 # 别处引用它，任务可能在运行途中被 GC 回收并静默取消（CPython 的已知陷阱）。
 _ingestion_tasks: dict[uuid.UUID, asyncio.Task] = {}
+_cancelled_ingestions: set[uuid.UUID] = set()
+
+
+def cancel_ingestion(doc_id: uuid.UUID) -> bool:
+    """Stop at the next checkpoint; let in-flight parser threads finish safely."""
+    if not is_ingesting(doc_id):
+        return False
+    _cancelled_ingestions.add(doc_id)
+    return True
+
+
+async def stop_ingestion_before_delete(doc_id: uuid.UUID) -> None:
+    if cancel_ingestion(doc_id):
+        task = _ingestion_tasks.get(doc_id)
+        if task is not None:
+            await task
 
 
 def _build_term_rows(items: list, max_chars: int) -> list[tuple[int, str, str]]:
@@ -1117,7 +1135,12 @@ async def _ingestion_runner(
             prep, filename, content, settings,
             owner_id=owner_id, collection_id=collection_id,
         )
+    except asyncio.CancelledError:
+        _cancelled_ingestions.discard(doc_id)
+        await _update_document(doc_id, status=DocumentStatus.FAILED, current_stage="cancelled",
+                               error_message="已取消入库；重新上传同一文件可继续。")
     finally:
+        _cancelled_ingestions.discard(doc_id)
         _ingestion_tasks.pop(doc_id, None)
 
 

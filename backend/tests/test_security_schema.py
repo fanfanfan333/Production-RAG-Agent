@@ -248,7 +248,8 @@ def test_migration_file_exists_and_chains_to_head() -> None:
     assert "q2k3l4m5n6o7" in revisions
     referenced = {d for d in revisions.values() if d}
     heads = sorted(set(revisions) - referenced)
-    assert heads == ["q2k3l4m5n6o7"], f"迁移未挂在唯一 head 上，当前 heads={heads}"
+    assert heads == ["r3l4m5n6o7p8"], f"迁移未挂在唯一 head 上，当前 heads={heads}"
+    assert revisions["r3l4m5n6o7p8"] == "q2k3l4m5n6o7"
 
 
 def test_migration_is_idempotent_and_reversible() -> None:

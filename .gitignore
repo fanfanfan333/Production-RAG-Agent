@@ -119,3 +119,9 @@ uploads/
 # ── backend 侧一次性侦察 / 日志产物（统一前缀 _）──────────────────────
 backend/_*.txt
 backend/scripts/_*.py
+
+# Training data and model outputs stay local.
+/training-data/
+/training-runs/
+rag-sft-*.json
+rag-dpo-*.json

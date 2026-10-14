@@ -122,6 +122,7 @@ async def _generate_sse(
     user: User,
     collection_id: uuid.UUID | None = None,
     forced_mode: str | None = None,
+    retrieval_strategy: str = "hybrid",
 ) -> AsyncGenerator[str, None]:
     """
     Async generator that drives the entire RAG pipeline and yields raw SSE
@@ -183,7 +184,7 @@ async def _generate_sse(
         return
 
     # ── 3. Immediate "thinking" event ─────────────────────────────────────────
-    yield _sse(SSEThinking().model_dump())
+    yield _sse({**SSEThinking().model_dump(), "conversation_id": str(conv_id)})
 
     # ── 4. LangGraph streaming ────────────────────────────────────────────────
     if mode == "list_documents":
@@ -206,6 +207,7 @@ async def _generate_sse(
         #   Query Router → {Document Summary | Knowledge QA(Hybrid RAG
         #   + Retrieval Grader + Retry) | General Chat | doc_relations}
         graph_events = stream_master(
+            retrieval_strategy=retrieval_strategy,
             query=query,
             conversation_id=str(conv_id),
             history_messages=history,
@@ -366,6 +368,7 @@ async def query_endpoint(
             request=request,
             query=effective_query,
             conversation_id=body.conversation_id,
+            retrieval_strategy=body.retrieval_strategy,
             top_k=body.top_k,
             mode=mode,
             user=user,

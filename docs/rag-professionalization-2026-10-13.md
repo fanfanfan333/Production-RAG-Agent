@@ -1,0 +1,104 @@
+# RAG 专业化升级与验收记录
+
+日期：2026-10-13，更新于 2026-10-14。目标是让现有企业文档问答可维护、可评测、可追溯；新增工具不等于检索准确率已经提升。
+
+## 已验证
+
+- 本机原数据库备份完成，增量迁移 `q2k3l4m5n6o7 → r3l4m5n6o7p8` 已应用。先在数据库副本执行升级、回滚、再次升级；原业务文档不重建、不覆盖。
+- 后端完整依赖回归：1965 passed、20 skipped，测试容器限 2 GB / 2 CPU，OOM=false。跳过项需要额外服务或显式启用集成环境，不能当成通过项。
+- 新图索引使用真实 PostgreSQL 副本和独立 Qdrant 临时 collection 验证：抽取中断重试、账号隔离、权威对象撤权、正文变化后旧证据失效、显式重建及文档删除级联清理。关系抽取在该集成测试中使用确定性替身，不代表真实 LLM 抽取准确率。
+- 原账号金标 20 例：Recall@1/3/5/10、MRR 均为 1.0；原跨公司、他人私库等越权探针零命中。只代表这份固定小集。
+- 前端 TypeScript、lint、5 项流式/依赖门禁测试及生产构建通过。真实浏览器访问训练审核页和关联检索选项，未发现页面运行错误。
+- 经同源前端代理验证：真实服务记录的反馈可提交；伪造问答返回 409，他人会话返回 404；普通账号访问训练审核返回 403。管理员创建、审核、SFT/DPO 导出后通过离线版本与来源隔离校验；验收构造样本和会话已清理。
+
+## 实验能力：文档知识图谱
+
+保留 PostgreSQL、Qdrant、当前混合召回及精排。没有新增 Neo4j，也没有替换普通 RAG 服务。
+
+新增 `graph_indexes`、`graph_entities`、`graph_relations`：实体以文档和版本保存，关系绑定原分片、证据原文及正文 SHA-256。版本覆盖文件 hash、分片点 ID 和关键词内容；重建可显式重置。查询逐次检查当前正文 hash，旧证据不能继续参与召回。索引失败独立于文档解析状态。
+
+关系抽取只接受逐字证据内明确、肯定、连续的“主体—谓词—客体”片段，拒绝否定、假设、并列错配与反向关系。这是保守规则，会漏掉复杂句式；不能用字符串校验代替语义评测。
+
+图抽取对完整原文和输出预留作保守上下文检查，不截掉长分片尾部充当完成；超长分片、缺模型、未完成或被截断的 JSON 输出均标记失败并显示原因。长分片需调整切分/上下文后重试，普通问答不被图索引失败阻断。
+
+每次索引请求处理一个分片并保存检查点；下一次请求重新检查权限。单进程串行锁与文档行锁避免重复写入。暂停会在当前分片完成后停止；重试从现有游标继续。
+
+查询先用文档权限 SQL 过滤，再通过 PostgreSQL 权威对象 ACL 检查原分片；同名不同类型不合并，最多 2 跳、50 条边。取回原文后融合、精排并进入现有证据与引用校验。没有跨租户实体摘要、社区摘要或全库报告。文档删除级联清理图记录；撤权立即影响新的证据查询。权限检查异常拒绝访问，普通图服务故障可回退有权限的混合检索。
+
+当前授权图读取上限为 1000 条边，候选最多 30 个分片。它适合小范围试点；扩大到大型图之前应改用带索引的前沿查询并实测性能，不能把当前实现宣称为大规模图检索 SLA。
+
+默认设置 `GRAPH_RETRIEVAL_ENABLED=false`。聊天里“关联检索”是显式实验选项；关闭、未索引或没有可信关系时显示回退原因。
+
+| 接口 | 用途 |
+| --- | --- |
+| `POST /documents/{id}/graph-index` | 建立/继续一个分片，要求写权限且为本人文档 |
+| `POST /documents/{id}/graph-index?restart=true` | 显式重建，清理该文档旧图记录 |
+| `GET /documents/{id}/graph-index` | 当前状态、进度和失败原因 |
+| `GET /documents/{id}/graph-evidence?q=实体名` | 有权限的文档级证据路径 |
+| `POST /query` 的 `retrieval_strategy` | `hybrid`（默认）或 `hybrid_graph` |
+| `POST /documents/{id}/cancel-ingestion` | 本人入库在下一个阶段检查点取消，可重新上传继续 |
+
+删除正在入库的文档会先等待当前阶段停止，再清理向量、数据库和归档，避免后台任务在删除后继续写索引。当前部署仍为单 worker；不要在未增加持久化任务协调前改成多 worker 入库。
+
+## 120 例评测准备
+
+`backend/eval/professional_v1.json` 包含 40 事实、25 表格、15 图片、20 多跳、20 无答案/冲突问题。答案来自显式构造的文档事实及算术，未用模型答案充当真值。每例包含证据位置、原文和场景账号范围；真实验收报告另记录当前认证账号范围及独立知识库 ID。
+
+**当前是可溯源构造集，`human_review=pending_business_review`。** 不是 120 例已人工审核的企业业务金标。表格夹具为 Markdown 表格，图片为文字截图，不涵盖真实扫描表格、复杂图形和合并表头；之前复杂 PDF/Word/OCR 小样本验收不能替代这轮 120 例验收。
+
+生成本地文档夹具：
+
+```powershell
+python backend/scripts/make_professional_golden.py --out backend/eval/professional_v1.json --documents .scratch/professional-fixtures
+```
+
+在专用知识库中，按当前账号上传夹具并确认解析状态、警告与原文；记录知识库 UUID。不要把业务库上传或删除操作交给自动清理器。`evaluate_professional.py` 使用当前账号 API 令牌，只查询指定知识库，串行运行并仅删除本轮创建的测试会话：
+
+```powershell
+# RAG_EVAL_TOKEN 在当前进程环境中设置，不放入命令行、报告或 Git。
+python backend/scripts/evaluate_professional.py --collection <专用知识库UUID> --condition warm --config-version <代码及模型配置版本> --strategy hybrid --out .scratch/professional-hybrid.json
+python backend/scripts/evaluate_professional.py --collection <相同UUID> --condition warm --config-version <相同版本> --strategy hybrid_graph --out .scratch/professional-graph.json
+python backend/scripts/compare_professional_reports.py .scratch/professional-hybrid.json .scratch/professional-graph.json
+```
+
+报告分开统计文档/页级 Recall@5、MRR、答案字面匹配、数值单位匹配、服务端引用支持率及覆盖率、首字/总耗时、检索等节点耗时。它不能替代人工答案正确性审查或分片级业务金标。冷启动用单例独立运行；预热需先预热；缓存命中需在相同账号、模型、权限和问题条件下重复并核实缓存，不能只靠速度猜测。三种条件分开保存报告。
+
+成对比较检查同一金标 hash、账号、知识库和配置版本、多跳提升至少 10 个百分点、普通问题不退化、预热检索 P95 ≤ 基线 1.2 倍、Recall@5 ≥ 0.90、引用支持/覆盖 ≥ 95%、无接口错误且确实使用图证据。通过自动字面检查也不自动开启默认图检索：仍需人工审查、独立越权门禁与发布审批。
+
+真实推理脚本在 Windows 宿主启动前要求可用内存 ≥ 5 GB；每例启动前再检查，运行中低于 1 GB 关闭本次请求。不会停止其他项目或修改 Ollama 全局配置。本轮宿主可用内存曾降至约 2.7 GB，因此没有继续启动真实文本/VLM 大模型验收。
+
+## 离线训练准备
+
+管理员入口：`/admin/training`。提交问题、原文证据及位置、人工纠正答案、可选较差答案和明确许可。只有平台管理员可审核/导出。审核列表显示原文供核对，点赞不会自动生成样本。
+
+首版只允许公开 HTTPS 来源或 `synthetic:` 自有构造来源。拒绝私网 URL、企业私有来源类别及部分明显个人信息/密钥模式；自动规则不是完整 DLP，管理员必须人工核验来源和许可。
+
+- SFT 导出 `messages`，用于引用、拒答、回答格式；执行训练时转换为 `prompt/completion`，只对回答计算 loss。
+- DPO 导出同一问题与同一证据下的 `prompt/chosen/rejected`，两份答案须不同；不能替代召回或权限隔离。
+- 来源组与共享证据建立连通分组，公开 URL 去除片段和查询参数，保守归并页面别名；稳定排序、去重及冲突答案检查后确定训练/验证分组。多文档样本不能把连接的来源拆到不同 split。原始业务反馈只用于诊断。
+- 清单保存样本 hash、来源、许可、split、来源组；版本 hash 覆盖这些记录及样本内容。相同数据输入顺序变化不改变版本。源许可仍需人工审核，URL 规范化不能识别不同域名下的镜像文件。
+- 导出仅一个来源组或没有验证集时明确标记不可训练；离线校验拒绝缺失来源、清单篡改或跨 split 泄漏。
+
+`requirements-training.txt` 与在线服务分开。导出放在忽略的 `training-data/`，模型输出放在忽略的 `training-runs/`；数据文件不上传 GitHub：
+
+```powershell
+python backend/scripts/train_rag_offline.py training-data/reviewed-sft.json
+# 以下仅在独立 GPU 环境执行，本机不下载/训练大模型：
+python -m pip install -r backend/requirements-training.txt
+python backend/scripts/train_rag_offline.py training-data/reviewed-sft.json --model <本地HF模型目录> --output training-runs/sft-v1 --execute
+```
+
+实际训练还需正确安装独立 GPU 环境的 PyTorch。入口要求至少 16 GB 可用显存、BF16 支持、足够权重/激活值空间；禁止自动 CPU/disk offload。tokenizer 对完整问题、证据和两份答案预检，超过 2048 token 明确拒绝，不静默截断答案。保留训练参数、基础模型配置 hash 和数据版本。未运行 GPU 训练，不保证任意模型都可在 16 GB 上训练。
+
+新模型必须重新通过固定金标、拒答、引用和权限门禁，才能另行替换在线模型；当前模型与部署配置未被训练入口改动，回滚仍可使用旧模型和镜像。
+
+## 研究依据与取舍
+
+- [LightRAG](https://github.com/HKUDS/LightRAG)：参考实体/关系与原文混合检索、删除派生内容的设计，复用本项目现有数据库；没有直接接入整套服务。
+- [Microsoft GraphRAG 索引方法](https://microsoft.github.io/graphrag/index/methods/)：抽取与索引只是候选知识，最终回到来源证据；本轮不做社区摘要。
+- [GraphRAG-Bench](https://arxiv.org/abs/2506.05690)、[MKG-RAG-Bench](https://arxiv.org/abs/2606.26458)：按问题类型比较图检索，并将多模态检索与生成质量分开评价；不预设新增图检索必然更准确。
+- [TRL SFT](https://huggingface.co/docs/trl/sft_trainer)、[TRL DPO](https://huggingface.co/docs/trl/dpo_trainer)：采用官方数据格式、PEFT 和回答侧 loss；先把样本、许可、版本与验收做好，训练保持离线。
+
+## 尚未达到的发布条件
+
+120 例企业业务人工审核及完整真实问答、多跳正确率提升 ≥ 10 个百分点、普通问题无退化、预热图检索延迟门禁和复杂扫描图表覆盖仍待实测；不能宣布本轮已经达到这些指标。SFT/DPO 只完成数据与入口准备，未完成模型训练或训练效果验证。图能力保持实验开关，普通混合检索继续为默认。
