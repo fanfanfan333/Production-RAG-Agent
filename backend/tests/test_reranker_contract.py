@@ -18,15 +18,16 @@ def test_dedup_preserves_different_tails():
 @pytest.mark.parametrize("backend", ["flagreranker", "cross_encoder"])
 @pytest.mark.parametrize("logits", [[-10.0], [-10.0, 10.0]])
 def test_model_outputs_are_calibrated(monkeypatch, backend, logits):
-    def predict(pairs, *, show_progress_bar, activation_fn):
+    def predict(pairs, *, show_progress_bar, activation_fn, batch_size):
         assert len(pairs) == len(logits)
+        assert batch_size == 4
         return activation_fn(np.asarray(logits))
 
     scorer = object.__new__(rr.ChunkReranker)
     scorer._backend = backend
     scorer._model = SimpleNamespace(
         predict=predict,
-        compute_score=lambda pairs, normalize: np.asarray(logits),
+        compute_score=lambda pairs, normalize, batch_size: np.asarray(logits),
     )
     monkeypatch.setattr(rr, "get_settings", lambda: SimpleNamespace(RERANKER_MAX_TEXT_CHARS=0))
     scores = scorer._score_pairs_sync("query", ["text"] * len(logits), [0.5] * len(logits))
@@ -48,3 +49,19 @@ def test_failed_or_invalid_scores_do_not_reuse_coarse_ranking(monkeypatch, resul
     chunks = [SimpleNamespace(text=text, score=0.8) for text in ("a", "b")]
     assert asyncio.run(rr.rerank_chunks("query", chunks, 2)) == []
     assert [c.score for c in chunks] == [0.8, 0.8]
+
+
+def test_shared_reranker_limits_concurrent_model_forwards(monkeypatch):
+    import time
+    active, peak = 0, 0
+    def score(query, texts, vectors):
+        nonlocal active, peak
+        active += 1; peak = max(peak, active)
+        time.sleep(.02)
+        active -= 1
+        return [.5] * len(texts)
+    scorer = object.__new__(rr.ChunkReranker)
+    monkeypatch.setattr(scorer, "_score_pairs_sync", score)
+    async def run():
+        return await asyncio.gather(*(scorer.score_pairs("q", ["text"], [.2]) for _ in range(3)))
+    assert asyncio.run(run()) == [[.5]] * 3 and peak == 1

@@ -10,7 +10,7 @@ from pathlib import Path
 import httpx
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from scripts.evaluate_professional import available_gb
+from scripts.evaluate_professional import available_gb, wait_rate_limit, memory_guard
 
 
 def main():
@@ -32,7 +32,8 @@ def main():
         temporary = state_path.with_suffix(".tmp")
         temporary.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
         temporary.replace(state_path)
-    with httpx.Client(base_url=args.url.rstrip("/"), headers={"Authorization": f"Bearer {token}"}, timeout=60, trust_env=False) as client:
+    with httpx.Client(base_url=args.url.rstrip("/"), headers={"Authorization": f"Bearer {token}"}, timeout=60, trust_env=False,
+        limits=httpx.Limits(max_keepalive_connections=0)) as client:
         response = client.get("/auth/me"); response.raise_for_status(); user = response.json()
         digest = hashlib.sha256(gold_path.read_bytes()).hexdigest()
         if state and (state.get("gold_sha256") != digest or state.get("owner_id") != user["id"]):
@@ -50,7 +51,13 @@ def main():
         def document(identifier):
             page = 1
             while True:
-                response = client.get("/documents", params={"collection_id": state["collection_id"], "limit": 100, "page": page})
+                for attempt in range(3):
+                    try:
+                        response = client.get("/documents", params={"collection_id": state["collection_id"], "limit": 100, "page": page})
+                        break
+                    except (httpx.RemoteProtocolError, httpx.ConnectError):
+                        if attempt == 2: raise
+                        time.sleep(1)
                 response.raise_for_status(); listing = response.json()
                 rows = listing["documents"]
                 for row in rows:
@@ -58,16 +65,22 @@ def main():
                 if len(rows) < 100: raise RuntimeError("文档不在当前专用验收知识库中")
                 page += 1
         try:
+            if available_gb() < 5:
+                raise RuntimeError("本轮启动前宿主可用内存不足5GB；保留检查点")
             for name in golden["documents"]:
                 record = state["documents"].get(name)
                 if args.phase == "graph" and not name.startswith("relation-"): continue
-                if available_gb() < 5:
-                    raise RuntimeError("启动下一项前宿主可用内存不足5GB；保留检查点，释放内存后可续跑")
+                if available_gb() < 1:
+                    raise RuntimeError("运行中宿主可用内存不足1GB；已停止本轮并保留检查点")
                 if args.phase == "upload":
                     if record and document(record["id"])["status"] == "completed": continue
                     with (args.fixtures / "documents" / name).open("rb") as stream:
-                        response = client.post("/upload", data={"collection_id": state["collection_id"], "access_level": "private",
-                            **({"company_id": user.get("tenant_id") or "default"} if user["role"] == "admin" else {})}, files={"files": (name, stream)})
+                        for attempt in range(3):
+                            stream.seek(0)
+                            response = client.post("/upload", data={"collection_id": state["collection_id"], "access_level": "private",
+                                **({"company_id": user.get("tenant_id") or "default"} if user["role"] == "admin" else {})}, files={"files": (name, stream)})
+                            if response.status_code != 429 or attempt == 2: break
+                            wait_rate_limit(response)
                     response.raise_for_status(); uploaded = response.json()["documents"][0]
                     identifier = uploaded.get("document_id") or uploaded.get("existing_document_id")
                     if not identifier: raise RuntimeError(f"{name}: 上传未返回文档记录")
@@ -88,8 +101,12 @@ def main():
                 else:
                     if not record or document(record["id"])["status"] != "completed": raise RuntimeError(f"{name}: 必须先完成文档入库")
                     while True:
-                        if available_gb() < 5: raise RuntimeError("图抽取前可用内存不足5GB，保留检查点")
-                        response = client.post(f"/documents/{record['id']}/graph-index", timeout=45)
+                        if available_gb() < 1: raise RuntimeError("运行中可用内存不足1GB，已停止图索引测试并保留检查点")
+                        for attempt in range(3):
+                            with memory_guard(client):
+                                response = client.post(f"/documents/{record['id']}/graph-index", timeout=45)
+                            if response.status_code != 429 or attempt == 2: break
+                            wait_rate_limit(response)
                         response.raise_for_status(); job = response.json()
                         record["graph"] = job; checkpoint()
                         print(f"{name}: graph {job['cursor']}/{job['total']} {job['status']}", flush=True)

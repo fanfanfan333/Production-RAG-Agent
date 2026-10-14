@@ -191,6 +191,7 @@ class ChunkReranker:
 
     _instance: "ChunkReranker | None" = None
     _lock = threading.Lock()
+    _inference_lock = threading.Lock()
 
     def __new__(cls) -> "ChunkReranker":
         if cls._instance is None:
@@ -271,13 +272,15 @@ class ChunkReranker:
         # bge-reranker 系列的窗口只有 512 token，超长部分本来就截断；
         # 先按字符截到 RERANKER_MAX_TEXT_CHARS，省掉无效 tokenization
         # 与推理开销（粗排候选是 1000~2000 字的块，父块回填后更长）。
-        limit = get_settings().RERANKER_MAX_TEXT_CHARS
+        settings = get_settings()
+        limit = settings.RERANKER_MAX_TEXT_CHARS
+        batch_size = max(1, int(getattr(settings, "RERANKER_BATCH_SIZE", 4)))
         if limit > 0:
             texts = [t[:limit] for t in texts]
 
         if self._backend == "flagreranker":
             raw = self._model.compute_score(
-                [[query, t] for t in texts], normalize=False
+                [[query, t] for t in texts], normalize=False, batch_size=batch_size
             )
             if hasattr(raw, "tolist"):
                 raw = raw.tolist()
@@ -288,7 +291,7 @@ class ChunkReranker:
 
         if self._backend == "cross_encoder":
             raw = self._model.predict(
-                [(query, t) for t in texts], show_progress_bar=False,
+                [(query, t) for t in texts], show_progress_bar=False, batch_size=batch_size,
                 activation_fn=lambda logits: logits,  # Apply sigmoid exactly once below.
             )
             if hasattr(raw, "tolist"):
@@ -303,7 +306,12 @@ class ChunkReranker:
         self, query: str, texts: list[str], vector_scores: list[float]
     ) -> list[float]:
         """Async wrapper: normalize=False + sigmoid keeps the [0,1] scale stable."""
-        return await asyncio.to_thread(self._score_pairs_sync, query, texts, vector_scores)
+        return await asyncio.to_thread(self._score_pairs_serial, query, texts, vector_scores)
+
+    def _score_pairs_serial(self, query, texts, vector_scores):
+        # Bound peak inference memory when several requests share this model.
+        with self._inference_lock:
+            return self._score_pairs_sync(query, texts, vector_scores)
 
     async def score_pairs_multi(
         self,

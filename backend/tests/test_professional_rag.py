@@ -241,7 +241,8 @@ def test_complex_golden_has_scanned_and_merged_tables_and_unambiguous_chart_year
     assert all(case["human_review"] == "pending_business_review" for case in golden["cases"])
 
 
-def test_acceptance_upload_is_manifest_scoped_and_checkpointed(monkeypatch, tmp_path):
+@pytest.mark.parametrize("rate_limited", [False, True])
+def test_acceptance_upload_is_manifest_scoped_and_checkpointed(monkeypatch, tmp_path, rate_limited):
     import json
     import sys
     from scripts import prepare_professional_acceptance as runner
@@ -249,7 +250,7 @@ def test_acceptance_upload_is_manifest_scoped_and_checkpointed(monkeypatch, tmp_
     (tmp_path / "documents/test.md").write_text("test", encoding="utf-8")
     (tmp_path / "gold.json").write_text(json.dumps({"documents": {"test.md": "test"}}), encoding="utf-8")
     calls, collection = [], {}
-    def response(data): return SimpleNamespace(raise_for_status=lambda: None, json=lambda: data)
+    def response(data): return SimpleNamespace(status_code=200, raise_for_status=lambda: None, json=lambda: data)
     class Client:
         def __enter__(self): return self
         def __exit__(self, *args): pass
@@ -264,18 +265,78 @@ def test_acceptance_upload_is_manifest_scoped_and_checkpointed(monkeypatch, tmp_
                 collection.update(id="kb", name=kwargs["json"]["name"]); return response(collection)
             assert path == "/upload" and kwargs["data"]["collection_id"] == "kb"
             assert kwargs["files"]["files"][0] == "test.md"
+            assert kwargs["files"]["files"][1].read() == b"test", "retry must rewind the uploaded file"
+            if rate_limited and calls.count("/upload") == 1:
+                return SimpleNamespace(status_code=429, headers={"Retry-After": "1"})
             return response(dict(documents=[dict(document_id="doc")]))
     monkeypatch.setattr(runner.httpx, "Client", lambda **kwargs: Client())
-    monkeypatch.setattr(runner, "available_gb", lambda: 6)
+    readings = iter([6] + [3] * 20)
+    monkeypatch.setattr(runner, "available_gb", lambda: next(readings))
+    monkeypatch.setattr(runner, "wait_rate_limit", lambda response: int(response.headers["Retry-After"]))
     monkeypatch.setenv("RAG_EVAL_TOKEN", "test-token")
     monkeypatch.setattr(sys, "argv", ["runner", str(tmp_path), "--phase", "upload"])
     runner.main()
     state = json.loads((tmp_path / "run-state.json").read_text(encoding="utf-8"))
     assert state["upload_completed"] and state["documents"]["test.md"]["id"] == "doc"
-    assert calls == ["/kb/collections", "/upload"]
+    expected = ["/kb/collections", "/upload"] + (["/upload"] if rate_limited else [])
+    assert calls == expected
     monkeypatch.setattr(runner, "available_gb", lambda: .5)
     with pytest.raises(SystemExit): runner.main()
-    assert calls == ["/kb/collections", "/upload"], "low memory must not start a new upload"
+    assert calls == expected, "low memory must not start a new upload"
+
+
+def test_paired_acceptance_prewarm_is_not_counted_as_a_gold_case(monkeypatch, tmp_path):
+    import json
+    import sys
+    import httpx
+    from scripts import evaluate_professional as runner
+    gold = tmp_path / "gold.json"
+    gold.write_text(json.dumps(dict(name="fixture", truth_origin="synthetic", cases=[dict(id="fact-01", category="fact", query="query", answer="value", expect_sources=["doc.md"])])), encoding="utf-8")
+    calls, removed = [], []
+    class Client:
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def get(self, path): return httpx.Response(200, request=httpx.Request("GET", "http://local" + path), json=dict(id="owner"))
+        def build_request(self, method, path, **kwargs): return httpx.Request(method, "http://local" + path, **kwargs)
+        def send(self, request, **kwargs):
+            calls.append(json.loads(request.content)["retrieval_strategy"])
+            events = [dict(type="thinking", conversation_id=f"owned-{len(calls)}"), dict(type="sources", sources=[dict(filename="doc.md", page_number=1)]), dict(type="chunk", content="value"), dict(type="done")]
+            return httpx.Response(200, request=request, text="\n".join("data: " + json.dumps(event) for event in events))
+        def delete(self, path): removed.append(path); return SimpleNamespace(status_code=204)
+    monkeypatch.setattr(runner.httpx, "Client", lambda **kwargs: Client())
+    readings = iter([6] + [3] * 30)
+    monkeypatch.setattr(runner, "available_gb", lambda: next(readings))
+    monkeypatch.setenv("RAG_EVAL_TOKEN", "unit-token")
+    monkeypatch.setattr(sys, "argv", ["runner", "--gold", str(gold), "--out", str(tmp_path / "paired.json"), "--collection", "kb", "--condition", "warm", "--config-version", "unit", "--limit", "1", "--paired"])
+    runner.main()
+    assert calls == ["hybrid", "hybrid", "hybrid_graph", "hybrid_graph"]
+    for strategy in ("hybrid", "hybrid_graph"):
+        report = json.loads((tmp_path / f"paired-{strategy}.json").read_text(encoding="utf-8"))
+        assert report["summary"]["cases"] == 1 and report["warmup"]["completed"]
+        assert report["session_start_available_gb"] == 6
+    assert len(removed) == 4 and all("/conversations/owned-" in path for path in removed)
+
+
+def test_rate_limit_wait_checks_runtime_memory_and_preserves_server_delay(monkeypatch):
+    from scripts import evaluate_professional as runner
+    waits = []
+    monkeypatch.setattr(runner, "available_gb", lambda: 3)
+    monkeypatch.setattr(runner.time, "sleep", waits.append)
+    response = SimpleNamespace(headers={"Retry-After": "2"})
+    assert runner.wait_rate_limit(response) == 2 and waits == [1, 1]
+    monkeypatch.setattr(runner, "available_gb", lambda: .5)
+    with pytest.raises(RuntimeError, match="低于1GB"): runner.wait_rate_limit(response)
+
+
+def test_memory_guard_covers_wait_before_response_headers(monkeypatch):
+    import threading
+    from scripts import evaluate_professional as runner
+    closed = threading.Event()
+    monkeypatch.setattr(runner, "available_gb", lambda: .5)
+    client = SimpleNamespace(close=closed.set)
+    with pytest.raises(RuntimeError, match="低于1GB"):
+        with runner.memory_guard(client):
+            assert closed.wait(3), "guard must close connections before a response exists"
 
 
 def test_negative_and_conflict_cases_do_not_accept_keyword_only_answers():

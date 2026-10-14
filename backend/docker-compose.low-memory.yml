@@ -1,4 +1,4 @@
-# Local CPU profile; keep the main deployment defaults unchanged.
+# Local resource limits; GPU use requires an explicit per-machine setting.
 # Keep the RAG evidence window; save memory through model size and concurrency.
 services:
   postgres:
@@ -22,8 +22,8 @@ services:
     environment:
       OLLAMA_MODEL: qwen3:4b-instruct-2507-q4_K_M
       OLLAMA_NUM_CTX: "8192"
-      OLLAMA_NUM_GPU: "0"
-      OLLAMA_KEEP_ALIVE_SECONDS: "0"
+      OLLAMA_NUM_GPU: "${OLLAMA_NUM_GPU:-0}"
+      OLLAMA_KEEP_ALIVE_SECONDS: "${OLLAMA_KEEP_ALIVE_SECONDS:-0}"
       MAX_CONCURRENT_EMBEDDINGS: "1"
       OMP_NUM_THREADS: "2"
       MKL_NUM_THREADS: "2"

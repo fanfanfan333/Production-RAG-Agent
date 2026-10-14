@@ -250,6 +250,7 @@ class Settings(BaseSettings):
     # ── Reranker 精排（粗排→精排两阶段检索的第二阶段） ─────────────────────────
     RERANKER_ENABLED: bool = True             # cross-encoder 精排总开关
     RERANKER_MODEL_NAME: str = "BAAI/bge-reranker-base"  # 默认轻量 cross-encoder
+    RERANKER_BATCH_SIZE: int = 4
                                                      # （~278MB）。bge-reranker-v2-m3 效果更强
                                                      # 但占 ~2.3GB 常驻内存，与 Ollama 同机
                                                      # 部署时容易把 llama-server 挤到 OOM。
