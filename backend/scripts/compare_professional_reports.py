@@ -1,6 +1,7 @@
 """Check experimental graph gates on paired, warm runs; human review is still required."""
 import argparse
 import json
+from collections import Counter
 from pathlib import Path
 
 
@@ -11,6 +12,8 @@ def compare(baseline, graph):
         raise ValueError("需要同范围下的预热 hybrid / hybrid_graph 成对报告")
     left = {row["id"]: row for row in baseline["cases"]}
     right = {row["id"]: row for row in graph["cases"]}
+    if len(left) != len(baseline["cases"]) or len(right) != len(graph["cases"]):
+        raise ValueError("重复用例 ID，不能用于门禁")
     if not left or left.keys() != right.keys() or baseline.get("aborted") or graph.get("aborted"):
         raise ValueError("用例不同或运行中断")
     multi = [key for key in left if left[key]["category"] == "multihop"]
@@ -20,7 +23,12 @@ def compare(baseline, graph):
     baseline_latency = baseline["summary"].get("retrieval_p95_ms")
     graph_latency = graph["summary"].get("retrieval_p95_ms")
     summary = graph["summary"]
-    return {"multihop_gain_pp": round(gain * 100, 2), "multihop_gate": gain >= .1,
+    expected = {"fact": 40, "table": 25, "image": 15, "multihop": 20, "negative": 20}
+    complete = dict(Counter(row["category"] for row in left.values())) == expected
+    provenance = bool(baseline.get("gold_sha256") and len(baseline["gold_sha256"]) == 64
+                      and baseline.get("config_version") and baseline.get("account_scope", {}).get("id"))
+    return {"complete_dataset_gate": complete, "provenance_gate": provenance,
+            "multihop_gain_pp": round(gain * 100, 2), "multihop_gate": gain >= .1,
             "ordinary_no_regression": all(not left[key]["answer_literal_match"] or right[key]["answer_literal_match"] for key in ordinary),
             "latency_gate": bool(baseline_latency and graph_latency is not None and graph_latency <= 1.2 * baseline_latency),
             "recall_gate": (summary.get("recall@5") or 0) >= .9,
@@ -36,7 +44,7 @@ def main():
     args = parser.parse_args()
     result = compare(json.loads(args.baseline.read_text(encoding="utf-8")), json.loads(args.graph.read_text(encoding="utf-8")))
     print(json.dumps(result, ensure_ascii=False, indent=2))
-    if not all(result[key] for key in ("multihop_gate", "ordinary_no_regression", "latency_gate", "recall_gate", "citation_gate", "error_gate", "graph_usage_gate")):
+    if not all(result[key] for key in ("complete_dataset_gate", "provenance_gate", "multihop_gate", "ordinary_no_regression", "latency_gate", "recall_gate", "citation_gate", "error_gate", "graph_usage_gate")):
         raise SystemExit(1)
 
 

@@ -428,6 +428,23 @@ async def _retrieve_node(state: MasterState) -> dict:
             "user=%s conversation=%s query=%r",
             state.get("user_id"), state.get("conversation_id"), raw_query[:80],
         )
+    candidates = []
+    graph_paths, retrieval_notice = [], ""
+    if state.get("retrieval_strategy") == "hybrid_graph":
+        if not get_settings().GRAPH_RETRIEVAL_ENABLED or not get_settings().RERANKER_ENABLED:
+            retrieval_notice = "关联检索尚处于实验阶段，本次使用普通混合检索。"
+        else:
+            from app.services.graph_retrieval import graph_candidates, GraphPermissionError
+            try:
+                candidates, graph_paths = await graph_candidates(safe_query, state.get("user_scope"), state.get("collection_id"))
+                if not candidates:
+                    retrieval_notice = "暂无可用的关联证据，本次使用普通混合检索。"
+            except GraphPermissionError:
+                raise
+            except Exception:
+                logger.exception("Graph retrieval unavailable; using scoped hybrid results")
+                graph_paths, retrieval_notice = [], "关联检索暂不可用，本次使用普通混合检索。"
+
     chunks = await retrieve_chunks(
         query=safe_query,
         scope=state.get("user_scope"),
@@ -435,29 +452,10 @@ async def _retrieve_node(state: MasterState) -> dict:
         collection_id=state.get("collection_id"),
         extra_queries=safe_variants,
         extra_vector_queries=[safe_hyde] if safe_hyde else None,
+        **({"graph_chunks": candidates} if candidates else {}),
     )
-
-    graph_paths, retrieval_notice = [], ""
-    if state.get("retrieval_strategy") == "hybrid_graph":
-        if not get_settings().GRAPH_RETRIEVAL_ENABLED:
-            retrieval_notice = "关联检索尚处于实验阶段，本次使用普通混合检索。"
-        else:
-            from app.services.graph_retrieval import graph_candidates, GraphPermissionError
-            from app.services.reranker import rerank_chunks
-            try:
-                candidates, graph_paths = await graph_candidates(safe_query, state.get("user_scope"), state.get("collection_id"))
-                if candidates:
-                    unique = {(chunk.document_id, chunk.chunk_index): chunk for chunk in [*chunks, *candidates]}
-                    chunks = await rerank_chunks(safe_query, list(unique.values()), top_k=state["top_k"])
-                    kept = {(chunk.document_id, chunk.chunk_index) for chunk in chunks}
-                    graph_paths = [path for path in graph_paths if (path["document_id"], path["chunk_index"]) in kept]
-                else:
-                    retrieval_notice = "暂无可用的关联证据，本次使用普通混合检索。"
-            except GraphPermissionError:
-                raise
-            except Exception:
-                logger.exception("Graph retrieval unavailable; using scoped hybrid results")
-                graph_paths, retrieval_notice = [], "关联检索暂不可用，本次使用普通混合检索。"
+    kept = {(chunk.document_id, chunk.chunk_index) for chunk in chunks}
+    graph_paths = [path for path in graph_paths if (path["document_id"], path["chunk_index"]) in kept]
 
     sources = [
         {

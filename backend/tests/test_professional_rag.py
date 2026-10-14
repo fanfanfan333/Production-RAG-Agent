@@ -192,6 +192,8 @@ def test_graph_report_gates_reject_regression_and_incomparable_scope():
         summary={"retrieval_p95_ms": 100, "recall@5": 1, "citation_support_rate": 1, "errors": 0})
     result = deepcopy(baseline); result["strategy"] = "hybrid_graph"; result["cases"][0]["answer_literal_match"] = True
     assert compare(baseline, result)["multihop_gate"]
+    assert not compare(baseline, result)["complete_dataset_gate"]
+    assert not compare(baseline, result)["provenance_gate"]
     result["cases"][1]["answer_literal_match"] = False
     assert not compare(baseline, result)["ordinary_no_regression"]
     result["account_scope"] = {"id": "other"}
@@ -227,3 +229,97 @@ def test_graph_incomplete_or_invalid_model_output_is_not_success(monkeypatch, re
     monkeypatch.setattr(graph, "get_settings", lambda: settings)
     monkeypatch.setattr(graph.httpx, "AsyncClient", lambda **kwargs: Client())
     with pytest.raises(graph.GraphExtractionError): asyncio.run(graph.extract("甲投资乙"))
+
+
+def test_complex_golden_has_scanned_and_merged_tables_and_unambiguous_chart_year():
+    from scripts.make_complex_professional import make_complex_golden
+    golden = make_complex_golden()
+    assert len(golden["cases"]) == 120
+    assert sum(name.endswith(".docx") for name in golden["documents"]) == 2
+    assert sum(name.endswith(".pdf") for name in golden["documents"]) == 3
+    assert all("2025" in case["query"] for case in golden["cases"] if case["category"] == "image")
+    assert all(case["human_review"] == "pending_business_review" for case in golden["cases"])
+
+
+def test_acceptance_upload_is_manifest_scoped_and_checkpointed(monkeypatch, tmp_path):
+    import json
+    import sys
+    from scripts import prepare_professional_acceptance as runner
+    (tmp_path / "documents").mkdir()
+    (tmp_path / "documents/test.md").write_text("test", encoding="utf-8")
+    (tmp_path / "gold.json").write_text(json.dumps({"documents": {"test.md": "test"}}), encoding="utf-8")
+    calls, collection = [], {}
+    def response(data): return SimpleNamespace(raise_for_status=lambda: None, json=lambda: data)
+    class Client:
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def get(self, path, **kwargs):
+            if path == "/auth/me": return response(dict(id="owner", role="admin", tenant_id="default"))
+            if path == "/kb/collections": return response(dict(collections=[collection]))
+            assert path == "/documents"
+            return response(dict(documents=[dict(document_id="doc", status="completed", chunk_count=1, page_count=1)]))
+        def post(self, path, **kwargs):
+            calls.append(path)
+            if path == "/kb/collections":
+                collection.update(id="kb", name=kwargs["json"]["name"]); return response(collection)
+            assert path == "/upload" and kwargs["data"]["collection_id"] == "kb"
+            assert kwargs["files"]["files"][0] == "test.md"
+            return response(dict(documents=[dict(document_id="doc")]))
+    monkeypatch.setattr(runner.httpx, "Client", lambda **kwargs: Client())
+    monkeypatch.setattr(runner, "available_gb", lambda: 6)
+    monkeypatch.setenv("RAG_EVAL_TOKEN", "test-token")
+    monkeypatch.setattr(sys, "argv", ["runner", str(tmp_path), "--phase", "upload"])
+    runner.main()
+    state = json.loads((tmp_path / "run-state.json").read_text(encoding="utf-8"))
+    assert state["upload_completed"] and state["documents"]["test.md"]["id"] == "doc"
+    assert calls == ["/kb/collections", "/upload"]
+    monkeypatch.setattr(runner, "available_gb", lambda: .5)
+    with pytest.raises(SystemExit): runner.main()
+    assert calls == ["/kb/collections", "/upload"], "low memory must not start a new upload"
+
+
+def test_negative_and_conflict_cases_do_not_accept_keyword_only_answers():
+    from scripts.evaluate_professional import score
+    missing = dict(id="negative-01", category="negative", query="不存在设备保修几年", answer=None, expect_sources=[], expect_refusal=True)
+    def events(answer): return [dict(type="chunk", content=answer), dict(type="done")]
+    assert not score(missing, events("无法完全确认，但保修三年。"), 1, 1)["answer_literal_match"]
+    assert score(missing, events("没有相关资料，无法确认保修期限。"), 1, 1)["answer_literal_match"]
+    conflict = dict(id="negative-20", category="negative", answer="材料冲突，无法确定", expect_sources=["a", "b"], expect_conflict_notice=True,
+        source_locations=[dict(filename="a", evidence="预算109万元"), dict(filename="b", evidence="预算209万元")])
+    assert not score(conflict, events("没有冲突，最终预算为209万元。"), 1, 1)["answer_literal_match"]
+    assert not score(conflict, events("资料冲突，预算209万元。"), 1, 1)["answer_literal_match"]
+    assert score(conflict, events("两份材料分别写109万元和209万元，无法确定，应核实来源。"), 1, 1)["answer_literal_match"]
+
+
+def test_graph_candidate_pool_is_bounded_and_cannot_restore_denied_chunks():
+    from app.services.retrieval_service import _merge_graph_candidates, _chunk_key
+    ordinary = [RetrievedChunk("ordinary", "a", 1, i, "text", .5) for i in range(12)]
+    graph_chunks = [RetrievedChunk("graph", "b", 1, i, "evidence", 0) for i in range(10)]
+    merged = {_chunk_key(c): c for c in ordinary + graph_chunks}
+    graph_keys = {_chunk_key(c) for c in graph_chunks} | {("denied", 0)}
+    picks = _merge_graph_candidates(ordinary, merged, graph_keys, 12)
+    assert len(picks) == 12 and picks[:8] == ordinary[:8]
+    assert sum(c.document_id == "graph" for c in picks) == 4
+    assert not any(c.document_id == "denied" for c in picks)
+    assert _merge_graph_candidates(ordinary, merged, {("denied", 0)}, 12) == ordinary
+
+
+def test_master_graph_uses_one_scoped_retrieval_and_filters_evidence_paths(monkeypatch):
+    from app.services import master_graph as master
+    from app.services import reranker
+    chunk = RetrievedChunk("visible", "source.md", 1, 0, "甲投资乙", .9)
+    calls = []
+    async def candidates(*args):
+        return [chunk], [dict(document_id="visible", chunk_index=0), dict(document_id="dropped", chunk_index=1)]
+    async def retrieve(**kwargs):
+        calls.append(kwargs)
+        assert kwargs["graph_chunks"] == [chunk] and kwargs["scope"] == "scope"
+        return [chunk]
+    async def duplicate_rerank(*args, **kwargs):
+        pytest.fail("master graph must not perform a second reranking")
+    monkeypatch.setattr(master, "get_settings", lambda: SimpleNamespace(GRAPH_RETRIEVAL_ENABLED=True, RERANKER_ENABLED=True))
+    monkeypatch.setattr(graph, "graph_candidates", candidates)
+    monkeypatch.setattr(master, "retrieve_chunks", retrieve)
+    monkeypatch.setattr(reranker, "rerank_chunks", duplicate_rerank)
+    result = asyncio.run(master._retrieve_node(dict(query="甲的关联", top_k=5, user_scope="scope", retrieval_strategy="hybrid_graph")))
+    assert len(calls) == 1 and result["graph_paths"] == [dict(document_id="visible", chunk_index=0)]

@@ -345,6 +345,15 @@ def _chunk_key(chunk: RetrievedChunk) -> tuple[str, int]:
     return (chunk.document_id, chunk.chunk_index)
 
 
+def _merge_graph_candidates(candidates, merged, graph_keys, limit):
+    # Only merge evidence that survived the same document/object ACL checks as ANN.
+    graph_picks = [merged[k] for k in sorted(graph_keys) if k in merged][:max(1, limit // 3)]
+    if not graph_picks:
+        return candidates
+    ordinary = [c for c in candidates if _chunk_key(c) not in graph_keys]
+    return ordinary[:limit - len(graph_picks)] + graph_picks
+
+
 def _media_fields(payload: dict) -> dict:
     """从 Qdrant payload 提取内容类型与图片信息（部分3）."""
     return {
@@ -1407,6 +1416,7 @@ async def retrieve_chunks_scoped(
     extra_vector_queries: list[str] | None = None,
     enable_hierarchical: bool | None = None,
     metadata_filter: MetadataFilter | None = None,
+    graph_chunks: list[RetrievedChunk] | None = None,
 ) -> list[RetrievedChunk]:
     """
     **唯一推荐**的用户请求检索入口（决策 10-①：签名强制）.
@@ -1472,6 +1482,7 @@ async def retrieve_chunks_scoped(
         owns_tenant_ids=scope.base.owns_tenant_ids,
         metadata_filter=metadata_filter,
         scope=scope,
+        **({"graph_chunks": graph_chunks} if graph_chunks else {}),
     )
 
 
@@ -1493,6 +1504,7 @@ async def retrieve_chunks(
     unrestricted: bool = False,
     metadata_filter: MetadataFilter | None = None,
     scope: "UserScope | None" = None,
+    graph_chunks: list[RetrievedChunk] | None = None,
 ) -> list[RetrievedChunk]:
     """
     两阶段检索：粗排（召回+融合）→ 精排（cross-encoder rerank）.
@@ -1755,6 +1767,16 @@ async def retrieve_chunks(
             rank_list.append(key)
         vector_rank_lists.append(rank_list)
 
+    graph_keys = set()
+    if graph_chunks and settings.RERANKER_ENABLED:
+        if scope is None:
+            return []
+        for chunk in graph_chunks[:30]:
+            payload = chunk._acl_payload or {}
+            key = _chunk_key(chunk)
+            if str(payload.get("document_id")) == key[0] and payload.get("chunk_index") == key[1]:
+                all_results.setdefault(key, (0.0, payload))
+                graph_keys.add(key)
     search_results_count = len(all_results)
     if search_results_count == 0:
         logger.info("No raw candidates returned from Qdrant search.")
@@ -1784,6 +1806,8 @@ async def retrieve_chunks(
                 Document.id.in_(doc_ids),
                 Document.status == DocumentStatus.COMPLETED,
             )
+            if collection_id:
+                q = q.where(Document.collection_id == uuid.UUID(str(collection_id)))
             if unrestricted:
                 # 仅供诊断脚本：不做任何权限过滤（与升级前的"admin 全览"等价）
                 pass
@@ -1886,7 +1910,7 @@ async def retrieve_chunks(
     # 与元数据校验 —— 所以这里的截断才配得上"候选池"这个说法。不过取时
     # valid_candidates 本来就 ≤ ann_limit == candidate_pool，这段不生效。
     if overfetched and len(valid_candidates) > candidate_pool:
-        keep = {_chunk_key(c) for c in valid_candidates[:candidate_pool]}
+        keep = {_chunk_key(c) for c in valid_candidates[:candidate_pool]} | graph_keys
         dropped = len(merged) - len(keep)
         merged = {k: v for k, v in merged.items() if k in keep}
         valid_candidates = valid_candidates[:candidate_pool]
@@ -2171,6 +2195,8 @@ async def retrieve_chunks(
 
     if fallback_path:
         candidates = _apply_score_filters(valid_candidates, fetch_final)
+        if graph_keys:
+            candidates = _merge_graph_candidates(candidates, merged, graph_keys, settings.RERANKER_MAX_CANDIDATES)
         # ⚠️ 只要**有**候选就必须进精排，不能因为"只有 1 条"就跳过 ——
         # 跳过会让 chunk.score 停留在**粗排分**（向量余弦 / 关键词占位 0.30），
         # 而下游（rag_graph 幻觉守卫、evidence_gate、retrieval_grader、
@@ -2216,6 +2242,7 @@ async def retrieve_chunks(
             for key, c in merged.items()
             if (c.score >= settings.RETRIEVAL_MIN_SCORE and c.score >= gap_cutoff)
             or key in strong_keyword
+            or key in graph_keys
         ]
         survivors.sort(
             key=lambda kc: fused_scores.get(kc[0], 0.0), reverse=True
@@ -2223,6 +2250,9 @@ async def retrieve_chunks(
 
         # 粗排候选池：截断到精排上限，控制 cross-encoder 推理量
         candidates = [c for _, c in survivors[: settings.RERANKER_MAX_CANDIDATES]]
+
+        if graph_keys:
+            candidates = _merge_graph_candidates(candidates, merged, graph_keys, settings.RERANKER_MAX_CANDIDATES)
 
         # 同 fallback 分支：只要有候选就要打分，避免粗排分冒充精排分（量纲泄漏）。
         if settings.RERANKER_ENABLED and candidates:

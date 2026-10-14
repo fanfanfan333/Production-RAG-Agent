@@ -48,8 +48,13 @@ def score(case, events, elapsed, first_token):
     truth = case.get("answer")
     if case.get("expect_refusal"):
         correct = any(word in normalized for word in ("无法", "不足", "未找到", "未检索", "没有相关"))
+        if re.search(r"(?:\d+(?:\.\d+)?|[一二三四五六七八九十]+)(?:万元|元|瓦|天|年)", normalized):
+            correct = False
     elif case.get("expect_conflict_notice"):
-        correct = "冲突" in normalized or "不一致" in normalized
+        amounts = {value for source in case.get("source_locations", []) for value in re.findall(r"\d+(?:\.\d+)?万元", source.get("evidence", ""))}
+        uncertainty = any(word in normalized for word in ("无法确定", "无法唯一确定", "不能确定", "无法判断", "需核实", "需要核实", "有待核实"))
+        correct = uncertainty and len(amounts) >= 2 and all(re.search(r"(?<!\d)" + re.escape(value), normalized) for value in amounts)
+        if re.search(r"(?:没有|不存在|未发现|无)冲突|最终(?:预算|金额)(?:为|是)", normalized): correct = False
     else:
         literal = re.sub(r"\s+", "", truth or "")
         pattern = (r"(?<!\d)" if literal[:1].isdigit() else "") + re.escape(literal)
@@ -63,7 +68,9 @@ def score(case, events, elapsed, first_token):
             "answer_literal_match": correct and numeric_match is not False, "numeric_unit_match": numeric_match,
             "citation_total": citation.get("total", 0), "citation_passed": citation.get("passed", 0),
             "ttft_ms": first_token, "total_ms": elapsed, "stages_ms": stages, "error": error,
-            "completed": done, "answer": answer, "sources": sources, "graph_paths": paths}
+            "completed": done, "answer": answer, "sources": sources, "graph_paths": paths,
+            "query": case.get("query"), "reference_answer": truth, "source_locations": case.get("source_locations", []),
+            "human_review": "pending"}
 
 
 def aggregate(rows):
