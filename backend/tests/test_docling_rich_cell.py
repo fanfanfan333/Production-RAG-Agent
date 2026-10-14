@@ -62,6 +62,21 @@ def test_guardrail_normalizes_compact_table_separator():
     assert "| --- | --- |" in out
 
 
+def test_page_offsets_follow_cleaned_markdown(monkeypatch):
+    from types import SimpleNamespace
+    from app.services.image_understanding.engines.docling_engine import DoclingEngine
+    nodes = [SimpleNamespace(page=1, text="| A | B |\n|-----|-----|\n| " + RICH + " | " + RICH + " |\n| 1 | 2 |"),
+             SimpleNamespace(page=2, text="Second page fact: 281 minutes.")]
+    doc = SimpleNamespace(iterate_items=lambda: iter((node, 0) for node in nodes))
+    monkeypatch.setattr(DoclingEngine, "_get_converter", lambda self: SimpleNamespace(convert=lambda path: SimpleNamespace(document=doc)))
+    monkeypatch.setattr(providers, "_docling_page_no", lambda node: node.page)
+    monkeypatch.setattr(providers, "_docling_markdown", lambda node, doc: node.text)
+    result = providers.DoclingProvider(get_settings()).parse(b"fake-pdf", "pages.pdf")
+    assert result is not None and RICH not in result.markdown
+    assert result.page_for_offset(result.markdown.index("281")) == 2
+    assert result.page_marks[1].char_start == result.markdown.index("Second page")
+
+
 # ── doc 传递限制：只有 TableItem 能收到 doc（保护图片占位通道）───────────────
 
 def test_table_item_is_passed_doc(monkeypatch):

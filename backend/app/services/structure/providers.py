@@ -571,7 +571,8 @@ class DoclingProvider(StructureProvider):
         marks: list[PageMark] = []
         cursor = 0
         for page_no in order:
-            body = "\n\n".join(buckets[page_no]).strip()
+            # Normalize before measuring offsets; cleanup changes Markdown length.
+            body = _sanitize_docling_markdown("\n\n".join(buckets[page_no]).strip(), filename).strip()
             if not body:
                 continue
             marks.append(PageMark(page_number=page_no, char_start=cursor))
@@ -582,8 +583,6 @@ class DoclingProvider(StructureProvider):
         markdown = "".join(parts).strip()
         if not markdown or not marks:
             return None
-        # 防复发护栏 + 表格分隔行归一化（见 _sanitize_docling_markdown）
-        markdown = _sanitize_docling_markdown(markdown, filename)
         if not markdown:
             return None
         return StructuredDocument(
