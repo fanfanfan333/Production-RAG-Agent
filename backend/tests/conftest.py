@@ -21,9 +21,13 @@ python-pptx / openpyxl / asyncpg / PyJWT …）。在**开发机（Windows 宿�
 from __future__ import annotations
 
 import importlib.machinery
+import os
 import sys
 import types
 import warnings
+
+if os.getenv("RUN_DB_INTEGRATION") != "1":
+    os.environ.setdefault("POSTGRES_PASSWORD", "pytest-only-not-production")
 
 #: 允许被哑桩顶替的第三方顶层包。仅限「本模块链路上用不到其行为」的重依赖。
 _HOST_PAD_NAMES: tuple[str, ...] = (

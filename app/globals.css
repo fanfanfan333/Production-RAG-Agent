@@ -29,46 +29,47 @@
 }
 
 :root {
-  --radius: 0.625rem;
-  --background: oklch(0.988 0 0);
-  --foreground: oklch(0.145 0 0);
-  --card: oklch(1 0 0);
-  --card-foreground: oklch(0.145 0 0);
-  --popover: oklch(1 0 0);
-  --popover-foreground: oklch(0.145 0 0);
-  --primary: oklch(0.205 0 0);
-  --primary-foreground: oklch(0.985 0 0);
-  --secondary: oklch(0.96 0 0);
-  --secondary-foreground: oklch(0.205 0 0);
-  --muted: oklch(0.96 0 0);
-  --muted-foreground: oklch(0.52 0 0);
-  --accent: oklch(0.955 0 0);
-  --accent-foreground: oklch(0.205 0 0);
-  --destructive: oklch(0.577 0.245 27.325);
-  --border: oklch(0.915 0 0);
-  --input: oklch(0.915 0 0);
-  --ring: oklch(0.205 0 0);
+  --radius: 0.75rem;
+  --background: #f6f7f9;
+  --foreground: #202127;
+  --card: #ffffff;
+  --card-foreground: #202127;
+  --popover: #ffffff;
+  --popover-foreground: #202127;
+  --primary: #515dbf;
+  --primary-foreground: #ffffff;
+  --secondary: #eff0f4;
+  --secondary-foreground: #343640;
+  --muted: #eff0f4;
+  --muted-foreground: #626675;
+  --accent: #e9ebfa;
+  --accent-foreground: #454fa3;
+  --destructive: #c43245;
+  --border: #e2e4eb;
+  --input: #d4d7e1;
+  --ring: #5e6ad2;
 }
 
 .dark {
-  --background: oklch(0.135 0 0);
-  --foreground: oklch(0.965 0 0);
-  --card: oklch(0.17 0 0);
-  --card-foreground: oklch(0.965 0 0);
-  --popover: oklch(0.17 0 0);
-  --popover-foreground: oklch(0.965 0 0);
-  --primary: oklch(0.965 0 0);
-  --primary-foreground: oklch(0.17 0 0);
-  --secondary: oklch(0.225 0 0);
-  --secondary-foreground: oklch(0.965 0 0);
-  --muted: oklch(0.225 0 0);
-  --muted-foreground: oklch(0.66 0 0);
-  --accent: oklch(0.245 0 0);
-  --accent-foreground: oklch(0.965 0 0);
-  --destructive: oklch(0.704 0.191 22.216);
-  --border: oklch(0.26 0 0);
-  --input: oklch(0.26 0 0);
-  --ring: oklch(0.965 0 0);
+  color-scheme: dark;
+  --background: #010102;
+  --foreground: #f7f8f8;
+  --card: #0f1011;
+  --card-foreground: #f7f8f8;
+  --popover: #141516;
+  --popover-foreground: #f7f8f8;
+  --primary: #5e6ad2;
+  --primary-foreground: #ffffff;
+  --secondary: #18191a;
+  --secondary-foreground: #d0d6e0;
+  --muted: #18191a;
+  --muted-foreground: #a0a5af;
+  --accent: #23253b;
+  --accent-foreground: #c3c9ff;
+  --destructive: #f07886;
+  --border: #23252a;
+  --input: #34343a;
+  --ring: #828fff;
 }
 
 @layer base {
@@ -224,4 +225,22 @@
 .prose a[href^="#source-"]:hover {
   text-decoration: none;
   background: color-mix(in oklch, var(--primary) 28%, transparent);
+}
+
+@layer base {
+  :where(a, button, input, textarea, select):focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 3px;
+  }
+  ::selection {
+    background: color-mix(in srgb, var(--primary) 22%, transparent);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }

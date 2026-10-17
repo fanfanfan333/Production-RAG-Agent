@@ -39,6 +39,7 @@ next-env.d.ts
 # ── Backend (Python) ──────────────────────────────────────────────
 backend/.env
 backend/**/__pycache__/
+backend/.cache/
 backend/**/*.pyc
 backend/venv/
 backend/.venv/

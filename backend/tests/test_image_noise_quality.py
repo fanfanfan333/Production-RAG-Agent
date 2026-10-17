@@ -41,7 +41,6 @@ _BACKEND_ROOT = str(Path(__file__).resolve().parent.parent)
 if _BACKEND_ROOT not in sys.path:
     sys.path.insert(0, _BACKEND_ROOT)
 
-os.environ.setdefault("POSTGRES_PASSWORD", "test-placeholder")
 _TMP_ROOT = tempfile.mkdtemp(prefix="rag_noise_test_")
 os.environ.setdefault("IMAGE_STORAGE_DIR", os.path.join(_TMP_ROOT, "uploads"))
 

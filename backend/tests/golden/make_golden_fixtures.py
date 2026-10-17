@@ -251,7 +251,7 @@ def build_xlsx(path: Path, pages: list[str]) -> None:
     rows: list[str] = []
     for r_idx, row in enumerate(grid, start=1):
         cells: list[str] = []
-        for c_idx, value in enumerate(row):
+        for c_idx, value in enumerate(row, start=1):
             ref = f"{chr(64 + c_idx)}{r_idx}"
             if value == "":
                 cells.append(f'<c r="{ref}"/>')        # 空单元格必须保住（否则列错位）

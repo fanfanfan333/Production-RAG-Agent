@@ -42,14 +42,14 @@ export function AskHero({ collections }: AskHeroProps) {
       transition={{ duration: 0.4 }}
       aria-label="快捷提问"
     >
-      <Card className="relative overflow-hidden bg-gradient-to-b from-primary/[0.05] to-transparent">
+      <Card className="relative overflow-hidden border-primary/20">
         <CardContent className="flex flex-col items-center gap-5 px-6 py-8 sm:px-10 sm:py-10">
           <div className="flex flex-col items-center gap-1.5 text-center">
             <span className="inline-flex items-center gap-1.5 rounded-full border border-primary/20 bg-primary/5 px-3 py-1 text-xs font-medium text-primary">
               <Sparkles className="size-3" />
               AI 检索问答
             </span>
-            <h2 className="text-xl font-semibold tracking-tight sm:text-2xl">
+            <h2 className="mt-3 text-2xl font-semibold tracking-tight sm:text-3xl">
               想从知识库里了解什么？
             </h2>
             <p className="text-sm text-muted-foreground">

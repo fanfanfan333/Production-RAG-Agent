@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import re
 import threading
 from typing import TYPE_CHECKING
 
@@ -35,6 +36,34 @@ if TYPE_CHECKING:
     from app.services.retrieval_service import RetrievedChunk
 
 logger = get_logger(__name__)
+
+_FIGURE_REFERENCE = re.compile(r"(?:图表|图|Figure|Fig\.?)\s*(\d+(?:\.\d+)*)(?!\d|\s*年)", re.IGNORECASE)
+
+
+def image_reference_matches(query, chunk):
+    label = _FIGURE_REFERENCE.match(chunk.text.lstrip(" #\t\n")[:100]) if getattr(chunk, "content_type", None) == "image" else None
+    return bool(label and label.group(1) in set(_FIGURE_REFERENCE.findall(query)))
+
+
+def filter_evidence_references(query, chunks):
+    """Explicit figure labels and table years constrain evidence identity."""
+    requested = set(_FIGURE_REFERENCE.findall(query))
+    years = set(re.findall(r"(?<![0-9A-Za-z-])((?:19|20)\d{2})年", query))
+    all_years = set(re.findall(r"(?<!\d)(?:19|20)\d{2}(?!\d)", query))
+    requested_year = next(iter(years)) if len(years) == len(all_years) == 1 else None
+    from app.services.nodes.citation_verifier import _dates_for_check
+
+    kept = []
+    for chunk in chunks:
+        label = _FIGURE_REFERENCE.match(chunk.text.lstrip(" #\t\n")[:100]) if getattr(chunk, "content_type", None) == "image" else None
+        if requested and label is not None and label.group(1) not in requested:
+            continue
+        if requested_year and getattr(chunk, "content_type", None) in {"table", "image"}:
+            source_years = {date[:4] for date in _dates_for_check(chunk.text)}
+            if source_years and requested_year not in source_years:
+                continue
+        kept.append(chunk)
+    return kept
 
 
 def _sigmoid(x: float) -> float:
@@ -270,13 +299,14 @@ class ChunkReranker:
             return []
 
         # bge-reranker 系列的窗口只有 512 token，超长部分本来就截断；
-        # 先按字符截到 RERANKER_MAX_TEXT_CHARS，省掉无效 tokenization
+        # 先按查询选取证据到 RERANKER_MAX_TEXT_CHARS，避免只读开头漏掉结论并省掉无效 tokenization
         # 与推理开销（粗排候选是 1000~2000 字的块，父块回填后更长）。
         settings = get_settings()
         limit = settings.RERANKER_MAX_TEXT_CHARS
         batch_size = max(1, int(getattr(settings, "RERANKER_BATCH_SIZE", 4)))
         if limit > 0:
-            texts = [t[:limit] for t in texts]
+            from app.services.nodes.context_builder import compress_text
+            texts = [compress_text(t, query, limit) for t in texts]
 
         if self._backend == "flagreranker":
             raw = self._model.compute_score(
@@ -370,6 +400,7 @@ async def rerank_chunks(
     - 精排失败或输出非法时返回空证据，交给上游重试/拒答，不能用粗排分冒充精排分。
     """
     settings = get_settings()
+    chunks = filter_evidence_references(query, chunks)
     if not chunks:
         return []
     if top_k <= 0:

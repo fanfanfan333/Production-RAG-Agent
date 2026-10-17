@@ -83,37 +83,31 @@ async def validate_document_upload(file: UploadFile, settings=None) -> bytes:
         )
 
     # 3. Magic bytes verification (prevent MIME spoofing)
-    header = content[:8]
+    header = content[:12]
     is_valid_magic = False
     
-    if ext == "pdf" and header.startswith(b"%PDF-"):
-        is_valid_magic = True
-    elif ext in {"docx", "pptx", "xlsx"} and header.startswith(b"PK\x03\x04"):
-        is_valid_magic = True
+    if ext == "pdf":
+        is_valid_magic = header.startswith(b"%PDF-")
+    elif ext in {"docx", "pptx", "xlsx"}:
+        is_valid_magic = header.startswith(b"PK\x03\x04")
     elif ext == "doc":
         # .doc 的唯一合法容器是 OLE2。必须在这里给出结论，不能落到末尾
         # "其它格式默认放行"的分支 —— 否则任意文件改个 .doc 后缀就能送进
         # 解析器（测试 test_upload_rejects_doc_with_wrong_magic_* 覆盖此点）。
         is_valid_magic = header.startswith(_OLE2_MAGIC)
-    elif ext == "png" and header.startswith(b"\x89PNG\r\n\x1a\n"):
-        is_valid_magic = True
-    elif ext in {"jpg", "jpeg"} and header.startswith(b"\xff\xd8\xff"):
-        is_valid_magic = True
+    elif ext == "png":
+        is_valid_magic = header.startswith(b"\x89PNG\r\n\x1a\n")
+    elif ext in {"jpg", "jpeg"}:
+        is_valid_magic = header.startswith(b"\xff\xd8\xff")
+    elif ext == "tiff":
+        is_valid_magic = header[:4] in {b"II*\x00", b"MM\x00*", b"II+\x00", b"MM\x00+"}
+    elif ext == "bmp":
+        is_valid_magic = header.startswith(b"BM")
+    elif ext == "webp":
+        is_valid_magic = header.startswith(b"RIFF") and header[8:12] == b"WEBP"
     elif ext in {"txt", "md", "markdown", "csv", "json", "log"}:
-        # Text files don't have standard magic bytes; verify they contain valid text
-        # Attempt decoding with UTF-8, Windows-1252, and Latin-1 fallbacks, ensuring no null bytes
-        is_valid_magic = False
-        for encoding in ["utf-8", "windows-1252", "latin-1"]:
-            try:
-                decoded = content[:1024].decode(encoding)
-                if "\x00" not in decoded:
-                    is_valid_magic = True
-                    break
-            except UnicodeDecodeError:
-                continue
-    else:
-        # Fallback for other image formats (tiff, bmp, webp) if not strictly checked
-        is_valid_magic = True
+        # Latin-1 fallback accepts every byte; reject NUL across the complete bounded upload.
+        is_valid_magic = b"\x00" not in content
         
     if not is_valid_magic:
         detail = _MAGIC_MISMATCH_HINTS.get(

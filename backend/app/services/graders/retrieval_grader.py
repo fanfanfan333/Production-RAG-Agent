@@ -39,6 +39,7 @@ from langchain_ollama import ChatOllama
 
 from app.config import get_settings
 from app.services.prompt_security import sanitize_document_context
+from app.services.nodes.context_builder import compress_text
 from app.services.retrieval_service import RetrievedChunk
 from app.utils.logging import get_logger
 from app.utils.timing import timed_stage
@@ -60,6 +61,9 @@ _GRADER_SYSTEM_PROMPT = """\
    例如问题问"营收增长率"，片段只讲了"利润率"→ 判 irrelevant。
 2. 片段只要包含部分有用信息就判 relevant（不需要完整回答）。
 3. 不要评估片段的真伪，只判断相关性。
+4. 多跳问题允许多个片段共同构成有证据的关系链：例如“A投资B”和“B位于C”
+   可以共同回答“A投资的企业在哪里”，两个环节均 relevant；不能要求每片都包含整条链。
+   同名或编号相近本身不是关系证据，不得据此补全缺失环节。
 
 只输出一个 JSON 对象，不要任何解释：
 {"verdicts": ["relevant", "irrelevant", ...]}
@@ -144,7 +148,7 @@ async def grade_retrieval(
             num_gpu=settings.OLLAMA_NUM_GPU,
         )
 
-        # 每条证据截断，避免长文档把 prompt 撑爆（判定相关性看开头足够）。
+        # Keep relevant tail sentences within the same budget instead of discarding them.
         # 喂给 grader 的内容**必须**先 sanitize_document_context —— 文档是
         # 不可信数据；不洗的话，poisoned 段落可以直接把 grader 撬成"relevant"，
         # 让生成节点顺着被污染的上下文继续答。context_builder 那层只覆盖了
@@ -153,8 +157,8 @@ async def grade_retrieval(
         evidence_lines: list[str] = []
         masked_count = 0
         for i, c in enumerate(assessed, start=1):
-            snippet = c.text[:600].replace("\n", " ")
-            safe_snippet, was_masked = sanitize_document_context(snippet)
+            safe_text, was_masked = sanitize_document_context(c.text)
+            safe_snippet = compress_text(safe_text, query, 600).replace("\n", " ")
             if was_masked:
                 masked_count += 1
             evidence_lines.append(

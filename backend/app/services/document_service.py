@@ -701,6 +701,7 @@ async def _run_ingestion(
             max_chunk_size=settings.MAX_CHUNK_SIZE,
             chunk_overlap=settings.CHUNK_OVERLAP,
             page_resolver=extraction.page_for_offset,
+            page_boundaries=[page.char_start for page in extraction.pages],
             enable_small_to_big=(
                 settings.HIERARCHICAL_RAG_ENABLED and not settings.PARENT_CHILD_ENABLED
             ),

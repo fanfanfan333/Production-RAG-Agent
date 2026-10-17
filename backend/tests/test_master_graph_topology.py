@@ -42,7 +42,6 @@ if _BACKEND_ROOT not in sys.path:
     sys.path.insert(0, _BACKEND_ROOT)
 
 # Settings 需要 POSTGRES_PASSWORD；测试环境给个占位值（不真正连库）
-os.environ.setdefault("POSTGRES_PASSWORD", "test-placeholder")
 
 # ── 轻量化导入 ────────────────────────────────────────────────────────────────
 # 本测试只关心**图谱拓扑**，不跑上传管线。但 `app.services/__init__.py` 会

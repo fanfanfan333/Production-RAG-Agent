@@ -59,23 +59,23 @@ export function DashboardContent() {
       <HealthStatus />
 
       <div className="grid gap-6 lg:grid-cols-5">
-        <div className="lg:col-span-3">
+        <div className="min-w-0 lg:col-span-3">
           <UploadCard disabled={false} onUploadComplete={refetch} />
         </div>
-        <div className="lg:col-span-2">
+        <div className="min-w-0 lg:col-span-2">
           <QuickActions />
         </div>
       </div>
 
       <div className="grid gap-6 lg:grid-cols-5">
-        <div className="lg:col-span-3">
+        <div className="min-w-0 lg:col-span-3">
           <RecentDocuments
             documents={documents}
             loading={loading}
             error={error}
           />
         </div>
-        <div className="lg:col-span-2">
+        <div className="min-w-0 lg:col-span-2">
           <RecentConversations
             conversations={conversations}
             loading={conversationsLoading}

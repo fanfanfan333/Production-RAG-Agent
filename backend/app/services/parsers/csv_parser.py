@@ -8,9 +8,16 @@ logger = get_logger(__name__)
 class CsvParser(DocumentParser):
     def parse(self, content: bytes, filename: str, *, document_id: str | None = None, tenant_id: str | None = None) -> ExtractionResult:
         try:
-            # Read CSV and convert to string representation
-            df = pd.read_csv(io.BytesIO(content))
-            full_text = df.to_string(index=False)
+            # 保留标识符前导零、空单元格和列边界，不能把 CSV 压成对齐空白文本。
+            df = pd.read_csv(io.BytesIO(content), dtype=str, keep_default_na=False)
+            if df.empty:
+                raise ValueError("CSV has no data rows")
+            def row_text(values):
+                return "| " + " | ".join(str(value).replace("|", "\\|").replace("\r\n", "<br>").replace("\n", "<br>") for value in values) + " |"
+            full_text = "\n".join([
+                row_text(df.columns), row_text(["---"] * len(df.columns)),
+                *(row_text(row) for row in df.itertuples(index=False, name=None)),
+            ])
         except Exception as exc:
             raise ValueError(f"Cannot open CSV '{filename}': {exc}") from exc
 

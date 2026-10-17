@@ -2237,13 +2237,19 @@ async def retrieve_chunks(
         top_vector_score = valid_candidates[0].score if valid_candidates else 0.0
         gap_cutoff = top_vector_score - settings.RETRIEVAL_MAX_GAP
 
+        from app.services.reranker import filter_evidence_references, image_reference_matches
+
+        reference_keys = {key for key, chunk in merged.items() if image_reference_matches(query, chunk)}
         survivors = [
             (key, c)
             for key, c in merged.items()
             if (c.score >= settings.RETRIEVAL_MIN_SCORE and c.score >= gap_cutoff)
             or key in strong_keyword
             or key in graph_keys
+            or key in reference_keys
         ]
+        compatible_keys = {_chunk_key(chunk) for chunk in filter_evidence_references(query, [chunk for _, chunk in survivors])}
+        survivors = [(key, chunk) for key, chunk in survivors if key in compatible_keys]
         survivors.sort(
             key=lambda kc: fused_scores.get(kc[0], 0.0), reverse=True
         )

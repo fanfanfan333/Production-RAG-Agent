@@ -8,11 +8,34 @@ import pytest
 
 from app.services import reranker as rr
 
+def test_explicit_figure_number_excludes_other_images_without_changing_scores():
+    target = SimpleNamespace(text="图表2\n收入531万元", content_type="image", score=.8)
+    wrong = SimpleNamespace(text="图表6项目收入655万元", content_type="image", score=.99)
+    text = SimpleNamespace(text="图表说明", content_type="text", score=.7)
+    assert rr.filter_evidence_references("图表2中2025年的收入", [wrong, target, text]) == [target, text]
+    assert target.score == .8
+    assert rr.filter_evidence_references("图表2和图表6比较", [wrong, target]) == [wrong, target]
+    assert rr.filter_evidence_references("2025年收入", [wrong, target]) == [wrong, target]
+    assert rr.filter_evidence_references("图表2的收入", [SimpleNamespace(text="图表20收入", content_type="image")]) == []
+    assert rr.image_reference_matches("图表2的收入", target)
+    assert not rr.image_reference_matches("图表2的收入", wrong)
+    assert rr.filter_evidence_references("图表2的收入", [wrong] * 12 + [target])[:12] == [target]
 
 def test_dedup_preserves_different_tails():
     prefix = "共同前文" * 300
     chunks = [SimpleNamespace(text=prefix + tail) for tail in ("答案一", "答案二", "答案一")]
     assert rr.dedup_candidates(chunks) == chunks[:2]
+
+
+def test_table_year_identity_keeps_undated_and_comparison_evidence():
+    current = SimpleNamespace(text="2023年预算407万元", content_type="table")
+    old = SimpleNamespace(text="2022年预算307万元", content_type="image")
+    undated = SimpleNamespace(text="预算情况", content_type="table")
+    multi = SimpleNamespace(text="| 年份 | 预算 |\n| --- | --- |\n| 2022 | 307 |\n| 2023 | 407 |", content_type="table")
+    chunks = [old, current, undated, multi]
+    assert rr.filter_evidence_references("2023年预算", chunks) == [current, undated, multi]
+    assert rr.filter_evidence_references("2022年和2023年比较", chunks) == chunks
+    assert rr.filter_evidence_references("ABX-2023预算", chunks) == chunks
 
 
 @pytest.mark.parametrize("backend", ["flagreranker", "cross_encoder"])
@@ -65,3 +88,18 @@ def test_shared_reranker_limits_concurrent_model_forwards(monkeypatch):
     async def run():
         return await asyncio.gather(*(scorer.score_pairs("q", ["text"], [.2]) for _ in range(3)))
     assert asyncio.run(run()) == [[.5]] * 3 and peak == 1
+
+
+def test_reranker_scores_query_relevant_tail_within_existing_budget(monkeypatch):
+    pairs_seen = []
+    def compute_score(pairs, **kwargs):
+        pairs_seen.extend(pairs)
+        return [1.0]
+    scorer = object.__new__(rr.ChunkReranker)
+    scorer._backend = 'flagreranker'
+    scorer._model = SimpleNamespace(compute_score=compute_score)
+    monkeypatch.setattr(rr, 'get_settings', lambda: SimpleNamespace(RERANKER_MAX_TEXT_CHARS=600))
+    text = 'Unrelated summary conditions. ' * 80 + '\n\nGraph indexing took 281 minutes for the Podcast dataset.'
+    scorer._score_pairs_sync('Podcast graph indexing time minutes', [text], [.5])
+    assert '281 minutes' in pairs_seen[0][1]
+    assert len(pairs_seen[0][1]) <= 600

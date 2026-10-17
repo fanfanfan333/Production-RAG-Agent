@@ -37,7 +37,6 @@ from unittest.mock import patch
 _BACKEND_ROOT = str(Path(__file__).resolve().parent.parent)
 if _BACKEND_ROOT not in sys.path:
     sys.path.insert(0, _BACKEND_ROOT)
-os.environ.setdefault("POSTGRES_PASSWORD", "test-placeholder")
 os.environ.setdefault("BADCASE_AUTO_CAPTURE", "false")
 
 if "app.services" not in sys.modules:

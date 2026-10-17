@@ -387,11 +387,11 @@ def test_jwt_secret_startup_policy():
     assert jwt_secret_must_fail_startup(strong, allow_insecure_jwt=True) is False
 
 
-def test_current_env_bootable_with_escape_hatch():
-    """本仓库 .env 使用弱默认密钥 + ALLOW_INSECURE_JWT=true，启动不应被阻断。"""
-    from app.config import get_settings
+def test_development_escape_hatch_boots_without_dotenv():
+    """显式开发开关可启动；不依赖本机 .env，也不放宽生产默认值。"""
+    from app.config import Settings
 
-    s = get_settings()
+    s = Settings(_env_file=None, POSTGRES_PASSWORD="test-only", JWT_SECRET="weak", ALLOW_INSECURE_JWT=True, DEBUG=False)
     assert jwt_secret_must_fail_startup(
         s.JWT_SECRET, allow_insecure_jwt=s.ALLOW_INSECURE_JWT, debug=s.DEBUG
     ) is False, "开发环境（弱默认密钥 + 显式 escape）必须仍可启动"

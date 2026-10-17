@@ -26,7 +26,6 @@ from unittest.mock import patch
 _BACKEND_ROOT = str(Path(__file__).resolve().parent.parent)
 if _BACKEND_ROOT not in sys.path:
     sys.path.insert(0, _BACKEND_ROOT)
-os.environ.setdefault("POSTGRES_PASSWORD", "test-placeholder")
 # 图谱级测试不连库：关掉 Bad Case 自动回流（否则每条用例都会尝试写 DB 并打警告）
 os.environ.setdefault("BADCASE_AUTO_CAPTURE", "false")
 

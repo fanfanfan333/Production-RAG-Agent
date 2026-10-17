@@ -237,12 +237,12 @@ def test_bm25_leg_branch_uses_replace():
 
 # ── 6. 空 token 句 support=1.0（有意取舍，固化行为）──────────────────────────
 
-def test_support_ratio_empty_tokens_lenient_by_design():
+def test_support_ratio_empty_claim_is_not_evidence():
     from app.services.nodes import citation_verifier as cv
 
-    # 内容为空（纯标点）→ 不因支持度判负（模块「宁可漏判、不可错杀」取舍）
-    assert cv._support_ratio("……", "任意原文内容") == 1.0
-    assert cv._support_ratio("🙂", "任意原文内容") == 1.0
+    # 没有待校验陈述时，不能把孤立引用记作受原文支持。
+    assert cv._support_ratio("……", "任意原文内容") == 0.0
+    assert cv._support_ratio("🙂", "任意原文内容") == 0.0
 
 
 # ── 7. 命中句定位只用 display_text（固化行为）───────────────────────────────

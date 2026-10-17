@@ -1315,6 +1315,7 @@ def build_chunks(
     parent_size_multiplier: float | None = None,
     parent_overlap: int | None = None,
     default_content_type: str = "text",
+    page_boundaries: list[int] | None = None,
 ) -> list[TextChunk]:
     """
     Parse *text* into adaptive semantic chunks, preserving structural metadata.
@@ -1355,14 +1356,16 @@ def build_chunks(
     if effective_overlap >= effective_max:
         effective_overlap = max(1, effective_max // 5)
 
-    semantic_chunks = _adaptive_chunk(
-        text,
-        effective_min,
-        effective_max,
-        effective_overlap,
-        sentence_overlap=sentence_overlap,
-        protect_blocks=protect_blocks,
-    )
+    # 子块不能跨物理页，否则页末的证据会错误引用到上一页。
+    boundaries = sorted({0, len(text), *(p for p in (page_boundaries or []) if 0 < p < len(text))})
+    semantic_chunks = [
+        (start, chunk)
+        for start, end in zip(boundaries, boundaries[1:])
+        for chunk in _adaptive_chunk(
+            text[start:end], effective_min, effective_max, effective_overlap,
+            sentence_overlap=sentence_overlap, protect_blocks=protect_blocks,
+        )
+    ]
 
     result: list[TextChunk] = []
     search_start = 0
@@ -1395,7 +1398,8 @@ def build_chunks(
             parent_overlap,
         )
 
-    for idx, schunk in enumerate(semantic_chunks):
+    for idx, (page_start, schunk) in enumerate(semantic_chunks):
+        search_start = max(search_start, page_start)
         raw = schunk.text
         pos = _locate_chunk(text, stripped_text, pos_map, raw, search_start)
         if pos == -1:

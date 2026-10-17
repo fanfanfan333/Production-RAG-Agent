@@ -400,14 +400,14 @@ async def build_multimodal_context(
             # ── Context Compression：查询感知的句子级压缩 ────────────────────
             if compression_on and per_source_budget > 0:
                 allowance = per_source_budget
-                if remaining_total > 0:
+                if settings.CONTEXT_MAX_TOTAL_CHARS > 0:
                     allowance = min(
                         allowance,
                         max(remaining_total, settings.CONTEXT_MIN_SOURCE_CHARS),
                     )
                 if allowance < len(safe_text):
                     safe_text = compress_text(safe_text, query, allowance)
-                if remaining_total > 0:
+                if settings.CONTEXT_MAX_TOTAL_CHARS > 0:
                     remaining_total -= len(safe_text)
 
             block = MultimodalBlock(

@@ -25,7 +25,6 @@ if str(_BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(_BACKEND_ROOT))
 
 # Settings 必填项，避免因缺 .env 而失败（只影响本测试进程）
-os.environ.setdefault("POSTGRES_PASSWORD", "test-only")
 
 # 桩包：避免触发 app/services/__init__.py 的重依赖
 if "app.services" not in sys.modules:

@@ -384,3 +384,15 @@ def test_master_graph_uses_one_scoped_retrieval_and_filters_evidence_paths(monke
     monkeypatch.setattr(reranker, "rerank_chunks", duplicate_rerank)
     result = asyncio.run(master._retrieve_node(dict(query="甲的关联", top_k=5, user_scope="scope", retrieval_strategy="hybrid_graph")))
     assert len(calls) == 1 and result["graph_paths"] == [dict(document_id="visible", chunk_index=0)]
+
+
+def test_acceptance_scores_the_final_visible_answer():
+    from scripts.evaluate_professional import score, aggregate
+    case = dict(id='test', category='fact', expect_sources=[], answer='125')
+    events = [dict(type='chunk', content='125 [Source 1]'),
+              dict(type='citation_check', sanitized_answer='无法确定'), dict(type='done')]
+    result = score(case, events, 1, 1)
+    assert result['answer'] == '无法确定'
+    assert not result['answer_literal_match']
+    assert result['visible_citations'] == 0
+    assert aggregate([result])['citation_coverage'] == 0

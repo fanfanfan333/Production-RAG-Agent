@@ -34,7 +34,11 @@ def score(case, events, elapsed, first_token):
         if kind == "sources": sources = event.get("sources", [])
         elif kind == "chunk": answer += event.get("content", "")
         elif kind == "stage_timing": stages[event["stage"]] = stages.get(event["stage"], 0) + event["duration_ms"]
-        elif kind == "citation_check": citation = event
+        elif kind == "citation_check":
+            citation = event
+            if isinstance(event.get("sanitized_answer"), str): answer = event["sanitized_answer"]
+        elif kind == "output_guard" and isinstance(event.get("sanitized_answer"), str):
+            answer = event["sanitized_answer"]
         elif kind == "done": done = True
         elif kind == "error": error = event.get("message", "unknown error")
         elif kind == "graph_retrieval": paths = event.get("paths", [])
@@ -68,6 +72,7 @@ def score(case, events, elapsed, first_token):
             "mrr": 1 / min(ranks) if ranks else (0 if expected else None),
             "answer_literal_match": correct and numeric_match is not False, "numeric_unit_match": numeric_match,
             "citation_total": citation.get("total", 0), "citation_passed": citation.get("passed", 0),
+            "visible_citations": len(re.findall(r"\[Source\s+\d+(?:-\d+)?\]", answer)),
             "ttft_ms": first_token, "total_ms": elapsed, "stages_ms": stages, "error": error,
             "completed": done, "answer": answer, "sources": sources, "graph_paths": paths,
             "query": case.get("query"), "reference_answer": truth, "source_locations": case.get("source_locations", []),
@@ -84,7 +89,7 @@ def aggregate(rows):
     return {"cases": len(rows), "recall@5": mean("recall@5"), "mrr": mean("mrr"),
             "answer_literal_match": mean("answer_literal_match"), "numeric_unit_match": mean("numeric_unit_match"),
             "citation_support_rate": sum(row["citation_passed"] for row in rows) / total if total else None,
-            "citation_coverage": sum(row["citation_total"] > 0 for row in positives) / len(positives) if positives else None,
+            "citation_coverage": sum(row["visible_citations"] > 0 for row in positives) / len(positives) if positives else None,
             "graph_used_cases": sum(bool(row["graph_paths"]) for row in rows),
             "retrieval_p95_ms": retrieval[math.ceil(.95 * len(retrieval)) - 1] if retrieval else None,
             "ttft_mean_ms": mean("ttft_ms"), "total_mean_ms": mean("total_ms"),

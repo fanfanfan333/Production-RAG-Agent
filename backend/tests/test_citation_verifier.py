@@ -48,6 +48,19 @@ _spec.loader.exec_module(_mod)
 
 verify_citations = _mod.verify_citations
 extract_numbers = _mod.extract_numbers
+
+
+def test_separately_cited_comma_claims_keep_their_own_numbers():
+    sources = _sources("项目预算200万元。", "另一记录预算100万元。")
+    report = verify_citations("项目预算200万元 [Source 1]，另一记录预算100万元 [Source 2]。", sources)
+    assert all(check.numbers_consistent for check in report.verdicts)
+
+
+def test_uncited_tail_and_joint_claim_cannot_escape_numeric_checks():
+    sources = _sources("项目预算200万元。", "另一记录预算100万元。")
+    for answer in ["项目预算200万元 [Source 1]，实际预算999万元。", "预算200和100万元 [Source 1][Source 2]。"]:
+        report = verify_citations(answer, sources)
+        assert any(not check.numbers_consistent for check in report.verdicts)
 extract_dates = _mod.extract_dates
 split_sentences = _mod.split_sentences
 split_sentences_with_spans = _mod.split_sentences_with_spans
@@ -72,6 +85,25 @@ def _sources(*texts: str) -> list[dict]:
 
 
 # ── 工具函数 ─────────────────────────────────────────────────────────────────
+
+def test_budget_heading_year_supports_table_answer_without_hiding_wrong_year():
+    sources = _sources("## 2021预算\n\n| 部门 | 金额 | 单位 |\n| --- | --- | --- |\n| 部门2 | 207 | 万元 |")
+    report = verify_citations("2021年部门2的预算为207万元 [Source 1]。", sources)
+    assert report.verdicts[0].dates_consistent
+    assert report.verdicts[0].passed
+    wrong = verify_citations("2022年部门2的预算为207万元 [Source 1]。", sources)
+    assert not wrong.verdicts[0].dates_consistent
+    assert extract_dates("设备功率2021瓦，编号12021预算") == set()
+
+
+def test_year_column_supports_date_but_amount_column_does_not():
+    table = "| 项目 | 年度 | 预算（万元） |\n| --- | --- | --- |\n| CSV-ACCEPT | 2024 | 4321 |"
+    assert "2024" in _mod._dates_for_check(table)
+    assert "2024" not in _mod._dates_for_check("| 项目 | 预算 |\n| --- | --- |\n| A | 2024 |")
+    correct = verify_citations("CSV-ACCEPT项目2024年预算为4321万元 [Source 1]。", _sources(table))
+    assert correct.verdicts[0].dates_consistent
+    wrong = verify_citations("CSV-ACCEPT项目2023年预算为4321万元 [Source 1]。", _sources(table))
+    assert not wrong.verdicts[0].dates_consistent
 
 def test_extract_numbers_normalizes():
     got = extract_numbers("营收 1,200 万元，同比增长 12.5%，覆盖率 95%")
@@ -226,17 +258,7 @@ def test_range_citation_out_of_bounds():
 
 
 def test_range_citation_keeps_surviving_indices():
-    """
-    回归：区间引用只删“坏”的下标，保留存活的下标（不再整条抹掉）.
-
-    缺陷：旧 `_drop` 只要区间内命中任意一个坏下标就 `return ""`，把整条
-    `[Source 1-3]` 连合法的 1、3 一起删 —— 一句本来有出处的话变成裸句，
-    溯源断链。这与本模块自己写明的原则冲突：宁可漏判，不可错杀。
-
-    构造：句1 用 `[Source 1-3]`（区间被整体判为支持，故 1 不是坏下标）；
-    句2 单引 `[Source 2]` 且判为不支持 → bad_indices={2}。此时区间
-    `[Source 1-3]` 必须只剩 1 与 3，单引的 2 被删除。
-    """
+    """An invalid occurrence cannot invalidate an independently supported range."""
     sources = _sources(
         "甲方应在合同生效后三十日内支付首付款。",
         "乙方应在验收合格后提供原始凭证。",
@@ -251,9 +273,8 @@ def test_range_citation_keeps_surviving_indices():
     # 下标 2 判为不支持（其独立引用被删）
     assert 2 in report.unsupported_indices, report.as_audit()
     # 区间引用里合法的 1、3 必须保留，坏掉的 2 必须删掉
-    assert "[Source 1]" in report.clean_text, report.clean_text
-    assert "[Source 3]" in report.clean_text, report.clean_text
-    assert "Source 2" not in report.clean_text, report.clean_text
+    assert "[Source 1-3]" in report.clean_text, report.clean_text
+    assert "[Source 2]" not in report.clean_text, report.clean_text
     print("[OK] test_range_citation_keeps_surviving_indices")
 
 
@@ -674,3 +695,19 @@ if __name__ == "__main__":
     for t in tests:
         t()
     print(f"\nAll {len(tests)} citation-verifier tests passed.")
+
+
+def test_trailing_citation_checks_the_preceding_claim():
+    correct = verify_citations('预算为100万元。[Source 1]', _sources('预算为100万元。'))
+    assert correct.verdicts[0].passed
+    wrong = verify_citations('预算为999万元。[Source 1]', _sources('预算为100万元。'))
+    assert not wrong.verdicts[0].passed
+    assert not wrong.verdicts[0].numbers_consistent
+    assert not verify_citations('[Source 1]', _sources('预算为100万元。')).verdicts[0].passed
+
+
+def test_bad_occurrence_does_not_erase_valid_citation_to_same_source():
+    report = verify_citations("预算200万元 [Source 1]。预算999万元 [Source 1]。", _sources("预算200万元。"), annotate=False)
+    assert report.clean_text.count("[Source 1]") == 1
+    assert "200万元 [Source 1]" in report.clean_text
+    assert "999万元 [Source 1]" not in report.clean_text

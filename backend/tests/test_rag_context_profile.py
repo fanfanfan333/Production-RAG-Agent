@@ -13,7 +13,7 @@ def test_local_profile_preserves_the_rag_evidence_window():
     environment = profile["services"]["backend"]["environment"]
     assert int(environment["OLLAMA_NUM_CTX"]) >= 8192
     assert int(environment["MAX_CONCURRENT_EMBEDDINGS"]) == 1
-    assert int(environment["OLLAMA_KEEP_ALIVE_SECONDS"]) == 0
+    assert environment["OLLAMA_KEEP_ALIVE_SECONDS"] == "${OLLAMA_KEEP_ALIVE_SECONDS:-0}"
     assert environment["HF_HUB_OFFLINE"] == "1"
 
 

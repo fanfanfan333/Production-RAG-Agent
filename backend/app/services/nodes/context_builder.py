@@ -40,7 +40,10 @@ _SENT_RE = re.compile(r"[^。！？!?；;\n]+[。！？!?；;]?")
 
 def _split_sentences(text: str) -> list[str]:
     """中英文通用的轻量分句（。！？!?；; 与换行都是句子边界）."""
-    return [m.group(0).strip() for m in _SENT_RE.finditer(text) if m.group(0).strip()]
+    sentences = []
+    for match in _SENT_RE.finditer(text):
+        sentences.extend(part.strip() for part in re.split(r"(?<=[.!?])\s+(?=[A-Z0-9])", match.group(0)) if part.strip())
+    return sentences
 
 
 def compress_text(body: str, query: str | None, budget: int) -> str:
@@ -59,7 +62,10 @@ def compress_text(body: str, query: str | None, budget: int) -> str:
     if budget <= 0 or len(body) <= budget:
         return body
 
-    sentences = _split_sentences(body)
+    # 保留短段落中的实体与后续代词/数值关系，避免只留下 "The corpus ..."。
+    paragraphs = [part.strip() for part in re.split(r"\n\s*\n", body) if part.strip()]
+    sentences = [unit for paragraph in paragraphs
+                 for unit in ([paragraph] if len(paragraph) <= budget else _split_sentences(paragraph))]
     if not sentences:
         return body[:budget]
 
@@ -77,7 +83,7 @@ def compress_text(body: str, query: str | None, budget: int) -> str:
     selected: list[int] = []
     used = 0
     for i in order:
-        length = len(sentences[i])
+        length = len(sentences[i]) + bool(selected)
         if used + length <= budget:
             selected.append(i)
             used += length
@@ -87,7 +93,7 @@ def compress_text(body: str, query: str | None, budget: int) -> str:
         return sentences[0][:budget]
 
     selected.sort()
-    return "".join(sentences[i] for i in selected)
+    return "\n".join(sentences[i] for i in selected)
 
 
 @dataclass
@@ -264,7 +270,7 @@ def build_context(
         # ── Context Compression：单源预算 + 总预算双重约束 ─────────────────
         if compression and per_source_budget > 0:
             allowance = per_source_budget
-            if remaining_total > 0:
+            if settings.CONTEXT_MAX_TOTAL_CHARS > 0:
                 allowance = min(
                     allowance,
                     max(remaining_total, settings.CONTEXT_MIN_SOURCE_CHARS),
@@ -274,7 +280,7 @@ def build_context(
                 if len(compressed_body) < len(safe_text):
                     compressed += 1
                 safe_text = compressed_body
-            if remaining_total > 0:
+            if settings.CONTEXT_MAX_TOTAL_CHARS > 0:
                 remaining_total -= len(safe_text)
 
         # 上下文头部带上"哪几行"：模型据此可以把引用写细，

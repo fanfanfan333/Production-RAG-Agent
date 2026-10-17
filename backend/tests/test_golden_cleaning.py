@@ -786,6 +786,22 @@ def test_llm_case_flags_empty_content_as_defect(monkeypatch) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def test_generated_xlsx_uses_valid_cell_coordinates(tmp_path) -> None:
+    import zipfile
+    from xml.etree import ElementTree
+    spec = importlib.util.spec_from_file_location("golden_fixture_generator", _GOLDEN_DIR / "make_golden_fixtures.py")
+    generator = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(generator)
+    path = tmp_path / "generated.xlsx"
+    generator.build_xlsx(path, [])
+    with zipfile.ZipFile(path) as archive:
+        root = ElementTree.fromstring(archive.read("xl/worksheets/sheet1.xml"))
+    ns = {"s": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+    refs = [cell.attrib["r"] for cell in root.findall(".//s:c", ns)]
+    assert refs[:4] == ["A1", "B1", "C1", "D1"]
+    assert "C4" in refs, "empty cells must preserve their column"
+
+
 def test_binary_fixtures_parseable() -> None:
     if os.environ.get("GOLDEN_BINARY", "0") != "1":
         _skip("GOLDEN_BINARY!=1：二进制样张解析用例默认关闭（样张未经第三方库验证）")
@@ -800,6 +816,9 @@ def test_binary_fixtures_parseable() -> None:
     for case in CASES:
         path = _CORPUS / f"{case['id']}.{case['format']}"
         parser = get_parser_for_file(path.name)
+        # These PNGs contain no glyphs; readable-image fixtures cover OCR separately.
+        if case["format"] == "png":
+            continue
         try:
             res = parser.parse(path.read_bytes(), path.name)
         except Exception as exc:      # noqa: BLE001
@@ -808,7 +827,7 @@ def test_binary_fixtures_parseable() -> None:
         if not (res.full_text or "").strip():
             problems.append(f"{case['id']}: 解析结果正文为空")
     assert not problems, "二进制样张解析失败:\n  " + "\n  ".join(problems)
-    print(f"  ok 二进制样张解析：{len(CASES)} 条")
+    print(f"  ok 二进制样张解析：{sum(case['format'] != 'png' for case in CASES)} 条；不含无文字 PNG")
 
 
 def main() -> None:

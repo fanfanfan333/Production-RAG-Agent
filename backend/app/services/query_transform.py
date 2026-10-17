@@ -348,10 +348,17 @@ async def rewrite_query(
     return result
 
 
+async def rewrite_query_bilingual(query: str, history_messages: list[BaseMessage] | None = None) -> RewriteResult:
+    """Retry cross-language misses without reusing the monolingual rewrite cache."""
+    return await _rewrite_query_impl(query, history_messages, bilingual=True)
+
+
 @timed_stage("query_rewrite")
 async def _rewrite_query_impl(
     query: str,
     history_messages: list[BaseMessage] | None = None,
+    *,
+    bilingual: bool = False,
 ) -> RewriteResult:
     """改写实现体：所有失败/回退分支都收敛到 RewriteResult(rewritten=query)."""
     settings = get_settings()
@@ -375,6 +382,8 @@ async def _rewrite_query_impl(
         return RewriteResult(rewritten=query, source="fastpath")
 
     cache_key = f"{query}\x00{history_fingerprint(history_messages)}"
+    if bilingual:
+        cache_key += "\x00bilingual"
     cached = _cache_get(cache_key, settings.QUERY_REWRITE_CACHE_TTL_SECONDS)
     if cached is not None:
         logger.debug("rewrite cache hit for query=%r", query[:60])
@@ -428,9 +437,16 @@ async def _rewrite_query_impl(
         else:
             user_block = f"当前问题：{query}"
 
+        system_prompt = _REWRITE_SYSTEM_PROMPT
+        if bilingual:
+            system_prompt += (
+                "\n上次检索未找到足够证据，候选文档主要为英文。"
+                "rewritten 仅输出原问题准确完整的英文翻译，程序会将其追加到原问题后；"
+                "不得补充原问题没有的事实、数字或条件。其他字段仍按原规则生成。"
+            )
         result = await asyncio.wait_for(
             llm.ainvoke([
-                SystemMessage(content=_REWRITE_SYSTEM_PROMPT),
+                SystemMessage(content=system_prompt),
                 HumanMessage(content=user_block),
             ]),
             timeout=settings.QUERY_REWRITE_TIMEOUT_SECONDS,
@@ -443,6 +459,11 @@ async def _rewrite_query_impl(
 
         # ── rewritten 过防漂移闸门 ────────────────────────────────────────────
         raw_rewritten = str(parsed.get("rewritten", "")).strip()[:400]
+        if bilingual:
+            if len(re.findall(r"[A-Za-z]", raw_rewritten)) >= 10 and set(_NUMBER_RE.findall(raw_rewritten)) == set(_NUMBER_RE.findall(query)):
+                raw_rewritten = f"{query} / {raw_rewritten}"
+            else:
+                raw_rewritten = query
         rewritten = query
         source = "original"
         drift = 1.0
@@ -514,10 +535,8 @@ async def _rewrite_query_impl(
                 len(hyde or ""), source,
             )
 
-        # 只在"真的产出过东西"时缓存 —— 缓存一次空结果没有收益，
-        # 还会让后续同样的瞬时故障一直被复用。
-        if source in ("llm", "drift_rejected") or variants or subqueries or hyde:
-            _cache_put(cache_key, result_obj, settings.QUERY_REWRITE_CACHE_MAX_ENTRIES)
+        # Valid unchanged answers also save an LLM call; exceptions and timeouts never reach this cache.
+        _cache_put(cache_key, result_obj, settings.QUERY_REWRITE_CACHE_MAX_ENTRIES)
         return result_obj
 
     except asyncio.TimeoutError:

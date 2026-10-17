@@ -1,0 +1,9 @@
+ARG RUNTIME_IMAGE=backend-backend:latest
+FROM ${RUNTIME_IMAGE}
+USER root
+RUN python -m pip install --no-cache-dir pytest==9.1.1 pip-audit==2.10.1
+USER appuser
+WORKDIR /workspace/backend
+ENV PYTHONPATH=/workspace/backend
+ENTRYPOINT ["python", "-m", "pytest"]
+CMD ["tests", "-q", "-p", "no:cacheprovider"]

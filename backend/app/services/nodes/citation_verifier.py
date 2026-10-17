@@ -67,6 +67,7 @@ _NUMBER_RE = re.compile(r"\d[\d,]*(?:\.\d+)?\s*(?:%|％|‰)?")
 # 日期：2024-01-31 / 2024/1/31 / 2024年1月31日 / 2024年1月 / 2024年
 _DATE_RE = re.compile(
     r"\d{4}\s*[-/年]\s*\d{1,2}(?:\s*[-/月]\s*\d{1,2}\s*日?)?|\d{4}\s*年"
+    r"|(?<!\d)(?:19|20)\d{2}(?=\s*(?:预算|年度|财年|年报|报告))"
 )
 
 # ── 排版标记（必须先剥掉，否则会被当成正文数字）──────────────────────────────
@@ -279,7 +280,21 @@ def _numbers_for_check(text: str) -> set[str]:
 
 def _dates_for_check(text: str) -> set[str]:
     """校验用日期视图：屏蔽溯源表达（书名里的年份不参与比对）."""
-    return extract_dates(_provenance_mask(text))
+    text = _provenance_mask(text)
+    dates = extract_dates(text)
+    year_columns = set()
+    for line in text.splitlines():
+        if not line.strip().startswith("|"):
+            year_columns = set()
+            continue
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        headers = {i for i, cell in enumerate(cells) if cell.casefold() in {"年", "年度", "年份", "统计年份", "year", "fiscal year"}}
+        if headers:
+            year_columns = headers
+        for i in year_columns:
+            if i < len(cells) and re.fullmatch(r"(?:19|20)\d{2}", cells[i]):
+                dates.add(cells[i])
+    return dates
 
 
 # ── 命中句回标（"答案实际用了哪几句"）────────────────────────────────────────
@@ -581,7 +596,7 @@ def _support_ratio(sentence: str, source_text: str) -> float:
     """句子内容词在被引原文中的覆盖率 ∈ [0, 1]."""
     sent_tokens = tokenize(_strip_citations(sentence))
     if not sent_tokens:
-        return 1.0                     # 无从判断 → 不因支持度判负（宁可漏判）
+        return 0.0                     # 孤立引用没有待校验陈述，不能记为支持
     src_tokens = set(tokenize(source_text))
     if not src_tokens:
         return 0.0
@@ -626,7 +641,23 @@ def verify_citations(
     sources = sources or []
     # 先剥排版标记（列表序号/标题井号）再分句：否则 "1. **反幻觉机制**：…" 里的
     # 列表序号会被当成正文数字，制造成片的"数字与原文不一致"假阳性。
-    sentences = split_sentences(prepare_for_checks(answer))
+    sentences = []
+    for sentence in split_sentences(prepare_for_checks(answer)):
+        # Independently cited comma clauses must be checked against their own source.
+        matches = list(_CITATION_RE.finditer(sentence))
+        fragments = []
+        start = 0
+        for current, following in zip(matches, matches[1:]):
+            separator = re.match(r"\s*[，,]\s*", sentence[current.end():following.start()])
+            if separator and tokenize(sentence[current.end() + separator.end():following.start()]):
+                fragments.append(sentence[start:current.end()])
+                start = current.end() + separator.end()
+        fragments.append(sentence[start:])
+        for fragment in fragments:
+            if sentences and _CITATION_RE.search(fragment) and not tokenize(_strip_citations(fragment)):
+                sentences[-1] += " " + fragment
+            else:
+                sentences.append(fragment)
 
     # 为每条 source 预取正文，避免重复拼接
     src_texts = [_source_text(s) for s in sources]
@@ -764,7 +795,10 @@ def verify_citations(
     bad_indices = set(unsupported) | set(hallucinated)
     clean_text = answer
     if strip_unsupported and bad_indices:
+        checks = iter(verdicts)
+
         def _drop(match: re.Match[str]) -> str:
+            check = next(checks)
             n = int(match.group(1))
             end = int(match.group(2)) if match.group(2) else n
             indices = list(range(n, end + 1))
@@ -773,7 +807,10 @@ def verify_citations(
             # 别处存在坏下标，这条本身无坏下标的引用就会被顺带删掉。
             if not indices:
                 return match.group(0)
-            keep = [i for i in indices if i not in bad_indices]
+            if check.passed:
+                return match.group(0)
+            # A bad occurrence must not erase valid citations to the same source elsewhere.
+            keep = [i for i in indices if 1 <= i <= len(sources)] if not check.citation_exists else []
             if not keep:
                 return ""
             if len(keep) == len(indices):

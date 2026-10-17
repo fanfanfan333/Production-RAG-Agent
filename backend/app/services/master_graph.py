@@ -44,6 +44,8 @@ rag_graph.py 里已经跑通的流式、历史落库、错误中文化、文档�
 
 from __future__ import annotations
 
+import re
+
 import asyncio
 import time
 import uuid
@@ -95,7 +97,7 @@ from app.services.prompt_security import (
     sanitize_document_context,
     sanitize_retrieval_query,
 )
-from app.services.query_transform import rewrite_query
+from app.services.query_transform import rewrite_query, rewrite_query_bilingual
 from app.services.rag_graph import (
     _RELATIONS_SYSTEM_TEMPLATE,
     _SYSTEM_TEMPLATE,
@@ -281,6 +283,13 @@ def _route_by_intent(state: MasterState) -> str:
 
 # ── 节点：Knowledge QA（rewrite → retrieve → grade）────────────────────────────
 
+def _english_evidence_for_chinese_query(state):
+    return bool(re.search(r"[\u4e00-\u9fff]", state["query"])) and any(
+        len(re.findall(r"[A-Za-z]", chunk.text)) > max(80, 3 * len(re.findall(r"[\u4e00-\u9fff]", chunk.text)))
+        for chunk in (state.get("chunks") or [])[:3]
+    )
+
+
 async def _rewrite_node(state: MasterState) -> dict:
     """
     Query Rewrite 节点（架构图 Query Rewrite）.
@@ -302,7 +311,9 @@ async def _rewrite_node(state: MasterState) -> dict:
     # 用 rewrite_query 而不是旧的 rewrite_query_with_history 包装：后者只回
     # (rewritten, variants)，把 subqueries 与 hyde 直接丢掉 —— 等于每轮都白花
     # 一次 LLM 生成（QUERY_DECOMPOSITION_ENABLED / QUERY_HYDE_ENABLED 默认开）。
-    result = await rewrite_query(
+    english_retry = is_retry and _english_evidence_for_chinese_query(state)
+    rewrite = rewrite_query_bilingual if english_retry else rewrite_query
+    result = await rewrite(
         query=state["query"],
         history_messages=state["history_messages"],
     )
@@ -521,6 +532,10 @@ async def _grade_node(state: MasterState) -> dict:
         query=state.get("rewritten_query") or state["query"],
         chunks=chunks,
     )
+
+    if good and not state.get("retry_count", 0) and _english_evidence_for_chinese_query(state):
+        # 跨语言词重叠可能来自标题；先对齐检索/压缩查询，再走同一证据门控。
+        good, reason = False, "cross_language_alignment"
 
     retry = state.get("retry_count", 0)
     if not good:
@@ -836,9 +851,12 @@ async def _generate_node(state: MasterState) -> dict:
 
     focused_query = (
         f"[指令：只回答下面这个问题。"
-        f"不要重复或以之前轮次的内容作为开头。]\n\n"
+        f"不要重复或以之前轮次的内容作为开头。每条结论紧跟来源标记；"
+        f"跨文档问题分步列出每条关系及对应引用，最后给结论。]\n\n"
         f"{state['query']}"
     )
+    if _english_evidence_for_chinese_query(state):
+        focused_query += "\n用中文简短回答，保留相关英文指标名称、数值和单位，每条事实标注来源。"
     messages: list[BaseMessage] = [
         SystemMessage(content=_SYSTEM_TEMPLATE.format(context=context_text)),
         *_trim_history(state["history_messages"]),
