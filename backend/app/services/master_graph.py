@@ -69,7 +69,7 @@ from app.services.monitoring_service import (
     record_query,
     record_refusal,
 )
-from app.services.nodes.citation_verifier import verify_citations
+from app.services.nodes.citation_verifier import source_quote_fallback, verify_citations
 from app.services.nodes.context_builder import build_context
 from app.services.nodes.document_summary_node import (
     build_overview_messages,
@@ -792,8 +792,7 @@ async def _citation_verifier_node(state: MasterState) -> dict:
     if not settings.CITATION_VERIFIER_ENABLED:
         return {}
 
-    report = verify_citations(
-        answer=answer,
+    verification_options = dict(
         sources=_sources_with_full_text(state),
         min_support=settings.CITATION_MIN_SUPPORT,
         misattribution_margin=settings.CITATION_MISATTRIBUTION_MARGIN,
@@ -805,9 +804,17 @@ async def _citation_verifier_node(state: MasterState) -> dict:
         evidence_min_ratio=settings.CITATION_EVIDENCE_MIN_RATIO,
         evidence_max_sentences=settings.CITATION_EVIDENCE_MAX_SENTENCES,
     )
+    report = verify_citations(answer=answer, **verification_options)
     record_citation_check(report)
 
+    generation_check = report.as_audit()
+    fallback = source_quote_fallback(report, verification_options["sources"]) if settings.CITATION_STRIP_UNSUPPORTED and _english_evidence_for_chinese_query(state) else None
+    if fallback:
+        report = verify_citations(answer=fallback, **verification_options)
     audit = report.as_audit()
+    if fallback:
+        audit["fallback"] = "source_quote"
+        audit["generation_check"] = generation_check
     # changed=True 表示净化真的改动了正文（移除了引用标记，或追加了校验脚注）。
     # 这个布尔值随 citation_check 事件下发，stream_master 据此决定是否回传
     # 净化后全文 —— 与 output_guard 同样的道理：token 已经流式发出无法撤回，
@@ -852,11 +859,19 @@ async def _generate_node(state: MasterState) -> dict:
     focused_query = (
         f"[指令：只回答下面这个问题。"
         f"不要重复或以之前轮次的内容作为开头。每条结论紧跟来源标记；"
-        f"跨文档问题分步列出每条关系及对应引用，最后给结论。]\n\n"
+        f"跨文档问题每一步必须换行，每行只陈述一条关系并紧跟支持这一步的引用，"
+        f"不要把两步合并成一句，不要追加注释或重复关系，最后给结论。"
+        f"遇到冲突，分别列出各来源的事实和引用，最后只写‘无法确定，需要核实’，"
+        f"不要给这句不确定性说明重复附加引用。]\n\n"
         f"{state['query']}"
     )
     if _english_evidence_for_chinese_query(state):
-        focused_query += "\n用中文简短回答，保留相关英文指标名称、数值和单位，每条事实标注来源。"
+        focused_query += (
+            "\n用中文简短回答，每条事实标注来源。为便于核对，在中文解释前附上直接支持答案的"
+            "一小段连续英文原文（只取相关指标及数值，不超过25个英文单词），"
+            "原文和中文解释放在同一句，最后标注该来源，不要把原文另放到下一段；原样保留单位，"
+            "不要扩写无关实验配置，也不要改写英文原文。"
+        )
     messages: list[BaseMessage] = [
         SystemMessage(content=_SYSTEM_TEMPLATE.format(context=context_text)),
         *_trim_history(state["history_messages"]),
@@ -1660,7 +1675,7 @@ async def stream_master(
 
             kind = event["event"]
             name = event.get("name", "")
-            if kind == "on_chain_start" and name in {"route", "retrieve", "multimodal_context", "evidence_gate", "generate", "citation_verifier"}:
+            if kind == "on_chain_start" and name in {"route", "rewrite", "retrieve", "grade", "multimodal_context", "evidence_gate", "generate", "citation_verifier", "output_guard", "save_history"}:
                 stage_started[name] = time.perf_counter()
             elif kind == "on_chain_end" and name in stage_started:
                 yield {"type": "stage_timing", "stage": name,
@@ -1765,6 +1780,7 @@ async def stream_master(
                         "number_mismatch": check.get("number_mismatch", []),
                         "date_mismatch": check.get("date_mismatch", []),
                         "verdicts": check.get("verdicts", []),
+                        **({"fallback": check["fallback"], "generation_check": check["generation_check"]} if check.get("fallback") else {}),
                         "sanitized_answer": (
                             sanitized
                             if check.get("changed")

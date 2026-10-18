@@ -31,8 +31,10 @@ def compare(baseline, graph):
             "multihop_gain_pp": round(gain * 100, 2), "multihop_gate": gain >= .1,
             "ordinary_no_regression": all(not left[key]["answer_literal_match"] or right[key]["answer_literal_match"] for key in ordinary),
             "latency_gate": bool(baseline_latency and graph_latency is not None and graph_latency <= 1.2 * baseline_latency),
-            "recall_gate": (summary.get("recall@5") or 0) >= .9,
-            "citation_gate": (summary.get("citation_support_rate") or 0) >= .95 and (summary.get("citation_coverage") or 0) >= .95,
+            "recall_gate": (summary.get("recall@5") or 0) >= .95,
+            "citation_gate": (summary.get("citation_support_rate") or 0) >= .98 and (summary.get("citation_coverage") or 0) == 1,
+            "evidence_chain_gate": all(row.get("citation_source_recall") == 1 for row in right.values()
+                if row["category"] != "negative" or row.get("recall@5") is not None),
             "error_gate": not summary.get("errors") and not baseline["summary"].get("errors"),
             "graph_usage_gate": (summary.get("graph_used_cases") or 0) > 0,
             "default_enable": False, "note": "自动字面检查不能替代答案人工复核与独立越权门禁；通过后仍需审核发布"}
@@ -44,7 +46,7 @@ def main():
     args = parser.parse_args()
     result = compare(json.loads(args.baseline.read_text(encoding="utf-8")), json.loads(args.graph.read_text(encoding="utf-8")))
     print(json.dumps(result, ensure_ascii=False, indent=2))
-    if not all(result[key] for key in ("complete_dataset_gate", "provenance_gate", "multihop_gate", "ordinary_no_regression", "latency_gate", "recall_gate", "citation_gate", "error_gate", "graph_usage_gate")):
+    if not all(result[key] for key in ("complete_dataset_gate", "provenance_gate", "multihop_gate", "ordinary_no_regression", "latency_gate", "recall_gate", "citation_gate", "evidence_chain_gate", "error_gate", "graph_usage_gate")):
         raise SystemExit(1)
 
 

@@ -68,11 +68,23 @@ def score(case, events, elapsed, first_token):
     correct = bool(correct and done and not error)
     numeric_truth = re.findall(r"\d+(?:\.\d+)?(?:万元|瓦|天|年)", truth or "")
     numeric_match = all(re.search(r"(?<!\d)" + re.escape(value), normalized) for value in numeric_truth) if numeric_truth else None
+    cited_indices = set()
+    citation_matches = list(re.finditer(r"\[Source\s*(\d+)(?:\s*[-–~]\s*(\d+))?\]", answer, re.IGNORECASE))
+    for match in citation_matches:
+        start = int(match.group(1))
+        end = int(match.group(2) or start)
+        if 1 <= start <= end <= len(sources):
+            cited_indices.update(range(start, end + 1))
+    cited_sources = {sources[i - 1].get("filename") for i in cited_indices if 1 <= i <= len(sources)}
     return {"id": case["id"], "category": case["category"], "recall@5": len(ranks) / len(expected) if expected else None,
             "mrr": 1 / min(ranks) if ranks else (0 if expected else None),
             "answer_literal_match": correct and numeric_match is not False, "numeric_unit_match": numeric_match,
             "citation_total": citation.get("total", 0), "citation_passed": citation.get("passed", 0),
-            "visible_citations": len(re.findall(r"\[Source\s+\d+(?:-\d+)?\]", answer)),
+            "visible_citations": len(citation_matches),
+            "citation_source_recall": len(set(expected) & cited_sources) / len(set(expected)) if expected else None,
+            "answer_mode": citation.get("fallback", "generated"),
+            "generation_citation_total": citation.get("generation_check", citation).get("total", 0),
+            "generation_citation_passed": citation.get("generation_check", citation).get("passed", 0),
             "ttft_ms": first_token, "total_ms": elapsed, "stages_ms": stages, "error": error,
             "completed": done, "answer": answer, "sources": sources, "graph_paths": paths,
             "query": case.get("query"), "reference_answer": truth, "source_locations": case.get("source_locations", []),
@@ -85,11 +97,15 @@ def aggregate(rows):
         return sum(values) / len(values) if values else None
     retrieval = sorted(row["stages_ms"]["retrieve"] for row in rows if "retrieve" in row["stages_ms"])
     total = sum(row["citation_total"] for row in rows)
+    generation_total = sum(row.get("generation_citation_total", row["citation_total"]) for row in rows)
     positives = [row for row in rows if row["category"] != "negative"]
     return {"cases": len(rows), "recall@5": mean("recall@5"), "mrr": mean("mrr"),
             "answer_literal_match": mean("answer_literal_match"), "numeric_unit_match": mean("numeric_unit_match"),
             "citation_support_rate": sum(row["citation_passed"] for row in rows) / total if total else None,
             "citation_coverage": sum(row["visible_citations"] > 0 for row in positives) / len(positives) if positives else None,
+            "citation_source_recall": mean("citation_source_recall"),
+            "source_quote_fallback_cases": sum(row.get("answer_mode") == "source_quote" for row in rows),
+            "generation_citation_support_rate": sum(row.get("generation_citation_passed", row["citation_passed"]) for row in rows) / generation_total if generation_total else None,
             "graph_used_cases": sum(bool(row["graph_paths"]) for row in rows),
             "retrieval_p95_ms": retrieval[math.ceil(.95 * len(retrieval)) - 1] if retrieval else None,
             "ttft_mean_ms": mean("ttft_ms"), "total_mean_ms": mean("total_ms"),

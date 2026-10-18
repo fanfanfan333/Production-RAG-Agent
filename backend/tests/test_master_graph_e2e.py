@@ -100,6 +100,7 @@ async def _run(query: str, *, reply: str, route: str, chunks=None, grade_good=Tr
     with patch.object(mg, "save_turn", _no_save), \
          patch.object(mg, "route_query", fake_route), \
          patch.object(mg, "rewrite_query", fake_rewrite), \
+         patch.object(mg, "rewrite_query_bilingual", fake_rewrite), \
          patch.object(mg, "retrieve_chunks", fake_retrieve), \
          patch.object(mg, "grade_retrieval", fake_grade), \
          patch.object(mg, "build_general_chat_llm", lambda: fake), \
@@ -171,7 +172,38 @@ def test_knowledge_qa_snippet_sanitized_citation_kept():
     guard = [e for e in events if e["type"] == "output_guard"]
     assert not guard or not guard[0].get("changed"), "合法引用不应触发净化"
     assert "[Source 1]" in _text(events)
+    timings = {e['stage'] for e in events if e['type'] == 'stage_timing'}
+    assert {'rewrite', 'grade', 'output_guard', 'save_history'} <= timings
     print("[OK] test_knowledge_qa_snippet_sanitized_citation_kept")
+
+
+def test_cross_language_numeric_fallback_keeps_original_failure_and_replaces_translation():
+    text = "Podcast transcripts. This corpus was divided into 1669 text chunks, with 100-token overlaps between consecutive chunks."
+    chunk = RetrievedChunk(document_id='english', filename='paper.pdf', page_number=2, chunk_index=0, text=text, score=.95)
+    events = asyncio.run(_run('Podcast transcripts corpus divided into text chunks 播客片段数量', reply='播客语料被切分为1669个文本片段 [Source 1]。', route='knowledge_qa', chunks=[chunk], grade_good=True))
+    check = next(e for e in events if e['type'] == 'citation_check')
+    assert check['fallback'] == 'source_quote'
+    assert check['generation_check']['overall'] == 'unsupported'
+    assert check['overall'] == 'verified'
+    assert text in _effective_text(events) and '被切分为' not in _effective_text(events)
+
+
+def test_source_quote_fallback_respects_disabled_stripping():
+    answer = '播客语料被切分为1669个文本片段 [Source 1]。'
+    settings = mg.get_settings().model_copy(update={'CITATION_STRIP_UNSUPPORTED': False, 'CITATION_ANNOTATE': False})
+    with patch.object(mg, 'get_settings', lambda: settings), \
+         patch.object(mg, '_sources_with_full_text', lambda state: [dict(text='Podcast transcripts contain 1669 text chunks.')]), \
+         patch.object(mg, '_english_evidence_for_chinese_query', lambda state: True):
+        result = asyncio.run(mg._citation_verifier_node(dict(answer=answer, query='播客片段数量')))
+    assert result['answer'] == answer and 'fallback' not in result['citation_check']
+
+
+def test_conjoined_citations_are_replaced_in_final_streamed_answer():
+    chunks = [RetrievedChunk(document_id='a', filename='a.pdf', page_number=1, chunk_index=0, text='付款期限为30天。', score=.95),
+              RetrievedChunk(document_id='b', filename='b.pdf', page_number=1, chunk_index=0, text='合同付款期限为30天。', score=.94)]
+    events = asyncio.run(_run('付款期限是多久', reply='付款期限为30天 [Source 1 和 Source 2]。', route='knowledge_qa', chunks=chunks, grade_good=True))
+    assert '[Source 1][Source 2]' in _effective_text(events)
+    assert '和 Source' not in _effective_text(events)
 
 
 # ── C. Retry 循环 → 重试用尽 → 礼貌拒答，无内部 JSON 泄漏 ─────────────────────

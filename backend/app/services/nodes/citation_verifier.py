@@ -604,6 +604,28 @@ def _support_ratio(sentence: str, source_text: str) -> float:
     return hit / len(sent_tokens)
 
 
+def source_quote_fallback(report: VerificationReport, sources: list[dict]) -> str | None:
+    """Replace an unverified numeric translation with the authorized original, never approve it."""
+    if report.overall != "unsupported" or len(report.verdicts) != 1:
+        return None
+    check = report.verdicts[0]
+    if not (check.citation_exists and check.position_correct and check.numbers_consistent and check.dates_consistent):
+        return None
+    source = sources[check.index - 1]
+    if (source.get("content_type") or "text") != "text" or source.get("image_id") or source.get("vision") or source.get("image_caption"):
+        return None
+    numbers = _numbers_for_check(check.sentence)
+    if not numbers:
+        return None
+    for paragraph in re.split(r"\n\s*\n", _source_text(source)):
+        paragraph = paragraph.strip()
+        if not 20 <= len(paragraph) <= 1500 or re.search(r"[\u4e00-\u9fff]", paragraph) or "[source" in paragraph.casefold():
+            continue
+        if numbers <= _numbers_for_check(paragraph) and _dates_for_check(check.sentence) <= _dates_for_check(paragraph):
+            return f"中文转述未通过自动校验，以下仅展示原文摘录，请结合上下文核对：\n\n{paragraph} [Source {check.index}]"
+    return None
+
+
 def verify_citations(
     answer: str,
     sources: list[dict],
@@ -638,6 +660,11 @@ def verify_citations(
     if not answer:
         return VerificationReport(clean_text=answer or "", overall="no_citations")
 
+    answer = re.sub(
+        r"\[Source\s*\d+(?:\s*(?:和|、|,|，|&)\s*(?:Source\s*)?\d+)+\]",
+        lambda match: "".join(f"[Source {number}]" for number in re.findall(r"\d+", match.group(0))),
+        answer, flags=re.IGNORECASE,
+    )
     sources = sources or []
     # 先剥排版标记（列表序号/标题井号）再分句：否则 "1. **反幻觉机制**：…" 里的
     # 列表序号会被当成正文数字，制造成片的"数字与原文不一致"假阳性。
@@ -685,7 +712,8 @@ def verify_citations(
             n = int(m.group(1))
             end = int(m.group(2)) if m.group(2) else n
             # 区间引用 [Source 2-3]：逐条验证，合并为一条结论（取最严）
-            group = list(range(n, end + 1))
+            # Invalid model-generated ranges must not allocate unbounded memory.
+            group = list(range(n, end + 1)) if end - n <= max(len(sources), 1000) else [n, end]
 
             exists = bool(group) and all(1 <= g <= len(sources) for g in group)
             if not exists:
@@ -801,6 +829,8 @@ def verify_citations(
             check = next(checks)
             n = int(match.group(1))
             end = int(match.group(2)) if match.group(2) else n
+            if end - n > len(sources):
+                return ""
             indices = list(range(n, end + 1))
             # n > M 的畸形区间（如 [Source 3-1]）解析不出任何下标：无从判断，
             # 按"宁可漏判，不可错杀"原样保留（回退到改动前的行为），否则只要

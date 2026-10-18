@@ -711,3 +711,41 @@ def test_bad_occurrence_does_not_erase_valid_citation_to_same_source():
     assert report.clean_text.count("[Source 1]") == 1
     assert "200万元 [Source 1]" in report.clean_text
     assert "999万元 [Source 1]" not in report.clean_text
+
+
+def test_enormous_citation_range_is_rejected_without_expansion():
+    report = verify_citations("预算200万元 [Source 1-999999999999]。", _sources("预算200万元。"), annotate=False)
+    assert report.overall == 'unsupported'
+    assert '[Source' not in report.clean_text
+    assert report.hallucinated_indices == (999999999999,)
+
+
+def test_unverified_translation_can_only_fall_back_to_original_evidence():
+    text = "Podcast transcripts. This corpus was divided into 1669 text chunks, with 100-token overlaps."
+    sources = _sources(text)
+    report = verify_citations("播客语料被切分为1669个文本片段 [Source 1]。", sources)
+    assert report.overall == 'unsupported'
+    fallback = _mod.source_quote_fallback(report, sources)
+    assert text in fallback and '中文转述未通过' in fallback
+    assert '被切分为' not in fallback
+    assert verify_citations(fallback, sources).overall == 'verified'
+
+
+def test_quote_fallback_rejects_missing_numbers_unknown_sources_and_images():
+    sources = _sources("Podcast transcripts contain 1669 text chunks.")
+    for answer in ['播客包含999个片段 [Source 1]。', '播客包含1669个片段 [Source 2]。', '这是一篇很先进的论文 [Source 1]。']:
+        assert _mod.source_quote_fallback(verify_citations(answer, sources), sources) is None
+    sources[0]['content_type'] = 'image'
+    assert _mod.source_quote_fallback(verify_citations('播客包含1669个片段 [Source 1]。', sources), sources) is None
+    sources[0]['content_type'] = 'text'
+    sources[0]['text'] += ' [Source 1 和 Source 99]'
+    assert _mod.source_quote_fallback(verify_citations('播客包含1669个片段 [Source 1]。', sources), sources) is None
+
+
+def test_conjoined_citations_are_clickable_and_still_checked_for_unknown_sources():
+    sources = _sources('企业位于园区。', '企业位于园区。')
+    report = verify_citations('企业位于园区 [Source 1 和 Source 2]。', sources)
+    assert report.overall == 'verified'
+    assert '[Source 1][Source 2]' in report.clean_text
+    bad = verify_citations('企业位于园区 [Source 1 和 Source 99]。', sources)
+    assert bad.hallucinated_indices == (99,) and '[Source 99]' not in bad.clean_text

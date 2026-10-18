@@ -194,6 +194,22 @@ def test_graph_report_gates_reject_regression_and_incomparable_scope():
     assert compare(baseline, result)["multihop_gate"]
     assert not compare(baseline, result)["complete_dataset_gate"]
     assert not compare(baseline, result)["provenance_gate"]
+    assert not compare(baseline, result)["evidence_chain_gate"]
+    result["cases"][0]["citation_source_recall"] = 1
+    result["cases"][1]["citation_source_recall"] = 1
+    assert compare(baseline, result)["evidence_chain_gate"]
+    conflict = dict(id="conflict", category="negative", answer_literal_match=True, **{"recall@5": 1})
+    baseline["cases"].append(conflict.copy())
+    result["cases"].append(conflict.copy())
+    assert not compare(baseline, result)["evidence_chain_gate"]
+    result["cases"][-1]["citation_source_recall"] = 1
+    assert compare(baseline, result)["evidence_chain_gate"]
+    result["summary"].update(citation_coverage=1, citation_support_rate=.97, **{"recall@5": .94})
+    assert not compare(baseline, result)["citation_gate"]
+    assert not compare(baseline, result)["recall_gate"]
+    result["summary"].update(citation_support_rate=.98, **{"recall@5": .95})
+    assert compare(baseline, result)["citation_gate"]
+    assert compare(baseline, result)["recall_gate"]
     result["cases"][1]["answer_literal_match"] = False
     assert not compare(baseline, result)["ordinary_no_regression"]
     result["account_scope"] = {"id": "other"}
@@ -396,3 +412,29 @@ def test_acceptance_scores_the_final_visible_answer():
     assert not result['answer_literal_match']
     assert result['visible_citations'] == 0
     assert aggregate([result])['citation_coverage'] == 0
+
+
+def test_multihop_citation_source_recall_requires_both_documents():
+    from scripts.evaluate_professional import score
+    case = dict(id='chain', category='multihop', expect_sources=['a.md', 'b.md'], answer='终点')
+    events = [dict(type='sources', sources=[dict(filename='a.md'), dict(filename='b.md')])]
+    one = score(case, events + [dict(type='chunk', content='终点 [Source 2]'), dict(type='done')], 1, 1)
+    both = score(case, events + [dict(type='chunk', content='终点 [Source 1-2]'), dict(type='done')], 1, 1)
+    assert one['answer_literal_match'] and one['citation_source_recall'] == .5
+    assert both['citation_source_recall'] == 1
+    invalid = score(case, events + [dict(type='chunk', content='终点 [Source 1-999999999999]'), dict(type='done')], 1, 1)
+    assert invalid['citation_source_recall'] == 0
+    variant = score(case, events + [dict(type='chunk', content='终点 [source1 – 2]'), dict(type='done')], 1, 1)
+    assert variant['citation_source_recall'] == 1 and variant['visible_citations'] == 1
+
+
+def test_acceptance_reports_quote_fallback_separately_from_generation_quality():
+    from scripts.evaluate_professional import score, aggregate
+    case = dict(id='english', category='fact', expect_sources=['paper.pdf'], answer='1669')
+    events = [dict(type='sources', sources=[dict(filename='paper.pdf')]),
+              dict(type='citation_check', total=1, passed=1, fallback='source_quote', generation_check=dict(total=1, passed=0),
+                   sanitized_answer='Original evidence: 1669 text chunks [Source 1]'), dict(type='done')]
+    result = aggregate([score(case, events, 1, 1)])
+    assert result['source_quote_fallback_cases'] == 1
+    assert result['generation_citation_support_rate'] == 0
+    assert result['citation_support_rate'] == 1
