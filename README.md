@@ -25,7 +25,7 @@
 
 | 业务问题 | 本项目的实现 | 用户得到什么 |
 | --- | --- | --- |
-| 关键词命中不全，语义相似又容易找偏 | BM25 + Qdrant 向量召回，RRF 融合，Cross-encoder 精排；结构感知切分与父块回填 | 同时覆盖型号、术语与自然语言问题，保留回答所需上下文 |
+| 关键词命中不全，语义相似又容易找偏 | PostgreSQL 全文检索（可选内存 BM25）与 Qdrant 独立召回，统一鉴权、RRF 融合和 Cross-encoder 精排；结构感知切分与父块回填 | 同时覆盖型号、术语与自然语言问题，保留回答所需上下文 |
 | 答案分散在多份文档，单次检索缺少中间关系 | PostgreSQL 保存有原文证据的实体关系，授权范围内最多2跳、50条关系；图候选与普通候选统一精排 | 沿“投资主体 → 被投资企业 → 所在园区”等关系补齐证据，可展开路径回看来源 |
 | 扫描 PDF、合并表格和图表难以读取 | Docling、OCR与视觉模型分工处理，保留页码、行号、表格与图片信息；识别分歧标记待复核 | 可以核对年份、行列、数值与单位，而非仅获得一段无法定位的摘要 |
 | 多公司、多部门与个人资料共用平台 | 租户边界、个人/部门/公司知识库、资源及分片权限过滤；原文访问再次鉴权 | 问答与引用来源沿用同一授权范围，图检索不能绕过权限 |
@@ -66,7 +66,27 @@
 
 ## 实测结果与验证范围
 
-以下为 **2026-10-19** 的本机真实服务结果。120例覆盖40例事实、25例表格、15例图片、20例多跳、20例无答案与冲突；普通与图策略均逐题预热后计分，来源为公开与自有构造资料。
+### 最新回归：修复后60例复杂问答
+
+**2026-10-19**，从原120例完整选取表格25例、图片15例、多跳20例，使用当前 `hybrid_graph` 策略在本机真实服务串行测试。未按历史成绩筛题，未修改问题与参考答案，复用已入库资料。
+
+| 类别 | 主答案匹配 | 文档/页级 Recall@5 | 平均总耗时 |
+| --- | ---: | ---: | ---: |
+| 表格（Word / 扫描 PDF） | 25/25 | 100% | 16.64秒 |
+| 图片 / 多年份图表 | 15/15 | 100% | 21.06秒 |
+| 跨文档两跳关系 | 20/20 | 100% | 9.25秒 |
+
+- 数值与单位检查 **40/40**，引用诊断 **84/84** 通过，必要来源引用覆盖 **100%**；20例多跳题均返回两段图证据。
+- 预热后平均总耗时 **15.28秒**、总耗时 P95 **22.94秒**，检索阶段 P95 **6.22秒**；不代表并发SLA。
+- 保留 **2例冗余解释**，其中1例夹带无关项目金额；另有 **4例来源OCR片段将 `VIZ` 识别为 `VZ`**，视觉描述仍含正确代号。本轮收入题未因此失败，但不能据此宣称OCR逐字段准确。
+
+这是既有构造开发集回归，不是未见企业资料盲测；本轮未重跑其余60例，也未重新上传与评测全部解析/OCR流程。AI逐项核对不代替真人签审，**主答案匹配60/60不等于总体业务准确率100%**。没有同条件普通混合检索对照，不据此计算图检索增益。详见[60例回归条件与问题记录](docs/complex60-regression-2026-10-19.md)。
+
+**本轮检索修复**：关键词候选不再被向量命中文档范围限制；向量、图和关键词文档并集统一经过原有权限校验。图关系校验排除已匹配的实体名称，避免误删“未来科技 / 不凡科技 / 未名公司”等正常关系，同时保留真实否定与假设过滤。相关回归共1003项通过，属于专项测试，不与下方历史完整测试相加。旧索引不会自动补回曾被过滤的关系，受影响文档需显式重建。见[修复与验证记录](docs/retrieval-fixes-2026-10-19.md)。
+
+### 此前完整基线：120例与24例开发诊断集
+
+以下同为 **2026-10-19** 的本机记录，来自上述两处修复之前，不是当前版本重新运行的完整验收。120例覆盖40例事实、25例表格、15例图片、20例多跳、20例无答案与冲突；普通与图策略均逐题预热后计分，来源为公开与自有构造资料。
 
 | 完整120例成对测试 | 普通混合检索 | 混合 + 图检索 |
 | --- | ---: | ---: |
@@ -87,7 +107,7 @@
 
 **工程验证**：锁定依赖的后端2047项通过，22项按环境跳过；权限专项1019项通过，1项跳过（属于专项复测，不能与完整测试相加）。实时图接口10项越权/匿名探针零泄漏，另有2项所有者正向检查。前端静态检查、5项测试及生产构建通过。实际前端代理已验证问答、原文查看、真实反馈，以及伪造/越权拒绝，并修复中文标点反馈失败和SSE压缩缓冲。
 
-**当前边界**：图检索保持实验标记，AI原文复核已完成，真人签审待完成；仍保留1处引用警告和2处冗余解释。规则通过率与引用诊断不等于企业总体语义准确率。代表性预热请求总耗时8.36秒、改写缓存命中5.88秒，后端进程冷启动约26.25秒；这是串行单次观测，不代表并发SLA。SFT/DPO仅完成数据与离线入口准备，未训练或替换在线模型。
+**验证边界**：图检索保持实验标记，真人签审待完成；此前完整120例记录保留1处引用警告和2处冗余解释，本次60例中引用校验84/84通过但仍有2例冗余。规则通过率与引用诊断不等于企业总体语义准确率。代表性预热请求总耗时8.36秒、改写缓存命中5.88秒，后端进程冷启动约26.25秒；这是串行单次观测，不代表并发SLA。SFT/DPO仅完成数据与离线入口准备，未训练或替换在线模型。
 
 详细条件、模型配置、来源核对和剩余问题见[完整回归与审核记录](docs/graph-release-2026-10-19.md)；此前的升级过程见[历史记录](docs/release-history.md)。
 
@@ -102,7 +122,7 @@ RAG 智能助手是一套面向企业内部使用的检索增强生成平台，�
 项目围绕检索、证据与权限完善问答链路：
 
 - **意图路由** —— 识别问句属于知识检索、文档总结、闲聊还是跨文档关联，自动分流至对应支路
-- **混合召回** —— BM25 关键词检索与向量语义检索互补，同时覆盖精确匹配与语义近似
+- **混合召回** —— PostgreSQL 全文关键词检索（可选内存 BM25）与向量语义检索独立召回，再统一校验权限、融合与精排
 - **证据评估** —— 由 LLM 判断检索内容能否真正回答问题，不足则自动改写重试
 - **证据门控** —— 检索后追加一道**确定性** Evidence Gate，证据形态不达标直接拒答，不与 LLM 判断耦合
 - **结构感知切分** —— 表格、代码块、Markdown 标题不会被粗暴截断
@@ -176,7 +196,7 @@ RAG 智能助手是一套面向企业内部使用的检索增强生成平台，�
 | 能力       | 说明                                                                                                          |
 | :------- | :---------------------------------------------------------------------------------------------------------- |
 | 轻量图检索 | 可选 `hybrid_graph`：先鉴权，再沿有原文证据的实体关系最多扩展2跳、50条关系；为第二跳保留可见的关联上下文，候选统一精排；前端可展开证据路径。普通 `hybrid` 保持兼容 |
-| 混合检索     | 自研 BM25（字符 bigram，零第三方依赖）+ Qdrant 向量 ANN，多路查询**并发召回**，加权 RRF（Reciprocal Rank Fusion）融合；两腿候选取同深度（Vector TopN + BM25 TopN 对齐）                 |
+| 混合检索     | 默认 PostgreSQL 全文检索，可选自研内存 BM25（字符 bigram）+ Qdrant 向量 ANN；关键词不依赖向量命中文档，每路查询可并发，加权 RRF 融合；候选深度对齐                 |
 | 精排与异常收敛 | 模型加载支持FlagReranker、CrossEncoder及显式启发式降级；候选去重、分数阈值与Top-K过滤。运行异常或非法分数返回空证据，交由上游重试/拒答，不以粗排分冒充精排结果；启发式模式不等同模型精排效果 |
 | 上下文压缩     | Context Compression：按查询词覆盖率做句子级抽取式压缩，单源预算 + 总预算双重约束，控制父块回填后的上下文膨胀（确定性规则、零 LLM 调用）                           |
 | LLM 证据评估 | 不看分数，由 LLM 判断"这段证据是否真能回答问题"，仅保留相关证据                                                                         |
@@ -412,7 +432,7 @@ RAG 智能助手是一套面向企业内部使用的检索增强生成平台，�
 
 | 阶段     | 目标     | 实现                                            |
 | :--- | :----- | :-------------------------------------------- |
-| 粗排   | 高召回    | BM25（字符 bigram）+ 向量 ANN 并发召回，加权 RRF 融合取候选池（默认 20） |
+| 粗排   | 高召回    | PostgreSQL 全文检索 / 内存 BM25 与向量 ANN 独立召回，加权 RRF 融合取候选池（默认 20） |
 | 精排   | 高精度    | bge-reranker-base cross-encoder 重打分（先去重、截断；可选多查询取最大分） |
 | 相关性阈值 | 抗幻觉    | Relevance Threshold：精排后逐条丢弃低于 `RERANK_MIN_SCORE` 的擦边证据 |
 | 上下文压缩 | 控预算    | Context Compression：查询感知的句子级压缩，单源 1500 字符、总量 6000 字符软预算 |
@@ -476,7 +496,7 @@ Document
                                    ▼                        │
                     Chunk + Metadata（content_type）◀───────┘
                                    ▼
-                    BM25 + Vector Search → RRF → Reranker
+                    Keyword + Vector Search → RRF → Reranker
                                    ▼
                     Image Context 节点（取原图 → Vision）
                                    ▼
@@ -780,7 +800,7 @@ LangGraph负责问答流程的状态、路由、重试和生成；知识图谱�
 | 前端   | Next.js 15（App Router）· React 19 · TypeScript 5 · Tailwind CSS 4 · Radix UI · Framer Motion · react-markdown + remark-gfm · 原生 SSE 流式客户端 |
 | 后端   | FastAPI 0.143 · LangGraph · SQLAlchemy 2.0（async）+ asyncpg · Alembic · Pydantic 2 + Pydantic-Settings · PyJWT + cryptography（RS256 验签）+ bcrypt                   |
 | 身份认证 | Keycloak 26（OIDC · Authorization Code + PKCE）· JWKS 验签 · 多租户 claim（company_a / company_b）· 本地账号（HS256）双通路 |
-| 检索引擎 | 自研 BM25（字符 bigram，零依赖）· Qdrant 1.12 · RRF 融合 · bge-reranker 三级降级精排                                                                       |
+| 检索引擎 | PostgreSQL 全文检索 / 自研内存 BM25 · Qdrant 1.12 · RRF 融合 · bge-reranker 三级降级精排                                                                       |
 | 生成   | Ollama 本地推理（默认 qwen3:8b）· LangChain-Ollama · 流式输出 · 思考流分离                                                                                |
 | 向量化  | BGE 本地模型（bge-large-zh-v1.5，1024 维）· CPU-only torch · FlagEmbedding                                                                       |
 | 文档解析 | Docling 2.137 · PyMuPDF · python-docx · python-pptx · openpyxl · pandas · markdown                                                                       |
@@ -1060,7 +1080,7 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 | 边缘网关   | `GATEWAY_MAX_REQUEST_BYTES` · `GATEWAY_AUTH_RATE_LIMIT` · `GATEWAY_UPLOAD_RATE_LIMIT` · `GATEWAY_ADMIN_RATE_LIMIT` · `GATEWAY_ENFORCE_ORIGIN` · `TRUSTED_PROXY_IPS` |
 | 注入防护   | `PROMPT_GUARD_ENABLED` · `PROMPT_GUARD_BLOCK_HIGH_RISK` · `PROMPT_GUARD_MAX_QUERY_CHARS`                                                                            |
 | 检索     | `RETRIEVAL_TOP_K` · `RETRIEVAL_MIN_SCORE` · `RETRIEVAL_MAX_GAP` · `MAX_HISTORY_PAIRS`                                                                               |
-| 混合检索   | `HYBRID_SEARCH_ENABLED` · `HYBRID_MAX_CORPUS_POINTS` · `HYBRID_RRF_K` · `HYBRID_CACHE_TTL_SECONDS` · `HYBRID_VECTOR_WEIGHT` · `HYBRID_BM25_WEIGHT`                                                                  |
+| 混合检索   | `HYBRID_SEARCH_ENABLED` · `HYBRID_KEYWORD_BACKEND`（默认 postgres）· `HYBRID_MAX_CORPUS_POINTS` · `HYBRID_RRF_K` · `HYBRID_CACHE_TTL_SECONDS` · `HYBRID_VECTOR_WEIGHT` · `HYBRID_BM25_WEIGHT`                                                                  |
 | 图检索 | `GRAPH_RETRIEVAL_ENABLED`（服务端默认false）；请求字段 `retrieval_strategy`；上限2跳、50条关系，旧文档显式建立图索引 |
 | 查询改写   | `QUERY_REWRITE_ENABLED` · `QUERY_REWRITE_TIMEOUT_SECONDS` · `MULTI_QUERY_ENABLED` · `MULTI_QUERY_VARIANTS`                                                          |
 | 精排     | `RERANKER_ENABLED` · `RERANKER_MODEL_NAME` · `RERANKER_USE_FP16` · `RERANKER_MAX_CANDIDATES` · `RERANKER_MAX_TEXT_CHARS` · `RERANKER_USE_QUERY_VARIANTS` · `RERANK_MIN_SCORE_FILTER`                                                |

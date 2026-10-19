@@ -56,7 +56,13 @@ def validated_relations(raw, text):
             continue
         # Only literal, affirmative subject-predicate-object clauses; ambiguous syntax stays in ordinary RAG.
         clause = re.escape(subject) + r"\s*" + re.escape(predicate) + r"\s*" + re.escape(obj)
-        if not re.search(clause, quote) or re.search(r"未|不|否认|考虑|计划|拟|可能|假设|如果|曾想|并非|没有", quote):
+        match = re.search(clause, quote)
+        # Entity names (e.g. 未来科技) are not negation or modality cues.
+        if not match:
+            continue
+        context = (quote[:match.start()] + "实体" + quote[match.start() + len(subject):match.end() - len(obj)]
+                   + "实体" + quote[match.end():])
+        if re.search(r"未|不|否认|考虑|计划|拟|可能|假设|如果|曾想|并非|没有", context):
             continue
         result.append(dict(zip(("subject", "subject_type", "predicate", "object", "object_type", "evidence"),
                                (subject, stype, predicate, obj, otype, quote))))

@@ -504,3 +504,21 @@ def test_acceptance_reports_quote_fallback_separately_from_generation_quality():
     assert result['source_quote_fallback_cases'] == 1
     assert result['generation_citation_support_rate'] == 0
     assert result['citation_support_rate'] == 1
+
+
+@pytest.mark.parametrize("name", ["未来科技", "不凡科技", "未名公司"])
+@pytest.mark.parametrize("as_object", [False, True])
+def test_affirmative_entity_names_are_not_negation(name, as_object):
+    subject, obj = ("晴野科技", name) if as_object else (name, "晴野科技")
+    quote = f"{subject}投资{obj}。"
+    item = dict(subject=subject, subject_type="organization", predicate="投资",
+                object=obj, object_type="organization", evidence=quote)
+    assert graph.validated_relations([item], quote) == [item]
+
+
+@pytest.mark.parametrize("quote", ["未来科技未投资晴野科技。", "未来科技计划投资晴野科技。",
+    "并非未来科技投资晴野科技。", "如果未来科技投资晴野科技。", "未来科技投资晴野科技的消息不属实。"])
+def test_entity_name_exemption_keeps_actual_negation(quote):
+    item = dict(subject="未来科技", subject_type="organization", predicate="投资",
+                object="晴野科技", object_type="organization", evidence=quote)
+    assert graph.validated_relations([item], quote) == []

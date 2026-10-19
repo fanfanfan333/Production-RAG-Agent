@@ -568,7 +568,7 @@ async def _scroll_pages(
 async def _bm25_candidates(
     query: str,
     fetch_n: int,
-    valid_docs: set[str],
+    valid_docs: set[str] | None,
     collection_name: str,
     collection_id: str | None,
     owner_id: str | None,
@@ -581,8 +581,8 @@ async def _bm25_candidates(
     """
     Keyword (BM25) leg of the hybrid search.
 
-    Returns chunks ranked best-first, restricted to *valid_docs* (documents
-    that exist in PostgreSQL, are COMPLETED, and pass the tenant+ACL filter).
+    Returns scope-filtered chunks ranked best-first. When supplied, *valid_docs*
+    additionally restricts results; the caller authorizes independent candidates.
 
     *fetch_n* 与向量腿的候选池对齐（框架图 Vector Top20 + BM25 Top20）：
     两腿取同样深的候选，RRF 融合时哪一路都不会被浅列表系统性压低。
@@ -635,7 +635,7 @@ async def _bm25_candidates(
                 "'postgres' or raise HYBRID_MAX_CORPUS_POINTS.",
                 settings.HYBRID_MAX_CORPUS_POINTS, cache_key,
             )
-        visible = [c for c in corpus if c.document_id in valid_docs]
+        visible = corpus
         index = BM25Index([c.text for c in visible])
         _bm25_cache_put(
             cache_key,
@@ -649,11 +649,12 @@ async def _bm25_candidates(
             len(visible),
         )
 
-    if len(visible) < 2:
+    if not visible:
         return []
 
     hits = index.search(query, top_n=max(fetch_n, 1))
-    return [visible[h.index] for h in hits]
+    return [visible[h.index] for h in hits
+            if valid_docs is None or visible[h.index].document_id in valid_docs]
 
 
 async def _pg_keyword_candidates(
@@ -1781,9 +1782,66 @@ async def retrieve_chunks(
             if str(payload.get("document_id")) == key[0] and payload.get("chunk_index") == key[1]:
                 all_results.setdefault(key, (0.0, payload))
                 graph_keys.add(key)
+    # ── 关键词腿：每路查询各一条 ───────────────────────────────────────────
+    # 权限上下文指纹（第三层缓存隔离，决策 9）：owner + department + 宽口径标志
+    # 任一不同即不同键；绝不与非本人/非本部门/非同权限视图共享语料缓存。
+    #
+    # 【T3】有 ``scope`` 时，取值来源换成 ``scope.scope_fingerprint``（五维指纹，
+    # 含 clearance / project_ids / principals）—— 比旧三维串更细，天然按 Scope
+    # 分区。变量 ``perm_ctx`` 本身**保留**：它被 ``_bm25_candidates`` 的形参消费。
+    if scope_fingerprint is not None:
+        perm_ctx = scope_fingerprint
+    else:
+        perm_ctx = (
+            f"{owner_id or '__none__'}:{user_department_id or '-'}"
+            f":{'TW' if tenant_wide else '-'}"
+            f":{tenant_scope_fingerprint(tenant_ids)}"
+            f":{tenant_scope_fingerprint(owns_tenant_ids)}"
+        )
+    backend = str(getattr(settings, "HYBRID_KEYWORD_BACKEND", "postgres") or "postgres").strip().lower()
+    pg_lists = []
+    memory_lists = []
+    if settings.HYBRID_SEARCH_ENABLED and backend == "postgres":
+        # ── PG 关键词腿（默认）：覆盖 100% 语料，内存零放大 ──────────────────
+        # 多路查询并发发出（与向量腿的 gather 对齐）：串行 N 次会让多查询扩展
+        # 把延迟乘 N，而扩展本该是"用延迟换召回"的温和交换。
+        pg_lists = await asyncio.gather(*(
+            _pg_keyword_candidates(
+                query=q,
+                fetch_n=candidate_pool,          # 与向量腿同深
+                collection_id=collection_id,
+                tenant_ids=tenant_ids,
+                owner_id=owner_id,
+                user_department_id=user_department_id,
+                tenant_wide=tenant_wide,
+                owns_tenant_ids=owns_tenant_ids,
+                unrestricted=unrestricted,
+                metadata_filter=metadata_filter,
+                # 【T3 双路同源】同一个 UserScope → 关键词腿 SQL 走 to_sql(pred)，
+                # 与向量腿的 to_qdrant(pred) 由**同一个** ScopePredicate 编译。
+                scope=scope,
+                # 入口已编译的 pred 直接透传，PG 腿不再 scope.predicate() 现编。
+                pred=pred,
+            )
+            for q in queries
+        ))
+
+    elif settings.HYBRID_SEARCH_ENABLED:
+        for q in queries:
+            try:
+                memory_lists.append(await _bm25_candidates(
+                    query=q, fetch_n=candidate_pool, valid_docs=None,
+                    collection_name=coll, collection_id=collection_id,
+                    owner_id=owner_id, client=client, tenant_ids=tenant_ids,
+                    perm_context=perm_ctx, scope=scope, pred=pred,
+                ))
+            except Exception:
+                logger.exception("Hybrid BM25 candidate collection failed")
+                memory_lists.append([])
+
     search_results_count = len(all_results)
-    if search_results_count == 0:
-        logger.info("No raw candidates returned from Qdrant search.")
+    if not all_results and not any(pg_lists) and not any(memory_lists):
+        logger.info("No candidates returned from vector, graph or keyword search.")
         return []
 
     chunks: list[RetrievedChunk] = []
@@ -1801,6 +1859,14 @@ async def retrieve_chunks(
                 doc_ids.add(uuid.UUID(doc_id_str))
             except ValueError:
                 pass
+
+    # Authorize the union: a keyword-only document need not have an ANN hit.
+    for doc_id in ([row[0] for rows in pg_lists for row in rows]
+                   + [chunk.document_id for rows in memory_lists for chunk in rows]):
+        try:
+            doc_ids.add(uuid.UUID(str(doc_id)))
+        except (ValueError, TypeError):
+            continue
 
     valid_docs = set()
     if doc_ids:
@@ -1930,55 +1996,11 @@ async def retrieve_chunks(
         [k for k in rl if k in primary_keys] for rl in vector_rank_lists
     ]
 
-    # ── 关键词腿：每路查询各一条 ───────────────────────────────────────────
-    # 权限上下文指纹（第三层缓存隔离，决策 9）：owner + department + 宽口径标志
-    # 任一不同即不同键；绝不与非本人/非本部门/非同权限视图共享语料缓存。
-    #
-    # 【T3】有 ``scope`` 时，取值来源换成 ``scope.scope_fingerprint``（五维指纹，
-    # 含 clearance / project_ids / principals）—— 比旧三维串更细，天然按 Scope
-    # 分区。变量 ``perm_ctx`` 本身**保留**：它被 ``_bm25_candidates`` 的形参消费。
-    if scope_fingerprint is not None:
-        perm_ctx = scope_fingerprint
-    else:
-        perm_ctx = (
-            f"{owner_id or '__none__'}:{user_department_id or '-'}"
-            f":{'TW' if tenant_wide else '-'}"
-            f":{tenant_scope_fingerprint(tenant_ids)}"
-            f":{tenant_scope_fingerprint(owns_tenant_ids)}"
-        )
-    backend = str(getattr(settings, "HYBRID_KEYWORD_BACKEND", "postgres") or "postgres").strip().lower()
     keyword_rank_lists: list[list[tuple[str, int]]] = []
     floor = settings.RETRIEVAL_MIN_SCORE
-    # 关键词腿命中的 chunk 里，只有它命中（向量腿没召回）的那些，向量分是未知的。
-    # 给它们 floor 分（0.30 起）作为**诚实的占位**：它们靠精确词项命中赢得位置，
-    # 不是靠语义相似；用 0 分会让它们在 RRF 融合后的 floor/gap 过滤里被误杀。
     keyword_only_score = max(floor, 0.30)
 
     if settings.HYBRID_SEARCH_ENABLED and backend == "postgres":
-        # ── PG 关键词腿（默认）：覆盖 100% 语料，内存零放大 ──────────────────
-        # 多路查询并发发出（与向量腿的 gather 对齐）：串行 N 次会让多查询扩展
-        # 把延迟乘 N，而扩展本该是"用延迟换召回"的温和交换。
-        pg_lists = await asyncio.gather(*(
-            _pg_keyword_candidates(
-                query=q,
-                fetch_n=candidate_pool,          # 与向量腿同深
-                collection_id=collection_id,
-                tenant_ids=tenant_ids,
-                owner_id=owner_id,
-                user_department_id=user_department_id,
-                tenant_wide=tenant_wide,
-                owns_tenant_ids=owns_tenant_ids,
-                unrestricted=unrestricted,
-                metadata_filter=metadata_filter,
-                # 【T3 双路同源】同一个 UserScope → 关键词腿 SQL 走 to_sql(pred)，
-                # 与向量腿的 to_qdrant(pred) 由**同一个** ScopePredicate 编译。
-                scope=scope,
-                # 入口已编译的 pred 直接透传，PG 腿不再 scope.predicate() 现编。
-                pred=pred,
-            )
-            for q in queries
-        ))
-
         # 先把所有命中点的 id 汇总（按点 id 去重），**一次**批量取回 payload ——
         # 而不是每路查询各取一次。多查询扩展时这是 N 次 RTT → 分批后的 1~2 次。
         #
@@ -2044,27 +2066,13 @@ async def retrieve_chunks(
 
     elif settings.HYBRID_SEARCH_ENABLED:
         # ── 内存 BM25 腿（小语料可选后端；超限会显式告警而非静默截断）────────
-        for q in queries:
+        for bm25_ranked in memory_lists:
             try:
-                bm25_ranked = await _bm25_candidates(
-                    query=q,
-                    # 与向量腿同深（Vector TopN + BM25 TopN 对齐，见框架图）
-                    fetch_n=candidate_pool,
-                    valid_docs=valid_docs,
-                    collection_name=coll,
-                    collection_id=collection_id,
-                    owner_id=owner_id,
-                    client=client,
-                    tenant_ids=tenant_ids,
-                    perm_context=perm_ctx,
-                    # 【T3 双路同源】语料 scroll 用**同一份** to_qdrant(pred)；
-                    # user_scope 用于 cache_key_for_scope 缓存分区（决策 9），
-                    # pred 为入口编译好的**同一个**实例（决策 6.1）。
-                    scope=scope,
-                    pred=pred,
-                )
                 rows: list[tuple[str, int]] = []
                 for c in bm25_ranked:
+                    if c.document_id not in valid_docs:
+                        acl_dropped.add(c.document_id)
+                        continue
                     key = _chunk_key(c)
                     # 内存后端的语料来自 Qdrant payload，元数据过滤只能后置做
                     # （前置无法下推到 scroll）。这里补齐，保持与 PG 后端同语义。

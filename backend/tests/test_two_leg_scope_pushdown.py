@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+
+import pytest
 from pathlib import Path
 
 from app.services.retrieval_service import _visibility_conditions
@@ -139,6 +141,10 @@ def _wire(monkeypatch, rs, *, hits):
         ("ANN_OVERFETCH_FACTOR", 1),
     ):
         monkeypatch.setattr(settings, name, value, raising=False)
+    async def _audit(*args, **kwargs):
+        pass
+
+    monkeypatch.setattr(rs, "_record_acl_drops", _audit)
     return fake
 
 
@@ -216,3 +222,106 @@ if __name__ == "__main__":      # pragma: no cover
     import pytest
 
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+@pytest.mark.parametrize("backend", ["postgres", "memory"])
+@pytest.mark.parametrize("ann_hit", [False, True])
+def test_keyword_only_document_survives_independent_recall(monkeypatch, backend, ann_hit):
+    import app.services.retrieval_service as rs
+    import app.db.postgres as pg
+
+    other = str(uuid.uuid4())
+    payload = {**_allowed_payload(), "document_id": other, "text": "ZX9001 设备维修标准"}
+    _wire(monkeypatch, rs, hits=[_Hit(0.9, _allowed_payload())] if ann_hit else [])
+    monkeypatch.setattr(rs.get_settings(), "HYBRID_KEYWORD_BACKEND", backend)
+    statements = []
+
+    class Session(_FakeSession):
+        async def execute(self, statement):
+            statements.append(statement)
+            return _FakeResult([(DOC,), (other,)])
+
+    class CM(_FakeSessionCM):
+        async def __aenter__(self):
+            return Session()
+
+    monkeypatch.setattr(pg, "get_db_session", CM)
+
+    async def keywords(**kwargs):
+        return [(other, 0, "point-b"), (other, 0, "point-b")]
+
+    async def payloads(*args):
+        return {"point-b": payload}
+
+    async def corpus(*args, **kwargs):
+        return [rs.RetrievedChunk(document_id=other, filename="b.pdf", page_number=1,
+                                 chunk_index=0, text=payload["text"], score=0,
+                                 _acl_payload=payload)]
+
+    monkeypatch.setattr(rs, "_pg_keyword_candidates", keywords)
+    monkeypatch.setattr(rs, "_fetch_by_point_ids", payloads)
+    monkeypatch.setattr(rs, "_scroll_corpus", corpus)
+    rs._bm25_cache.clear()
+    try:
+        chunks = asyncio.run(rs.retrieve_chunks_scoped("ZX9001", scope=_scope(), top_k=5))
+        assert sum(c.document_id == other for c in chunks) == 1
+        params = statements[0].compile().params
+        assert any(isinstance(v, (list, set)) and uuid.UUID(other) in v for v in params.values())
+    finally:
+        rs._bm25_cache.clear()
+
+
+@pytest.mark.parametrize("backend", ["postgres", "memory"])
+@pytest.mark.parametrize("blocked", ["authority", "object_acl", "metadata", "hybrid_disabled"])
+def test_independent_keyword_candidates_keep_existing_gates(monkeypatch, backend, blocked):
+    import app.services.retrieval_service as rs
+    import app.db.postgres as pg
+    from app.services.metadata import MetadataFilter
+
+    _wire(monkeypatch, rs, hits=[])
+    settings = rs.get_settings()
+    monkeypatch.setattr(settings, "HYBRID_KEYWORD_BACKEND", backend)
+    monkeypatch.setattr(settings, "HYBRID_SEARCH_ENABLED", blocked != "hybrid_disabled")
+    payload = {**_allowed_payload(), "doc_type": "制度"}
+    if blocked == "object_acl":
+        payload["security_level"] = 5
+    calls = []
+
+    async def keywords(**kwargs):
+        calls.append(True)
+        return [(DOC, 0, "point-a")]
+
+    async def payloads(*args):
+        return {"point-a": payload}
+
+    async def corpus(*args, **kwargs):
+        calls.append(True)
+        return [rs.RetrievedChunk(document_id=DOC, filename="a.pdf", page_number=1,
+                                 chunk_index=0, text="ZX9001", score=0, doc_type="制度", _acl_payload=payload)]
+
+    class Session(_FakeSession):
+        async def execute(self, statement):
+            sql = str(statement)
+            assert "status" in sql and "collection_id" in sql
+            return _FakeResult([])
+
+    class CM(_FakeSessionCM):
+        async def __aenter__(self):
+            return Session()
+
+    if blocked == "authority":
+        monkeypatch.setattr(pg, "get_db_session", CM)
+    monkeypatch.setattr(rs, "_pg_keyword_candidates", keywords)
+    monkeypatch.setattr(rs, "_fetch_by_point_ids", payloads)
+    monkeypatch.setattr(rs, "_scroll_corpus", corpus)
+    rs._bm25_cache.clear()
+    try:
+        kwargs = {"collection_id": str(uuid.uuid4())}
+        if blocked == "metadata":
+            kwargs["metadata_filter"] = MetadataFilter(doc_types=["合同"])
+        chunks = asyncio.run(rs.retrieve_chunks_scoped("ZX9001", scope=_scope(), top_k=5, **kwargs))
+        assert chunks == []
+        if blocked == "hybrid_disabled":
+            assert not calls
+    finally:
+        rs._bm25_cache.clear()
