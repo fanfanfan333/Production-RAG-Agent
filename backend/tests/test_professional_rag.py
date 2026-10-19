@@ -20,6 +20,22 @@ def test_graph_expansion_is_two_hops_and_type_sensitive():
     assert len(graph.expand("甲", [edge("甲", str(i)) for i in range(100)])) == 50
 
 
+def test_graph_bridge_context_requires_a_visible_typed_first_hop():
+    from app.services.reranker import ranking_texts
+    from app.services.retrieval_service import _merge_graph_candidates
+    first, bridge, wrong_type = edge("甲", "乙"), edge("乙", "丙"), edge("乙", "丁", "person")
+    for index, item in enumerate((first, bridge, wrong_type)):
+        item.chunk.document_id = str(index)
+    contexts = graph.bridge_contexts("甲的间接关联", [first, bridge, wrong_type])
+    assert contexts == {("1", 0): [("0", 0, "甲投资乙")]}
+    bridge.chunk._graph_context = contexts[("1", 0)]
+    merged = {(c.document_id, c.chunk_index): c for c in (first.chunk, bridge.chunk)}
+    picks = _merge_graph_candidates([], merged, set(merged), 12, graph_chunks=[bridge.chunk])
+    assert ranking_texts(picks) == ["甲投资乙", "甲投资乙\n乙投资丙"]
+    assert ranking_texts([bridge.chunk]) == ["乙投资丙"]
+    assert bridge.chunk.text == "乙投资丙", "ranking context must not become cited source text"
+
+
 def test_graph_quotes_and_predicate_must_be_grounded():
     item = dict(subject="甲", subject_type="organization", predicate="投资", object="乙", object_type="organization", evidence="甲投资乙")
     assert graph.validated_relations([item], "甲投资乙") == [item]
@@ -194,6 +210,20 @@ def test_graph_report_gates_reject_regression_and_incomparable_scope():
     assert compare(baseline, result)["multihop_gate"]
     assert not compare(baseline, result)["complete_dataset_gate"]
     assert not compare(baseline, result)["provenance_gate"]
+    assert not compare(baseline, result)["scoring_gate"]
+    baseline["scoring_version"] = result["scoring_version"] = "professional_v3_no_mixed_refusal"
+    assert compare(baseline, result)["scoring_gate"]
+    assert not compare(baseline, result)["warmup_gate"]
+    assert not compare(baseline, result)["latency_gate"]
+    for report in (baseline, result):
+        report["warmup_policy"] = "per_case"
+        report["warmups"] = [dict(id=row["id"], completed=True, error=None) for row in report["cases"]]
+    assert compare(baseline, result)["warmup_gate"]
+    result["summary"]["retrieval_p95_ms"] = 110
+    assert compare(baseline, result)["latency_gate"]
+    result["warmups"][-1]["error"] = "failed"
+    assert not compare(baseline, result)["warmup_gate"]
+    result["warmups"][-1]["error"] = None
     assert not compare(baseline, result)["evidence_chain_gate"]
     result["cases"][0]["citation_source_recall"] = 1
     result["cases"][1]["citation_source_recall"] = 1

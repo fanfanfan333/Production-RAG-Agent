@@ -87,7 +87,7 @@ python backend/scripts/compare_professional_reports.py .scratch/professional-hyb
 
 后续资源与执行修正：完整回归 1980 项通过、20 项跳过。精排显式使用 4 条一批的模型推理，并串行访问共享模型，防止默认大批次与并发请求放大内存峰值；分数仍使用原模型 logit 的一次 sigmoid。验收工具尊重服务端 429 的 `Retry-After`，文件重试会重新定位流；文档状态 GET 支持短暂连接故障重试，不自动重放已开始的回答。
 
-`evaluate_professional.py --paired --condition warm` 在同一串行会话内运行普通与图检索，每阶段先做一次不计入金标的预热请求，分别输出 `*-hybrid.json`、`*-hybrid_graph.json`。记录整轮实际启动余量；限流等待单独记录，但仍计入客户端总耗时。预热指检索模型和流程已经运行过，不保证 GPU 模型始终驻留。
+`evaluate_professional.py --paired --condition warm` 在同一串行会话内运行普通与图检索，分别输出 `*-hybrid.json`、`*-hybrid_graph.json`。2026-10-19 起，两种策略均在每道计分请求前运行同题预热，预热单独保存在 `warmups`，不计入金标成绩；对比器拒绝缺失或失败的逐题预热记录通过延迟门禁，避免后跑策略独占前一轮留下的查询缓存。单策略 `warm` 仍只预热一次，不能用于该成对延迟门禁。记录整轮实际启动余量；限流等待单独记录，但仍计入客户端总耗时。不保证 GPU 模型始终驻留，也不把预热自动称作全部缓存命中。
 
 本机 RTX 3060 Laptop 实测为 6 GB 显存。已有 4B 模型通过 GPU 冒烟验证，8K 上下文时实际使用约 3.6 GB 显存；不下载新模型。低内存配置支持显式设置 `OLLAMA_NUM_GPU=-1`、`OLLAMA_KEEP_ALIVE_SECONDS=60`，默认仍为 CPU/即时卸载，使用前需核对本机显存。直接 CPU INT8 试验的最小向量余弦相似度仅约 0.948，且进程 RSS 增加，因此没有采用，也没有改变现有向量模型或索引。
 

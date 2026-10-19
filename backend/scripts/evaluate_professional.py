@@ -13,6 +13,8 @@ from pathlib import Path
 
 import httpx
 
+SCORING_VERSION = "professional_v3_no_mixed_refusal"
+
 
 def available_gb():
     if os.name != "nt":
@@ -65,6 +67,8 @@ def score(case, events, elapsed, first_token):
         pattern = (r"(?<!\d)" if literal[:1].isdigit() else "") + re.escape(literal)
         pattern += r"(?!\d)" if literal[-1:].isdigit() else ""
         correct = bool(re.search(pattern, normalized))
+        if re.search(r"(?:无法|不能)(?:确定|判断|确认)|证据不足|没有相关|没有找到|未(?:找到|检索到)|需要核实", normalized):
+            correct = False
     correct = bool(correct and done and not error)
     numeric_truth = re.findall(r"\d+(?:\.\d+)?(?:万元|瓦|天|年)", truth or "")
     numeric_match = all(re.search(r"(?<!\d)" + re.escape(value), normalized) for value in numeric_truth) if numeric_truth else None
@@ -201,7 +205,7 @@ def main():
     parser.add_argument("--config-version", required=True, help="Same application/model/retrieval configuration version for paired runs")
     parser.add_argument("--limit", type=int, default=120)
     parser.add_argument("--category", choices=("fact", "table", "image", "multihop", "negative"))
-    parser.add_argument("--paired", action="store_true", help="Run hybrid then hybrid_graph in one serial, prewarmed session")
+    parser.add_argument("--paired", action="store_true", help="Run hybrid then hybrid_graph serially; prewarm each query before its measured request")
     args = parser.parse_args()
     if not 1 <= args.limit <= 120: parser.error("limit 必须在1至120之间")
     token = os.environ.get("RAG_EVAL_TOKEN")
@@ -223,19 +227,29 @@ def main():
 def run_report(args, gold, cases, strategy, token, initial_memory):
     rows, conversations = [], set()
     report = {"gold": gold["name"], "truth_origin": gold["truth_origin"], "condition": args.condition,
+              "scoring_version": SCORING_VERSION,
               "gold_sha256": hashlib.sha256(args.gold.read_bytes()).hexdigest(), "config_version": args.config_version,
               "strategy": strategy, "collection_id": args.collection, "session_start_available_gb": initial_memory,
+              "warmup_policy": "per_case" if args.paired else ("once" if args.condition == "warm" else "none"),
+              "warmups": [],
               "method": "document/page recall, literal answer/numeric checks plus server citation verifier; requires human answer review", "cases": rows}
     with httpx.Client(base_url=args.url.rstrip("/"), headers={"Authorization": f"Bearer {token}"}, timeout=300, trust_env=False,
         limits=httpx.Limits(max_keepalive_connections=0)) as client:
         identity = client.get("/auth/me"); identity.raise_for_status()
         report["account_scope"] = {key: identity.json().get(key) for key in ("id", "username", "tenant_id", "department_id", "role")}
+        def prewarm(case):
+            warmup = run_case(client, case, args.collection, strategy, conversations)
+            snapshot = {key: warmup[key] for key in ("id", "completed", "error", "total_ms", "stages_ms")}
+            report["warmups"].append(snapshot)
+            report.setdefault("warmup", snapshot)
+            if not warmup["completed"] or warmup["error"]:
+                raise RuntimeError("预热请求未完成，不能标记为预热验收")
         try:
-            if args.condition == "warm":
-                warmup = run_case(client, cases[0], args.collection, strategy, conversations)
-                report["warmup"] = {key: warmup[key] for key in ("id", "completed", "error", "total_ms", "stages_ms")}
-                if not warmup["completed"] or warmup["error"]: raise RuntimeError("预热请求未完成，不能标记为预热验收")
+            if args.condition == "warm" and not args.paired:
+                prewarm(cases[0])
             for case in cases:
+                if args.paired:
+                    prewarm(case)
                 rows.append(run_case(client, case, args.collection, strategy, conversations))
                 print(f"{case['id']}: completed={rows[-1]['completed']}, recall={rows[-1]['recall@5']}", flush=True)
         except (RuntimeError, httpx.HTTPError) as exc:

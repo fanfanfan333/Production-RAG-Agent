@@ -232,6 +232,26 @@ def expand(query, edges, hops=2, limit=50):
     return selected
 
 
+def bridge_contexts(query, edges):
+    """Keep the typed, verified first hop available when ranking a second-hop chunk."""
+    first_hops = expand(query, edges, hops=1)
+    contexts = {}
+    def vertices(edge):
+        return {(normal_name(edge.subject), edge.subject_type), (normal_name(edge.obj), edge.object_type)}
+    for edge in edges:
+        key = (edge.chunk.document_id, edge.chunk.chunk_index)
+        if edge in first_hops:
+            continue
+        references = []
+        for first in first_hops:
+            ref = (first.chunk.document_id, first.chunk.chunk_index, first.evidence)
+            if ref[:2] != key and vertices(edge) & vertices(first) and ref not in references:
+                references.append(ref)
+        if references:
+            contexts[key] = references[:2]
+    return contexts
+
+
 async def graph_candidates(query, scope, collection_id=None, document_id=None):
     if scope is None:
         raise GraphPermissionError("missing scope")
@@ -267,11 +287,13 @@ async def graph_candidates(query, scope, collection_id=None, document_id=None):
                 **_media_fields(payload), **_line_fields(payload), **_position_fields(payload), **_analysis_fields(payload))
             edges.append(GraphEdge(left, ltype, right, rtype, relation.predicate, chunk, relation.evidence))
         selected = expand(query, edges)
+        contexts = bridge_contexts(query, selected)
         chunks, seen = [], set()
         paths = []
         for edge in selected:
             identity = (edge.chunk.document_id, edge.chunk.chunk_index)
             if identity not in seen:
+                edge.chunk._graph_context = contexts.get(identity, [])
                 chunks.append(edge.chunk)
                 seen.add(identity)
             paths.append({"subject": edge.subject, "predicate": edge.predicate, "object": edge.obj,

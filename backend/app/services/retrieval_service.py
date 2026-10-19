@@ -154,6 +154,8 @@ class RetrievedChunk:
     # =memory`` 下与另两条腿判定不同源，且剔除不进审计。带上一份引用即可同源。
     # ``repr=False``：日志里不打印整块 payload；``compare=False``：不影响相等语义。
     _acl_payload: dict | None = field(default=None, repr=False, compare=False)
+    # Request-local first-hop quotes, for ranking only; never become cited source text.
+    _graph_context: list[tuple[str, int, str]] = field(default_factory=list, repr=False, compare=False)
 
     @property
     def is_image(self) -> bool:
@@ -345,11 +347,13 @@ def _chunk_key(chunk: RetrievedChunk) -> tuple[str, int]:
     return (chunk.document_id, chunk.chunk_index)
 
 
-def _merge_graph_candidates(candidates, merged, graph_keys, limit):
+def _merge_graph_candidates(candidates, merged, graph_keys, limit, graph_chunks=None):
     # Only merge evidence that survived the same document/object ACL checks as ANN.
     graph_picks = [merged[k] for k in sorted(graph_keys) if k in merged][:max(1, limit // 3)]
     if not graph_picks:
         return candidates
+    contexts = {_chunk_key(c): c._graph_context for c in (graph_chunks or [])}
+    graph_picks = [replace(c, _graph_context=contexts.get(_chunk_key(c), [])) for c in graph_picks]
     ordinary = [c for c in candidates if _chunk_key(c) not in graph_keys]
     return ordinary[:limit - len(graph_picks)] + graph_picks
 
@@ -2196,7 +2200,7 @@ async def retrieve_chunks(
     if fallback_path:
         candidates = _apply_score_filters(valid_candidates, fetch_final)
         if graph_keys:
-            candidates = _merge_graph_candidates(candidates, merged, graph_keys, settings.RERANKER_MAX_CANDIDATES)
+            candidates = _merge_graph_candidates(candidates, merged, graph_keys, settings.RERANKER_MAX_CANDIDATES, graph_chunks)
         # ⚠️ 只要**有**候选就必须进精排，不能因为"只有 1 条"就跳过 ——
         # 跳过会让 chunk.score 停留在**粗排分**（向量余弦 / 关键词占位 0.30），
         # 而下游（rag_graph 幻觉守卫、evidence_gate、retrieval_grader、
@@ -2258,7 +2262,7 @@ async def retrieve_chunks(
         candidates = [c for _, c in survivors[: settings.RERANKER_MAX_CANDIDATES]]
 
         if graph_keys:
-            candidates = _merge_graph_candidates(candidates, merged, graph_keys, settings.RERANKER_MAX_CANDIDATES)
+            candidates = _merge_graph_candidates(candidates, merged, graph_keys, settings.RERANKER_MAX_CANDIDATES, graph_chunks)
 
         # 同 fallback 分支：只要有候选就要打分，避免粗排分冒充精排分（量纲泄漏）。
         if settings.RERANKER_ENABLED and candidates:

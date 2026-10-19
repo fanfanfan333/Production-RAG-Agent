@@ -376,6 +376,17 @@ def get_reranker() -> ChunkReranker:
 
 # ── Public rerank API ─────────────────────────────────────────────────────────
 
+def ranking_texts(chunks):
+    """Only pair a bridge with first-hop evidence present in this authorized candidate pool."""
+    visible = {(c.document_id, c.chunk_index) for c in chunks}
+    texts = []
+    for chunk in chunks:
+        quotes = [quote[:600] for doc, index, quote in getattr(chunk, "_graph_context", [])[:2]
+                  if (doc, index) in visible]
+        texts.append("\n".join([*quotes, chunk.text]))
+    return texts
+
+
 async def rerank_chunks(
     query: str,
     chunks: "list[RetrievedChunk]",
@@ -427,6 +438,7 @@ async def rerank_chunks(
 
         # 1) 去重（保序：粗排名次靠前的优先保留）
         unique_chunks = dedup_candidates(chunks)
+        texts = ranking_texts(unique_chunks)
 
         vector_scores = [c.score for c in unique_chunks]
         score_queries: list[str] = [query]
@@ -438,11 +450,11 @@ async def rerank_chunks(
         # 2) 打分（单查询或多查询取 max）
         if len(score_queries) > 1:
             scores = await reranker.score_pairs_multi(
-                score_queries, [c.text for c in unique_chunks], vector_scores
+                score_queries, texts, vector_scores
             )
         else:
             scores = await reranker.score_pairs(
-                query, [c.text for c in unique_chunks], vector_scores
+                query, texts, vector_scores
             )
 
         if len(scores) != len(unique_chunks) or any(
