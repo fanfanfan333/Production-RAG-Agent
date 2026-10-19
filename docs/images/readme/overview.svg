@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="430" viewBox="0 0 1280 430" role="img" aria-labelledby="title desc">
+  <title id="title">Production-RAG-Agent：混合检索、图谱补链与可追溯问答</title>
+  <desc id="desc">项目概览示意图。多格式文档经解析与索引后，使用受权限约束的混合检索和两跳图检索，统一精排并校验引用。</desc>
+  <defs>
+    <linearGradient id="bg" x2="1" y2="1"><stop stop-color="#101c30"/><stop offset="1" stop-color="#172c41"/></linearGradient>
+    <pattern id="grid" width="36" height="36" patternUnits="userSpaceOnUse"><path d="M36 0H0V36" fill="none" stroke="#ffffff" stroke-opacity=".035"/></pattern>
+  </defs>
+  <rect width="1280" height="430" rx="22" fill="url(#bg)"/>
+  <rect width="1280" height="430" rx="22" fill="url(#grid)"/>
+  <g font-family="Segoe UI,Microsoft YaHei,Arial,sans-serif">
+    <rect x="48" y="36" width="196" height="28" rx="14" fill="#173d45" stroke="#387779"/>
+    <text x="146" y="55" text-anchor="middle" fill="#a8f0dc" font-size="12" letter-spacing="1.4">PRIVATE KNOWLEDGE · RAG</text>
+    <text x="48" y="124" fill="#f5f8fc" font-size="46" font-weight="700" letter-spacing="-1">Production-RAG-Agent</text>
+    <text x="50" y="168" fill="#c2d2e1" font-size="24">检索找到依据，图谱连接线索，回答回到原文。</text>
+    <text x="50" y="203" fill="#91a7bd" font-size="16">企业私有知识库 · 本地模型推理 · 复杂文档解析 · 权限隔离</text>
+    <g transform="translate(48 242)">
+      <rect width="376" height="114" rx="14" fill="#203247" stroke="#3c5067"/>
+      <text x="22" y="34" fill="#8ce1ce" font-size="12" letter-spacing="1.5">01 / HYBRID RETRIEVAL</text>
+      <text x="22" y="65" fill="#f2f6fb" font-size="23" font-weight="600">精确匹配 + 语义召回</text>
+      <text x="22" y="93" fill="#b2c4d6" font-size="15">BM25 / Qdrant / RRF / Cross-encoder</text>
+    </g>
+    <g transform="translate(452 242)">
+      <rect width="376" height="114" rx="14" fill="#183c42" stroke="#4a8c84"/>
+      <text x="22" y="34" fill="#9cead7" font-size="12" letter-spacing="1.5">02 / GRAPH EXPANSION</text>
+      <text x="22" y="65" fill="#f2f6fb" font-size="23" font-weight="600">跨文档两跳证据补链</text>
+      <text x="22" y="93" fill="#b5d6d1" font-size="15">实体类型约束 / 原文证据 / 授权范围</text>
+    </g>
+    <g transform="translate(856 242)">
+      <rect width="376" height="114" rx="14" fill="#203247" stroke="#3c5067"/>
+      <text x="22" y="34" fill="#8ce1ce" font-size="12" letter-spacing="1.5">03 / TRACEABLE ANSWERS</text>
+      <text x="22" y="65" fill="#f2f6fb" font-size="23" font-weight="600">统一精排与引用校验</text>
+      <text x="22" y="93" fill="#b2c4d6" font-size="15">证据门控 / 页码与行号 / 冲突提示</text>
+    </g>
+    <text x="50" y="397" fill="#93a9be" font-size="14">PDF · Word · Excel · PPTX · CSV · Markdown · 图片</text>
+    <text x="1230" y="397" text-anchor="end" fill="#93a9be" font-size="12">能力概览示意 / 非界面截图</text>
+  </g>
+</svg>

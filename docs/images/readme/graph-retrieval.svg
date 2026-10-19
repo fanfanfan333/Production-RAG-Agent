@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="630" viewBox="0 0 1280 630" role="img" aria-labelledby="title desc">
+  <title id="title">受权限约束的两跳图检索及原文证据链</title>
+  <desc id="desc">构造资料示例：青岚控股投资晴野科技，晴野科技位于海棠园区。每条关系对应独立原文，召回分片后统一精排与引用校验。</desc>
+  <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10Z" fill="#238575"/></marker></defs>
+  <rect x="1" y="1" width="1278" height="628" rx="20" fill="#f7f9fc" stroke="#d9e1e9"/>
+  <g font-family="Segoe UI,Microsoft YaHei,Arial,sans-serif">
+    <text x="44" y="47" fill="#477365" font-size="12" letter-spacing="2">HOW GRAPH RETRIEVAL HELPS</text>
+    <text x="44" y="89" fill="#172a3f" font-size="30" font-weight="700">答案不在一份文档里，就把两份证据连接起来。</text>
+    <rect x="44" y="115" width="1192" height="54" rx="10" fill="#eaf1f7"/>
+    <text x="66" y="149" fill="#344c65" font-size="20">问题：青岚控股投资的企业位于哪个园区？</text>
+    <rect x="44" y="200" width="1192" height="320" rx="14" fill="#fff" stroke="#b8d3c8" stroke-dasharray="7 5"/>
+    <text x="66" y="228" fill="#477365" font-size="13">仅在当前账号授权的文档与分片范围内连接实体</text>
+    <g fill="#eff5f8" stroke="#b7c9d7">
+      <rect x="80" y="258" width="264" height="88" rx="12"/>
+      <rect x="508" y="258" width="264" height="88" rx="12"/>
+    </g>
+    <rect x="936" y="258" width="264" height="88" rx="12" fill="#e6f4ee" stroke="#68a995"/>
+    <g fill="#172a3f" font-size="25" font-weight="600" text-anchor="middle">
+      <text x="212" y="298">青岚控股</text><text x="640" y="298">晴野科技</text><text x="1068" y="298">海棠园区</text>
+    </g>
+    <g fill="#62798e" font-size="13" text-anchor="middle"><text x="212" y="325">organization / 起点</text><text x="640" y="325">organization / 中间实体</text><text x="1068" y="325">location / 问题所求</text></g>
+    <g stroke="#238575" stroke-width="2.5" marker-end="url(#arrow)"><path d="M354 301H495"/><path d="M782 301H923"/></g>
+    <g fill="#238575" font-size="16" text-anchor="middle"><text x="426" y="283">投资</text><text x="854" y="283">位于</text></g>
+    <rect x="80" y="378" width="538" height="110" rx="10" fill="#f5f8fb" stroke="#dce5ec"/>
+    <rect x="640" y="378" width="560" height="110" rx="10" fill="#f5f8fb" stroke="#dce5ec"/>
+    <text x="100" y="406" fill="#638095" font-size="13">证据 A / relation-00-a.md / 第1页</text>
+    <text x="100" y="440" fill="#273f55" font-size="20">“青岚控股投资晴野科技。”</text>
+    <text x="100" y="467" fill="#657b8d" font-size="13">关系必须对应来源分片、原文引用与文档版本</text>
+    <text x="660" y="406" fill="#638095" font-size="13">证据 B / relation-00-b.md / 第1页</text>
+    <text x="660" y="440" fill="#273f55" font-size="20">“晴野科技位于海棠园区。”</text>
+    <text x="660" y="467" fill="#657b8d" font-size="13">图召回返回原文分片，与混合检索候选统一精排</text>
+    <rect x="44" y="543" width="1192" height="43" rx="9" fill="#172d40"/>
+    <text x="640" y="570" text-anchor="middle" fill="#e4f3ee" font-size="16">先鉴权 → 最多2跳 / 50条关系 → 原文候选融合 → 统一精排 → 证据门控与引用校验</text>
+    <text x="44" y="611" fill="#708395" font-size="12">构造资料与实际测试同名示例 / 原理示意，非自动生成的社区摘要</text>
+    <text x="1236" y="611" text-anchor="end" fill="#708395" font-size="12">图索引异常回退普通检索；鉴权异常拒绝访问</text>
+  </g>
+</svg>
