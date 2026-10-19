@@ -14,7 +14,8 @@ def compare(baseline, graph):
     right = {row["id"]: row for row in graph["cases"]}
     if len(left) != len(baseline["cases"]) or len(right) != len(graph["cases"]):
         raise ValueError("重复用例 ID，不能用于门禁")
-    if not left or left.keys() != right.keys() or baseline.get("aborted") or graph.get("aborted"):
+    if (not left or left.keys() != right.keys() or baseline.get("aborted") or graph.get("aborted")
+            or baseline.get("in_progress") or graph.get("in_progress")):
         raise ValueError("用例不同或运行中断")
     multi = [key for key in left if left[key]["category"] == "multihop"]
     ordinary = [key for key in left if left[key]["category"] in {"fact", "table", "image"}]

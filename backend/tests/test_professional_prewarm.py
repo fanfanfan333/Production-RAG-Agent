@@ -26,6 +26,11 @@ def test_paired_run_prewarms_each_query_before_measuring(monkeypatch, tmp_path):
         def get(self, path):
             return SimpleNamespace(raise_for_status=lambda: None, json=lambda: dict(id="owner"))
     def run_case(client, case, collection, strategy, conversations):
+        checkpoint = json.loads((tmp_path / "result-hybrid.json").read_text())
+        assert checkpoint["in_progress"]
+        assert checkpoint["expected_cases"] == 2
+        if case["id"] == "case-1":
+            assert checkpoint["cases"][0]["id"] == "case-0"
         calls.append(case["id"])
         return dict(id=case["id"], category="fact", completed=True, error=None,
                     total_ms=1, stages_ms={}, **{"recall@5": 1})
@@ -36,5 +41,6 @@ def test_paired_run_prewarms_each_query_before_measuring(monkeypatch, tmp_path):
     assert calls == ["case-0", "case-0", "case-1", "case-1"]
     report = json.loads((tmp_path / "result-hybrid.json").read_text(encoding="utf-8"))
     assert report["summary"]["cases"] == 2
+    assert not report["in_progress"]
     assert report["warmup_policy"] == "per_case"
     assert [row["id"] for row in report["warmups"]] == ["case-0", "case-1"]

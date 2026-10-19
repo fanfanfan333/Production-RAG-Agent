@@ -257,7 +257,7 @@ export function ChatInterface() {
   } = useApp();
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
-  const [graphRetrieval, setGraphRetrieval] = useState(false);
+  const [graphRetrieval, setGraphRetrieval] = useState(true);
   const [isStreaming, setIsStreaming] = useState(false);
   const [lastQuery, setLastQuery] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);

@@ -231,12 +231,22 @@ def run_report(args, gold, cases, strategy, token, initial_memory):
               "gold_sha256": hashlib.sha256(args.gold.read_bytes()).hexdigest(), "config_version": args.config_version,
               "strategy": strategy, "collection_id": args.collection, "session_start_available_gb": initial_memory,
               "warmup_policy": "per_case" if args.paired else ("once" if args.condition == "warm" else "none"),
-              "warmups": [],
+              "warmups": [], "in_progress": True, "expected_cases": len(cases),
               "method": "document/page recall, literal answer/numeric checks plus server citation verifier; requires human answer review", "cases": rows}
     with httpx.Client(base_url=args.url.rstrip("/"), headers={"Authorization": f"Bearer {token}"}, timeout=300, trust_env=False,
         limits=httpx.Limits(max_keepalive_connections=0)) as client:
         identity = client.get("/auth/me"); identity.raise_for_status()
         report["account_scope"] = {key: identity.json().get(key) for key in ("id", "username", "tenant_id", "department_id", "role")}
+        def checkpoint():
+            report["created_conversations"] = sorted(conversations)
+            report["summary"] = aggregate(rows)
+            report["by_category"] = {kind: aggregate([row for row in rows if row["category"] == kind]) for kind in sorted({row["category"] for row in rows})}
+            args.out.parent.mkdir(parents=True, exist_ok=True)
+            output = args.out.with_name(f"{args.out.stem}-{strategy}.json") if args.paired else args.out
+            temporary = output.with_suffix(".tmp")
+            temporary.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+            temporary.replace(output)
+        checkpoint()
         def prewarm(case):
             warmup = run_case(client, case, args.collection, strategy, conversations)
             snapshot = {key: warmup[key] for key in ("id", "completed", "error", "total_ms", "stages_ms")}
@@ -251,15 +261,16 @@ def run_report(args, gold, cases, strategy, token, initial_memory):
                 if args.paired:
                     prewarm(case)
                 rows.append(run_case(client, case, args.collection, strategy, conversations))
+                checkpoint()
                 print(f"{case['id']}: completed={rows[-1]['completed']}, recall={rows[-1]['recall@5']}", flush=True)
         except (RuntimeError, httpx.HTTPError) as exc:
             report["aborted"] = str(exc)
+        except BaseException as exc:
+            report["aborted"] = type(exc).__name__
+            raise
         finally:
-            report["summary"] = aggregate(rows)
-            report["by_category"] = {kind: aggregate([row for row in rows if row["category"] == kind]) for kind in sorted({row["category"] for row in rows})}
-            args.out.parent.mkdir(parents=True, exist_ok=True)
-            output = args.out.with_name(f"{args.out.stem}-{strategy}.json") if args.paired else args.out
-            output.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+            report["in_progress"] = False
+            checkpoint()
             for identifier in conversations:
                 if getattr(client, "is_closed", False):
                     print("低内存导致连接关闭，本轮会话未清理，请按报告核查", flush=True)

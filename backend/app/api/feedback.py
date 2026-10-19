@@ -24,6 +24,7 @@ from app.services.tenancy import home_tenant_id, DEFAULT_TENANT_ID
 from app.db.postgres import get_db_session
 from app.db.user_models import User
 from app.services.audit_service import record_audit
+from app.services.prompt_security import normalize_text
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -73,6 +74,8 @@ async def submit_feedback(
     body: FeedbackRequest,
     user: Annotated[User, Depends(require_permission("feedback.write"))],
 ) -> dict:
+    # Queries are normalized on ingestion; keep exact legacy history valid too.
+    question_candidates = {body.question, normalize_text(body.question)}
     async with get_db_session() as session:
         conversation = await session.get(Conversation, body.conversation_id) if body.conversation_id else None
         if (conversation is None or conversation.owner_id != user.id
@@ -87,7 +90,7 @@ async def submit_feedback(
             user_message = aliased(Message)
             statement = statement.join(user_message, (user_message.conversation_id == Message.conversation_id)
                 & (user_message.created_at == Message.created_at) & (user_message.role == "user")).where(
-                    Message.content == body.answer, user_message.content == body.question)
+                    Message.content == body.answer, user_message.content.in_(question_candidates))
         message = await session.scalar(statement.order_by(Message.created_at.desc()).limit(1))
         if message is None or message.content != body.answer:
             raise HTTPException(409, "请刷新会话后，对已完成的真实回答提交反馈")
@@ -95,7 +98,7 @@ async def submit_feedback(
             Message.conversation_id == conversation.id, Message.role == "user",
             Message.created_at == message.created_at,
         ).limit(1))
-        if question is None or question.content != body.question:
+        if question is None or question.content not in question_candidates:
             raise HTTPException(409, "反馈问题与回答记录不一致")
         body.question, body.answer = question.content, message.content
         row = AnswerFeedback(

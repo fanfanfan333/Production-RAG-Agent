@@ -377,7 +377,7 @@ async def query_endpoint(
         ),
         media_type="text/event-stream",
         headers={
-            "Cache-Control": "no-cache",
+            "Cache-Control": "no-cache, no-transform",  # prevent proxy gzip buffering of SSE
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",       # disable nginx proxy buffering
             "Access-Control-Allow-Origin": "*",

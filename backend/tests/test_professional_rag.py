@@ -131,6 +131,42 @@ def test_offline_training_checks_tampering_without_loading_models():
         validate_bundle(bundle)
 
 
+@pytest.mark.parametrize("stored,submitted,answer,expected", [
+    ("ABX-109每隔多少天维护?", "ABX-109每隔多少天维护？", "39天", 200),
+    ("ABX-109每隔多少天维护？", "ABX-109每隔多少天维护？", "39天", 200),
+    ("ABX-109每隔多少天维护?", "ABX-110每隔多少天维护？", "39天", 409),
+    ("ABX-109每隔多少天维护?", "ABX-109每隔多少天维护？", "40天", 409),
+])
+def test_feedback_uses_true_answer_and_accepts_normalized_or_legacy_question(monkeypatch, stored, submitted, answer, expected):
+    from app.api import feedback
+    owner, conversation_id, message_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    conversation = SimpleNamespace(id=conversation_id, owner_id=owner, tenant_id="tenant")
+    added = []
+    class Session:
+        def __init__(self):
+            self.results = iter((SimpleNamespace(id=message_id, content="39天", created_at=None), SimpleNamespace(content=stored)))
+        async def get(self, *args): return conversation
+        async def scalar(self, *args): return next(self.results)
+        def add(self, row): added.append(row)
+        async def commit(self): pass
+    @asynccontextmanager
+    async def session(): yield Session()
+    async def audit(*args, **kwargs): pass
+    monkeypatch.setattr(feedback, "get_db_session", session)
+    monkeypatch.setattr(feedback, "home_tenant_id", lambda user: "tenant")
+    monkeypatch.setattr(feedback, "record_audit", audit)
+    body = feedback.FeedbackRequest(rating="up", question=submitted, answer=answer, conversation_id=conversation_id)
+    user = SimpleNamespace(id=owner, username="qa")
+    if expected == 200:
+        assert asyncio.run(feedback.submit_feedback(body, user))["recorded"]
+        assert added[0].question == stored and added[0].answer == "39天"
+    else:
+        with pytest.raises(feedback.HTTPException) as error:
+            asyncio.run(feedback.submit_feedback(body, user))
+        assert error.value.status_code == expected
+        assert not added
+
+
 def test_fixture_golden_has_120_grounded_cases():
     from scripts.make_professional_golden import make_golden, verify
     golden = make_golden()

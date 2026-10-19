@@ -47,7 +47,8 @@ def _security_headers(response: Response, request_id: str) -> None:
     response.headers["Referrer-Policy"] = "no-referrer"
     response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
     response.headers["Content-Security-Policy"] = "default-src 'none'; frame-ancestors 'none'"
-    response.headers["Cache-Control"] = "no-store"
+    directives = {value.strip().lower() for value in response.headers.get("Cache-Control", "").split(",")}
+    response.headers["Cache-Control"] = "no-store" + (", no-transform" if "no-transform" in directives else "")
 
 
 def _error(status_code: int, detail: str, request_id: str) -> JSONResponse:
