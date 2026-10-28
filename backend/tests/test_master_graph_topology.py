@@ -111,6 +111,7 @@ def test_all_framework_nodes_present():
         "multimodal_context",  # 图片上下文（部分6：Grade 与 Generate 之间）
         "evidence_gate",      # 确定性证据门控（形态不达标 → 拒答）
         "citation_verifier",  # 五项引用校验（Generate → Verifier → Output Guard）
+        "evidence_review",    # 条件化证据审阅（多 Agent，默认关闭时为空节点）
         "build_document",     # Document Agent（Word 交付物生成）
         "output_guard",       # Citation Check / 输出防护
         "save_history",       # 收尾落库
@@ -167,11 +168,19 @@ def test_evidence_gate_is_fail_closed_refusal():
 
 
 def test_citation_verifier_sits_between_generate_and_guard():
-    """图4：Generate → Citation Verifier → Output Guard（五项校验必经）."""
+    """图4：Generate → Citation Verifier → Evidence Review → Output Guard.
+
+    Evidence Review 是条件化多 Agent 的唯一落地形态（默认关闭、至多 1 次额外
+    LLM 调用）；它必须排在 Citation Verifier **之后** —— 引用已经被校正过，
+    审阅看的才是最终正文；也必须排在 Output Guard **之前**，这样审阅追加的
+    提示同样会被输出防护检查。
+    """
     edges = _edges(get_master_graph())
     assert ("generate", "citation_verifier") in edges
-    assert ("citation_verifier", "output_guard") in edges
+    assert ("citation_verifier", "evidence_review") in edges
+    assert ("evidence_review", "output_guard") in edges
     assert ("generate", "output_guard") not in edges, "generate 必须经 Citation Verifier"
+    assert ("citation_verifier", "output_guard") not in edges, "审阅节点不得被绕过"
     # Document Agent 产物是代码确定性拼装的纯文本、不含引用，无需过 Verifier
     assert ("build_document", "citation_verifier") not in edges
     print("[OK] test_citation_verifier_sits_between_generate_and_guard")
@@ -194,11 +203,13 @@ def test_all_generation_paths_pass_output_guard():
     for src in ("chat", "summarize", "analyze_relations"):
         assert (src, "output_guard") in edges, f"{src} must pass output_guard"
         assert (src, "save_history") not in edges, f"{src} must NOT bypass output_guard"
-    # 问答主路径：generate → citation_verifier → output_guard
+    # 问答主路径：generate → citation_verifier → evidence_review → output_guard
     assert ("generate", "citation_verifier") in edges
-    assert ("citation_verifier", "output_guard") in edges
+    assert ("citation_verifier", "evidence_review") in edges
+    assert ("evidence_review", "output_guard") in edges
     assert ("generate", "save_history") not in edges
     assert ("citation_verifier", "save_history") not in edges
+    assert ("evidence_review", "save_history") not in edges, "审阅不得直接跳过输出防护"
     assert ("output_guard", "save_history") in edges
     assert ("save_history", "__end__") in edges
     print("[OK] test_all_generation_paths_pass_output_guard")
@@ -214,11 +225,15 @@ def test_refusal_bypasses_output_guard():
 
 
 def test_llm_node_classification_is_exhaustive():
-    """图内 7 个会调 LLM 的节点必须全部归入 生成类/决策类，防止 JSON 再泄漏."""
+    """图内所有会调 LLM 的节点必须全部归入 生成类/决策类，防止 JSON 再泄漏.
+
+    本次新增 `evidence_review`（条件化多 Agent 审阅）：它输出的是内部 JSON
+    结论，必须归入**决策类**，否则 token 会漏进答案。
+    """
     all_llm_nodes = STREAMING_LLM_NODES | INTERNAL_LLM_NODES
     assert all_llm_nodes == {
         "generate", "chat", "summarize", "analyze_relations",  # 生成类
-        "route", "rewrite", "grade",                            # 决策类
+        "route", "rewrite", "grade", "evidence_review",        # 决策类
     }
     assert not (STREAMING_LLM_NODES & INTERNAL_LLM_NODES)
     print("[OK] test_llm_node_classification_is_exhaustive")

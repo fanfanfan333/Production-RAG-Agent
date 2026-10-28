@@ -15,6 +15,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.admin_users import router as admin_users_router
+from app.api.agent_runtime import router as agent_runtime_router
 from app.api.auth import router as auth_router
 from app.api.badcases import router as badcases_router
 from app.api.collections import router as collections_router
@@ -37,6 +38,7 @@ from app.config import RERANK_MIN_SCORE_RATIO_CEILING, get_settings
 from app.middleware.gateway import gateway_middleware
 from app.db import models  # noqa: F401 — registers Phase 2 tables with Base.metadata
 from app.db import conversation_models  # noqa: F401 — registers Phase 4 tables
+from app.db import agent_memory_models  # noqa: F401 — registers Agent Runtime memory table
 from app.db import feedback_models  # noqa: F401 — registers answer_feedback table
 from app.db import badcase_models  # noqa: F401 — registers bad_cases table (回流队列)
 from app.db import quality_models  # noqa: F401 — registers quality_events table (质量监控)
@@ -241,6 +243,7 @@ def create_app() -> FastAPI:
     app.include_router(collections_router)       # Phase 3 — Qdrant admin API (admin)
     app.include_router(query_router)             # Phase 4 — POST /query SSE (auth)
     app.include_router(conversations_router)     # Phase 4 — conversation history (auth)
+    app.include_router(agent_runtime_router)     # Agent Runtime — /agent/skills + 个人长期记忆
     app.include_router(feedback_router)          # 反馈闭环 — POST/GET /feedback (auth/admin)
     app.include_router(badcases_router)          # 持续监控 — /badcases 审阅队列 + 指标
     app.include_router(quality_router)           # 质量监控 — /quality/stats 时间窗聚合

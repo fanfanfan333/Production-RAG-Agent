@@ -114,9 +114,13 @@ def test_node_sets_are_disjoint():
 
 
 def test_all_llm_nodes_covered():
-    """主图谱里 7 个会调 LLM 的节点必须都被归类，不能漏."""
+    """主图谱里所有会调 LLM 的节点必须都被归类，不能漏.
+
+    新增 `evidence_review`（条件化多 Agent 审阅）后共 8 个：它产出内部 JSON
+    结论，必须归入决策类，否则审阅结果会漏进答案。
+    """
     all_llm_nodes = {
-        "route", "rewrite", "grade",
+        "route", "rewrite", "grade", "evidence_review",
         "generate", "chat", "summarize", "analyze_relations",
     }
     assert STREAMING_LLM_NODES | INTERNAL_LLM_NODES == all_llm_nodes

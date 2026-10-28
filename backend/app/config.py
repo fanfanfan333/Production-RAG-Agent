@@ -759,6 +759,33 @@ class Settings(BaseSettings):
     DOCUMENT_AGENT_MAX_IMAGES: int = 4           # 插入文档的原始图片上限
     DOCUMENT_AGENT_MAX_TABLE_ROWS: int = 60      # 表格写入行数上限（防失控文档）
 
+    # ── Agent Runtime（Skill / 分层上下文 / 长期记忆 / 条件化审阅）──────────────
+    # 四个子能力各有独立开关，任一关闭或异常都回落到升级前的单图行为。
+    # 见 `_audit/agent_evolution/ARCHITECTURE.md` 的「开关与回退」一节。
+    #
+    # 只读 Skill：确定性选择 + 常量指令，**不增加 LLM 调用**。默认开 —— 它是
+    # 纯提示侧的作答纪律，收益确定、风险面只有提示词本身，一键可关。
+    AGENT_SKILLS_ENABLED: bool = True
+    # 分层上下文：只有在会话超过 `AGENT_RECENT_PAIRS` 对消息时才产出摘要层，
+    # 短会话与升级前逐字节相同（不会多插 system 消息）。
+    AGENT_CONTEXT_LAYERS_ENABLED: bool = True
+    AGENT_RECENT_PAIRS: int = 3                 # 与 conversation_service 默认值一致
+    # 分层开时**加载**的历史窗口（对）。必须大于 AGENT_RECENT_PAIRS，否则
+    # 「更早轮次」恒为空、摘要层永远不产出 —— 这正是"功能开着但没生效"的经典形态。
+    # 只影响读取量：真正进提示的仍然只有最近 AGENT_RECENT_PAIRS 对。
+    AGENT_HISTORY_WINDOW_PAIRS: int = 12
+    AGENT_MEMORY_LAYER_BUDGET: int = 800        # 长期记忆层字符预算
+    AGENT_SESSION_DIGEST_BUDGET: int = 600      # 会话摘要层字符预算
+    AGENT_RECENT_LAYER_BUDGET: int = 2400       # 最近轮次层字符预算
+    # 长期记忆：只提取用户**显式**声明（"记住：…"），确定性规则、零 LLM 调用。
+    # 默认关 —— 它会产生跨会话持久化数据，必须先由使用方确认合规口径再开。
+    AGENT_MEMORY_ENABLED: bool = False
+    AGENT_MEMORY_MAX_ITEMS: int = 8
+    # 条件化多 Agent（有界证据交叉审阅）：默认关，单次请求至多 1 次额外 LLM 调用，
+    # 只在「跨文档 + 多跳/对比信号 + 证据门控通过」时触发，失败静默回退。
+    MULTI_AGENT_ENABLED: bool = False
+    MULTI_AGENT_TIMEOUT_SECONDS: float = 12.0
+
     # ── API gateway / edge protection ─────────────────────────────────────────
     # In-process gateway policy. For multi-instance production, pair this with
     # Kong/APISIX/Envoy and a Redis-backed distributed limiter.

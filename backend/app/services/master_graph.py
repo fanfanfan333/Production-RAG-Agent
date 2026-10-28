@@ -170,6 +170,9 @@ class MasterState(TypedDict):
     query: str
     conversation_id: str
     history_messages: list[BaseMessage]
+    # 更宽的历史窗口（默认为空）。只供"分层上下文"抽取更早轮次用：
+    # 进提示的仍然是 history_messages，window 里的内容只会被压成一句摘要。
+    history_window: list[BaseMessage]
     top_k: int
     owner_id: str | None
     collection_id: str | None
@@ -239,6 +242,10 @@ class MasterState(TypedDict):
     # Output Guard（问题3+问题4）审计信号：citations_removed / leaked_phrases /
     # hallucination_phrases / tool_attempt_phrases / changed。
     output_guard: dict
+
+    # Agent Runtime（只读 Skill / 分层上下文 / 长期记忆 / 条件化审阅）
+    # 的决策与计量记录。只放"用了什么"，不放原文；随 SSE 下发一次并落库。
+    agent_trace: dict
 
 
 # ── 节点：路由 ───────────────────────────────────────────────────────────────
@@ -827,6 +834,133 @@ async def _citation_verifier_node(state: MasterState) -> dict:
     }
 
 
+# ── Agent Runtime（受控能力层）──────────────────────────────────────────────
+#
+# 四项能力（只读 Skill / 分层上下文 / 长期记忆 / 条件化审阅）里，前三项都在
+# **提示与上下文层**落地，不新增图节点：
+#
+#   * 只读 Skill → 追加一段常量作答纪律（零 LLM 调用）；
+#   * 分层上下文 → 有更早轮次或记忆时，额外一条 system「状态层」；
+#   * 长期记忆   → 上一条状态层里的一段（默认关闭）。
+#
+# 第四项（条件化审阅）必须独立成节点，理由见 `_evidence_review_node`。
+#
+# 全部包在 try/except 里：任何一项出问题只记一条 fallback，**绝不让问答失败**。
+# 这不是"防御性代码癖"——新能力不能成为新的故障面，这是升级的准入条件。
+
+
+def _history_for_layers(state: MasterState) -> list:
+    """拼出**供分层上下文使用的完整历史**（更早窗口 + 最近轮次）.
+
+    为什么必须拼起来，而不是只喂 ``history_window``：
+
+    ``query.py`` 把历史切成 ``(recent, older)``，``older`` 才是
+    ``history_window``。分层模块内部还要在**它拿到的输入**里再切掉最近
+    ``recent_pairs`` 对，剩下的才算"更早轮次"。于是只喂 ``older`` 时：
+
+        4~6 对消息 → older 里有 1~3 个用户问题 → 全部被当成"最近"，摘要层为空
+
+    实测（4/5/6 对）摘要长度恒为 0，只有 ≥8 对才产出 —— 又一次"功能开着、
+    线上不生效"。拼接后语义才对：完整历史里切掉最近 N 对，其余才是更早轮次。
+
+    ``recent`` 是 ``older`` 的**后缀切片**（同一批对象），所以先判重再拼接，
+    避免将来调用方直接把全量历史传进 ``history_window`` 时出现重复轮次。
+    """
+    window = list(state.get("history_window") or [])
+    recent = list(state.get("history_messages") or [])
+    if not window:
+        return recent
+    if recent and len(window) >= len(recent):
+        tail = window[-len(recent):]
+        if all(left is right for left, right in zip(tail, recent)):
+            return window
+    return window + recent
+
+
+async def _agent_context_for_generate(settings, state: MasterState, sources: list[dict]):
+    """装配生成阶段的三项运行时能力.
+
+    Returns:
+        ``(AgentTrace, skill_instruction, layer_block)``。任一项不可用时对应
+        返回值退化为空串，调用方据此完全不加内容（= 升级前的行为）。
+    """
+    from app.agent_runtime import context_layers as layers_mod
+    from app.agent_runtime import memory_store as memory_mod
+    from app.agent_runtime.review import distinct_documents  # 同一套"几份文档"口径
+    from app.agent_runtime.skills import render_instruction, resolve_skill
+    from app.agent_runtime.trace import AgentTrace
+
+    trace = AgentTrace()
+    document_count = distinct_documents(sources or [])
+
+    resolution = None
+    try:
+        resolution = resolve_skill(
+            intent=str(state.get("intent") or ""),
+            query=str(state.get("query") or ""),
+            document_count=document_count,
+            enabled=bool(getattr(settings, "AGENT_SKILLS_ENABLED", False)),
+        )
+        trace.mark_skill(resolution.as_audit() if resolution else None)
+    except Exception as exc:  # noqa: BLE001 - 运行时不变量：任何异常都只回退
+        logger.warning("agent_runtime.skill 不可用，已回退：%s", exc)
+        trace.mark_fallback("skill", type(exc).__name__)
+
+    memory_items: list[dict] = []
+    if bool(getattr(settings, "AGENT_MEMORY_ENABLED", False)):
+        try:
+            from app.db.postgres import get_db_session  # 仅在开启时加载
+
+            raw_user = state.get("user_id")
+            user_uuid = uuid.UUID(str(raw_user)) if raw_user else None
+            async with get_db_session() as session:
+                rows = await memory_mod.load_memories(
+                    session,
+                    tenant_id=state.get("conversation_tenant_id"),
+                    user_id=user_uuid,
+                    limit=int(getattr(settings, "AGENT_MEMORY_MAX_ITEMS", 8)),
+                )
+            memory_items = memory_mod.as_context_items(rows)
+            trace.mark_memory(
+                {"enabled": True, "items": len(memory_items), "scope": "tenant+user"}
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("agent_runtime.memory 读取失败，已回退：%s", exc)
+            trace.mark_memory({"enabled": True, "items": 0, "error": type(exc).__name__})
+            trace.mark_fallback("memory", type(exc).__name__)
+    else:
+        trace.mark_memory({"enabled": False, "items": 0})
+
+    layer_block = ""
+    if bool(getattr(settings, "AGENT_CONTEXT_LAYERS_ENABLED", False)):
+        try:
+            layered = layers_mod.build_layered_context(
+                # 必须是**完整历史**：只喂 history_window（更早段）会让分层模块
+                # 再切掉最近几对后什么都不剩，摘要层在 4~6 对消息时恒空。
+                _history_for_layers(state),
+                memory_items,
+                budgets=layers_mod.LayerBudgets(
+                    memory=int(getattr(settings, "AGENT_MEMORY_LAYER_BUDGET", 800)),
+                    session_digest=int(
+                        getattr(settings, "AGENT_SESSION_DIGEST_BUDGET", 600)
+                    ),
+                    recent=int(getattr(settings, "AGENT_RECENT_LAYER_BUDGET", 2400)),
+                ),
+                recent_pairs=int(getattr(settings, "AGENT_RECENT_PAIRS", 3)),
+                memory_enabled=bool(getattr(settings, "AGENT_MEMORY_ENABLED", False)),
+            )
+            trace.mark_layers(layered.trace)
+            layer_block = layered.system_block
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("agent_runtime.layers 装配失败，已回退：%s", exc)
+            trace.mark_fallback("layers", type(exc).__name__)
+
+    skill_text = render_instruction(resolution) if resolution else ""
+    # 注入指纹：证明"这一轮到底往提示里加了什么"，又不把正文复制进审计快照。
+    trace.mark_injection(skill_text=skill_text, layer_text=layer_block)
+    return trace, skill_text, layer_block
+
+
 async def _generate_node(state: MasterState) -> dict:
     """
     生成节点 —— 使用 multimodal_context 节点组装好的上下文
@@ -882,9 +1016,35 @@ async def _generate_node(state: MasterState) -> dict:
             "原文和中文解释放在同一句，最后标注该来源，不要把原文另放到下一段；原样保留单位，"
             "不要扩写无关实验配置，也不要改写英文原文。"
         )
+    # ── Agent Runtime：只读 Skill 指令 + 分层状态层 ──────────────────────────
+    # 该 helper 内部逐项 try/except，任何一项不可用时返回值退化为空，
+    # 下面两条 if 都不成立 → 消息列表与升级前完全一致。
+    agent_trace, skill_instruction, layer_block = await _agent_context_for_generate(
+        settings, state, sources
+    )
+    if skill_instruction:
+        # 技能指令放在最前：它是"作答纪律"，必须先于具体指令被读到。
+        focused_query = f"{skill_instruction}\n\n{focused_query}"
+
+    history_messages = _trim_history(state["history_messages"])
+    if layer_block and agent_trace.context_layers:
+        # 报"真正送进去的"历史层字符数（已过 _trim_history 的 400 字截断），
+        # 而不是分层模块自己那套未截断的渲染值 —— trace 不能自说自话。
+        agent_trace.context_layers["chars"]["recent_sent"] = sum(
+            len(str(getattr(m, "content", "") or "")) for m in history_messages
+        )
+
+    # 状态层**并入**第一条 system 消息，而不是再插一条 SystemMessage：
+    # 部分 chat template 只认开头那一条 system，第二条会被降级成普通文本甚至
+    # 被模板丢弃（表现为"记忆/摘要加进去了但完全没效果"）。并入后无层时
+    # system 正文与升级前逐字节相同。
+    system_content = _SYSTEM_TEMPLATE.format(context=context_text)
+    if layer_block:
+        system_content = f"{system_content}\n\n{layer_block}"
+
     messages: list[BaseMessage] = [
-        SystemMessage(content=_SYSTEM_TEMPLATE.format(context=context_text)),
-        *_trim_history(state["history_messages"]),
+        SystemMessage(content=system_content),
+        *history_messages,
         HumanMessage(content=focused_query),
     ]
 
@@ -895,7 +1055,93 @@ async def _generate_node(state: MasterState) -> dict:
         answer += warning
 
     # sources 以 multimodal_context 节点的为准（它带图文信息与 vision 结论）
-    return {"answer": answer}
+    return {"answer": answer, "agent_trace": agent_trace.as_dict()}
+
+
+# ── 节点：条件化证据审阅（多 Agent 的唯一落地形态）───────────────────────────
+#
+# 为什么独立成节点，而不是在 generate 里顺手调一次：
+# `astream_events` 会把**任何** LLM 调用的 token 发出来，只有归入决策类
+# （INTERNAL_LLM_NODES）的节点才会被过滤。审阅产出的是内部 JSON，若把这次
+# 调用塞进 generate，用户会看到一段裸 JSON 拼进答案 —— 这正是当年
+# route / rewrite 泄漏 JSON 的同一个坑。独立节点 + 归入决策类，是唯一安全的做法。
+#
+# 默认 `MULTI_AGENT_ENABLED=False`：节点常驻图里但立即返回，不花任何调用，
+# 不改变任何输出。开启后也只在确定性规则判定为复杂时触发，且至多 1 次调用。
+
+
+async def _evidence_review_node(state: MasterState) -> dict:
+    settings = get_settings()
+    trace = dict(state.get("agent_trace") or {})
+
+    from app.agent_runtime.review import (
+        MAX_EXTRA_LLM_CALLS,
+        REVIEW_SYSTEM_PROMPT,
+        apply_verdict,
+        build_evidence_digest,
+        build_review_prompt,
+        parse_verdict,
+        should_review,
+    )
+
+    decision = should_review(
+        enabled=bool(getattr(settings, "MULTI_AGENT_ENABLED", False)),
+        intent=str(state.get("intent") or ""),
+        query=str(state.get("query") or ""),
+        sources=state.get("sources") or [],
+        evidence_passed=bool((state.get("evidence") or {}).get("passed", False)),
+        citation_overall=str((state.get("citation_check") or {}).get("overall") or ""),
+    )
+    audit = decision.as_audit()
+    if not decision.fire:
+        trace["review"] = {**audit, "status": "skipped"}
+        return {"agent_trace": trace}
+
+    answer = str(state.get("answer") or "")
+    # 必须用**完整正文**构造审阅证据：sources 里的 text_snippet 是给前端展示的
+    # 300 字预览，拿它当原文会把「数字/条款落在截断之后」系统性判成"不被支持"，
+    # 于是每条正确回答都被追加一句"证据较弱"。这与引用校验当年的坑完全同源
+    # （见 `_sources_with_full_text` 的注释），复用它的副本而不是重写一套。
+    digest = build_evidence_digest(_sources_with_full_text(state), answer=answer)
+    if not answer or not digest:
+        trace["review"] = {**audit, "status": "skipped", "reason": "empty_answer_or_evidence"}
+        return {"agent_trace": trace}
+
+    started_at = time.perf_counter()
+    try:
+        reviewer = _build_review_llm(settings)
+        raw = await asyncio.wait_for(
+            reviewer.ainvoke(
+                [
+                    SystemMessage(content=REVIEW_SYSTEM_PROMPT),
+                    HumanMessage(
+                        content=build_review_prompt(
+                            question=str(state.get("query") or ""),
+                            answer=answer,
+                            evidence_digest=digest,
+                        )
+                    ),
+                ]
+            ),
+            timeout=float(getattr(settings, "MULTI_AGENT_TIMEOUT_SECONDS", 12.0)),
+        )
+    except Exception as exc:  # noqa: BLE001 - 审阅是增强项，失败必须静默回退
+        logger.warning("evidence_review 未完成，回退单图结论：%s", exc)
+        trace["review"] = {**audit, "status": "fallback", "error": type(exc).__name__}
+        return {"agent_trace": trace}
+
+    verdict = parse_verdict(getattr(raw, "content", "") or "")
+    new_answer, appended = apply_verdict(answer, verdict)
+    trace["review"] = {
+        **audit,
+        **verdict.as_audit(),
+        "applied": appended,
+        # 只回传**增量**：正文已经流式发到浏览器，前端只需追加这一句。
+        "appended_suffix": new_answer[len(answer):] if appended else "",
+        "duration_ms": round((time.perf_counter() - started_at) * 1000, 2),
+        "max_extra_llm_calls": MAX_EXTRA_LLM_CALLS,
+    }
+    return {"answer": new_answer, "agent_trace": trace}
 
 
 async def _refuse_node(state: MasterState) -> dict:
@@ -1304,6 +1550,9 @@ def _build_turn_meta(state: MasterState) -> dict:
         # 管线徽章：重新打开历史时仍能显示"这轮走的哪条链路"
         "graph_retrieval": {"paths": state.get("graph_paths", []), "notice": state.get("retrieval_notice", "")},
         "intent": state.get("intent") or "",
+        # Agent Runtime 审计：重开历史时仍能回答"这条回答用了哪版技能、
+        # 各层上下文花了多少字符、有没有触发交叉审阅"。
+        "agent_trace": state.get("agent_trace") or {},
         # 引用来源（含图片对象：image_url / image_type / vision）
         "sources": state.get("sources") or [],
         # 答复性质：拒答时重开历史同样要把来源标成"未采用"，
@@ -1334,11 +1583,58 @@ def _build_turn_meta(state: MasterState) -> dict:
     }
 
 
+async def _capture_explicit_memories(state: MasterState) -> None:
+    """把用户本轮**显式声明**的长期设定落库（默认关闭）.
+
+    只认"记住：…"这类明确说法，用确定性规则抽取（零 LLM 调用）。理由见
+    `app/agent_runtime/memory_store.py` 顶部：自动抽取会让检索片段绕过
+    Evidence Gate 变成"用户说过的事实"。
+
+    失败一律吞掉：长期记忆是增强项，写不进去不该让这一轮问答报错。
+    """
+    settings = get_settings()
+    if not bool(getattr(settings, "AGENT_MEMORY_ENABLED", False)):
+        return
+    try:
+        from app.agent_runtime.memory_store import (
+            extract_explicit_memories,
+            save_memory,
+        )
+        from app.db.postgres import get_db_session
+
+        candidates = extract_explicit_memories(str(state.get("query") or ""))
+        raw_user = state.get("user_id")
+        user_uuid = uuid.UUID(str(raw_user)) if raw_user else None
+        if not candidates or user_uuid is None:
+            return
+        raw_conversation = state.get("conversation_id")
+        conversation_uuid = uuid.UUID(str(raw_conversation)) if raw_conversation else None
+        async with get_db_session() as session:
+            for item in candidates:
+                await save_memory(
+                    session,
+                    tenant_id=state.get("conversation_tenant_id"),
+                    user_id=user_uuid,
+                    kind=item.kind,
+                    content=item.content,
+                    source="explicit_user",
+                    conversation_id=conversation_uuid,
+                    meta={"intent": state.get("intent") or ""},
+                )
+        logger.info("agent_memory: captured %d explicit memories", len(candidates))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("agent_memory 写入失败（已忽略）：%s", exc)
+
+
 async def _save_history_node(state: MasterState) -> dict:
     # 第三层隔离：消息带上真实用户与租户（conversation_id + tenant_id +
     # user_id 的隔离键），跨用户/跨租户无法续读到这段记忆。
     # 这里的 tenant_id 是**会话租户**（第三层），与文档可见性的 tenant_ids 无关。
     user_id = state.get("user_id")
+
+    # 自进化记忆沉淀：只在本轮用户显式声明时写入，默认关闭。
+    await _capture_explicit_memories(state)
+
     await save_turn(
         conversation_id=uuid.UUID(state["conversation_id"]),
         user_message=state["query"],
@@ -1349,6 +1645,28 @@ async def _save_history_node(state: MasterState) -> dict:
         assistant_meta=_build_turn_meta(state),
     )
     return {}
+
+
+def _build_review_llm(settings):
+    """审阅用 LLM：非流式 + **关思考**（判定任务，与生成节点相反）.
+
+    抽成工厂而不是内联在节点里，是为了让"参数漂移"变成可测的事实：
+    `test_agent_runtime_graph_wiring` 会真的构造一次并断言关键参数在位。
+    否则某天 `ChatOllama` 不再接受 `reasoning=` 时，节点里那个 `except` 会把
+    TypeError 吞掉，表现成"审阅永远 fallback" —— 功能写着开着，一次都没通过。
+    """
+    from langchain_ollama import ChatOllama
+
+    return ChatOllama(
+        model=settings.OLLAMA_MODEL,
+        base_url=settings.OLLAMA_BASE_URL,
+        temperature=0.0,
+        streaming=False,
+        reasoning=False,
+        num_ctx=settings.chat_num_ctx,
+        keep_alive=getattr(settings, "OLLAMA_KEEP_ALIVE_SECONDS", 300),
+        num_gpu=settings.OLLAMA_NUM_GPU,
+    )
 
 
 def _build_streaming_llm(settings):
@@ -1387,6 +1705,8 @@ def _compile_master_graph():
     graph.add_node("generate", _generate_node)
     # Citation Verifier（五项引用校验）：Generate → Citation Verifier → Output Guard
     graph.add_node("citation_verifier", _citation_verifier_node)
+    # 条件化证据审阅（多 Agent 唯一落地形态）：默认关闭，常驻图但立即返回
+    graph.add_node("evidence_review", _evidence_review_node)
     # Document Agent：生成 Word 交付物（最终效果）
     graph.add_node("build_document", _build_document_node)
     graph.add_node("refuse", _refuse_node)
@@ -1447,9 +1767,12 @@ def _compile_master_graph():
     graph.add_edge("collect_digests", "analyze_relations")
     graph.add_edge("analyze_relations", "output_guard")
     graph.add_edge("chat", "output_guard")
-    # 生成路径：generate → citation_verifier → output_guard
+    # 生成路径：generate → citation_verifier → evidence_review → output_guard
+    # evidence_review 是"有界审阅"：默认关闭时它是空节点（零调用、零输出），
+    # 因此把它常驻在图里不改变任何既有行为，只占一次节点调度的微秒级开销。
     graph.add_edge("generate", "citation_verifier")
-    graph.add_edge("citation_verifier", "output_guard")
+    graph.add_edge("citation_verifier", "evidence_review")
+    graph.add_edge("evidence_review", "output_guard")
     # Document Agent 产物同样过一遍 Output Guard（引用编号 / 合规校验）；
     # 其文本由代码确定性拼装、不含引用，无需走 Citation Verifier
     graph.add_edge("build_document", "output_guard")
@@ -1559,6 +1882,7 @@ async def stream_master(
     conversation_id: str,
     history_messages: list[BaseMessage],
     top_k: int,
+    history_window: list[BaseMessage] | None = None,
     owner_id: str | None = None,
     collection_id: str | None = None,
     forced_mode: str | None = None,
@@ -1611,6 +1935,9 @@ async def stream_master(
         "query": query,
         "conversation_id": conversation_id,
         "history_messages": history_messages,
+        # 更宽的历史窗口，只服务分层上下文的摘要层（为空则退化为只看
+        # history_messages，即升级前行为）。
+        "history_window": history_window or [],
         "top_k": top_k,
         "owner_id": owner_id,
         "collection_id": collection_id,
@@ -1641,6 +1968,8 @@ async def stream_master(
         "evidence": {},
         "citation_check": {},
         "refusal_source": "",
+        # Agent Runtime 审计（生成/审阅节点写入）；先置空避免节点前读取拿到 None
+        "agent_trace": {},
     }
 
     graph = get_master_graph()
@@ -1660,6 +1989,8 @@ async def stream_master(
     gate_audit: dict = {}
     citation_audit: dict = {}
     guard_audit: dict = {}
+    # Agent Runtime 审计快照：generate 阶段先攒，evidence_review 到位后整体下发。
+    agent_trace_audit: dict = {}
     final_sources: list[dict] = []
     final_answer = ""
     # 本轮是否已经流式发出过答案 token —— 用于判断"确定性答复"（不调 LLM 的
@@ -1685,7 +2016,7 @@ async def stream_master(
 
             kind = event["event"]
             name = event.get("name", "")
-            if kind == "on_chain_start" and name in {"route", "rewrite", "retrieve", "grade", "multimodal_context", "evidence_gate", "generate", "citation_verifier", "output_guard", "save_history"}:
+            if kind == "on_chain_start" and name in {"route", "rewrite", "retrieve", "grade", "multimodal_context", "evidence_gate", "generate", "citation_verifier", "evidence_review", "output_guard", "save_history"}:
                 stage_started[name] = time.perf_counter()
             elif kind == "on_chain_end" and name in stage_started:
                 yield {"type": "stage_timing", "stage": name,
@@ -1799,6 +2130,28 @@ async def stream_master(
                             else None
                         ),
                     }
+
+            # ── Agent Runtime 审计（生成阶段：技能 / 分层 / 记忆）────────────
+            # 先攒起来，等审阅节点结束再一次性下发，避免前端收到两份半截 trace。
+            elif kind == "on_chain_end" and name == "generate":
+                output = event["data"].get("output", {}) or {}
+                if output.get("agent_trace"):
+                    agent_trace_audit.update(output["agent_trace"])
+
+            # ── 条件化证据审阅（多 Agent，默认关闭）──────────────────────────
+            elif kind == "on_chain_end" and name == "evidence_review":
+                output = event["data"].get("output", {}) or {}
+                trace_out = output.get("agent_trace") or {}
+                agent_trace_audit.update(trace_out)
+                review = trace_out.get("review") or {}
+                suffix = str(review.get("appended_suffix") or "")
+                if suffix:
+                    # 正文 token 早已流出，审阅提示只能**追加**；前端按序拼进当前
+                    # 消息即可，不需要整段替换。
+                    final_answer = str(output.get("answer") or (final_answer + suffix))
+                    total_chars += len(suffix)
+                    yield {"type": "chunk", "content": suffix}
+                yield {"type": "agent_trace", **trace_out}
 
             # ── 文档摘要（summary / relations）──────────────────────────────
             elif kind == "on_chain_end" and name in ("summary_digests", "collect_digests"):

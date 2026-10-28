@@ -248,7 +248,11 @@ def test_migration_file_exists_and_chains_to_head() -> None:
     assert "q2k3l4m5n6o7" in revisions
     referenced = {d for d in revisions.values() if d}
     heads = sorted(set(revisions) - referenced)
-    assert heads == ["r3l4m5n6o7p8"], f"迁移未挂在唯一 head 上，当前 heads={heads}"
+    # head 仍然是**唯一**的；加了 agent_memories 迁移后从 r3l4m5n6o7p8 前移到
+    # s5m6n7o8p9q0。这里刻意钉死 head 值：多出第二个 head 就说明有人写了一条
+    # 与现有链并行的迁移（部署时 alembic 会直接拒绝 upgrade）。
+    assert heads == ["s5m6n7o8p9q0"], f"迁移未挂在唯一 head 上，当前 heads={heads}"
+    assert revisions["s5m6n7o8p9q0"] == "r3l4m5n6o7p8"
     assert revisions["r3l4m5n6o7p8"] == "q2k3l4m5n6o7"
 
 

@@ -37,7 +37,10 @@ def test_all_ollama_factories_apply_the_model_residency_setting():
                 assert "keep_alive" in keywords, path
                 assert "OLLAMA_KEEP_ALIVE_SECONDS" in ast.unparse(keywords["keep_alive"]), path
                 count += 1
-    assert count == 7
+    # 8 = 7 个既有工厂 + `master_graph._evidence_review_node`（条件化审阅，2026-10-28）。
+    # 新增任何 ChatOllama 工厂都要在这里 +1：这个数字的作用不是"数着玩"，而是逼
+    # 新增调用点必须显式确认自己的模型驻留策略，而不是默默用默认值。
+    assert count == 8
 
 
 def test_vision_request_applies_the_model_residency_setting(monkeypatch):

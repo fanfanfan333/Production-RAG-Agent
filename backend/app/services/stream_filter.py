@@ -49,6 +49,7 @@ INTERNAL_LLM_NODES = frozenset({
     "route",     # 意图识别 → {"intent": "..."}
     "rewrite",   # 查询改写 → {"rewritten": ..., "variants": [...]}
     "grade",     # 证据评分 → 评分 JSON
+    "evidence_review",  # 条件化证据审阅（多 Agent）→ {"status": ..., "note": ...}
 })
 
 

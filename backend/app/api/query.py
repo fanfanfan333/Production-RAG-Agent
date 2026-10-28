@@ -59,7 +59,11 @@ from app.config import get_settings
 from app.db.user_models import User
 from app.schemas.query import QueryRequest, SSEThinking
 from app.services.audit_service import record_audit
-from app.services.conversation_service import get_or_create_conversation, load_history
+from app.services.conversation_service import (
+    get_or_create_conversation,
+    load_history,
+    split_recent_history,
+)
 from app.services.prompt_security import inspect_user_query
 from app.services.master_graph import stream_master
 from app.services.rag_graph import stream_document_list
@@ -174,9 +178,21 @@ async def _generate_sse(
         conv_id = await get_or_create_conversation(
             conversation_id, owner_id=owner, tenant_id=conversation_tenant,
         )
+        # 分层上下文开启时要读**更宽**的历史窗口，否则「更早轮次」恒为空、
+        # 摘要层永远不会产出（单测能过、线上是死代码）。真正进提示的仍只有
+        # 最近 `recent_pairs` 对 —— 由 `split_recent_history` 切分，其余只喂摘要层。
+        settings = get_settings()
+        recent_pairs = max(1, int(getattr(settings, "AGENT_RECENT_PAIRS", 3)))
+        if bool(getattr(settings, "AGENT_CONTEXT_LAYERS_ENABLED", False)):
+            load_pairs = max(
+                recent_pairs, int(getattr(settings, "AGENT_HISTORY_WINDOW_PAIRS", 12))
+            )
+        else:
+            load_pairs = recent_pairs
         history = await load_history(
-            conv_id, owner_id=owner, tenant_id=conversation_tenant
+            conv_id, max_pairs=load_pairs, owner_id=owner, tenant_id=conversation_tenant
         )
+        history_messages, history_window = split_recent_history(history, recent_pairs)
     except Exception as exc:
         logger.exception("Conversation setup failed: %s", exc)
         yield _sse({"type": "error", "message": f"Conversation setup failed: {exc}"})
@@ -210,7 +226,8 @@ async def _generate_sse(
             retrieval_strategy=retrieval_strategy,
             query=query,
             conversation_id=str(conv_id),
-            history_messages=history,
+            history_messages=history_messages,
+            history_window=history_window,
             top_k=top_k,
             owner_id=str(owner) if owner else None,
             collection_id=str(collection_id) if collection_id else None,

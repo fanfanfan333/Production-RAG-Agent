@@ -89,6 +89,34 @@ async def get_or_create_conversation(
     return conv_id
 
 
+def split_recent_history(
+    history: list[BaseMessage], max_pairs: int
+) -> tuple[list[BaseMessage], list[BaseMessage]]:
+    """把历史切成 ``(最近 max_pairs 对, 更早的窗口)``.
+
+    为什么需要这个切分：`load_history()` 只取最近 3 对，而「分层上下文」要拿
+    **更早的轮次**做抽取式摘要。若上游仍然只加载 3 对，分层模块算出的 `older`
+    恒为空 —— 摘要层永远不会产出，功能看着开着、实际没生效。所以上游按更宽的
+    窗口加载，再在这里切出"真正进提示的最近几对"，其余交给摘要层。
+
+    切分按**用户消息**计数（而不是按消息条数）：助手消息可能缺失（拒答、超时），
+    按条数切会把半轮对话割开。
+
+    Returns:
+        ``(recent, older)``；历史不足时 ``older`` 为空列表。
+    """
+    if not history:
+        return [], []
+    max_pairs = max(1, int(max_pairs or 1))
+    user_positions = [
+        index for index, message in enumerate(history) if getattr(message, "type", "") == "human"
+    ]
+    if len(user_positions) <= max_pairs:
+        return list(history), []
+    cutoff = user_positions[-max_pairs]
+    return list(history[cutoff:]), list(history[:cutoff])
+
+
 async def load_history(
     conversation_id: uuid.UUID,
     max_pairs: int = _DEFAULT_HISTORY_PAIRS,
