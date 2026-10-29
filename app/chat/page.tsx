@@ -1,6 +1,7 @@
 import { AppShell } from "@/components/layout/app-shell";
 import { ChatInterface } from "@/components/chat/chat-interface";
 import { ConversationSidebar } from "@/components/chat/conversation-sidebar";
+import { CoordinationPanel } from "@/components/chat/coordination-panel";
 
 export default function ChatPage() {
   return (
@@ -11,6 +12,8 @@ export default function ChatPage() {
           基于 AI 的知识库智能问答
         </p>
       </div>
+
+      <CoordinationPanel />
 
       {/* 提问区在左，历史对话在右（深色高级感面板）；
           窄屏时历史对话收纳到提问区下方 */}
