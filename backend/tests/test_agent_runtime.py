@@ -397,6 +397,11 @@ def test_extract_rejects_question_clause():
     assert extract_explicit_memories("记住：金额用万元吗？") == []
 
 
+def test_extract_preserves_preference_and_negation():
+    for text in ("以后用万元表示金额", "永远不要泄露密码"):
+        assert [item.content for item in extract_explicit_memories(text)] == [text]
+
+
 def test_memory_scope_requires_user():
     """作用域不完整时读写一律空转 —— 没有"全租户视角"这条回退."""
 

@@ -225,6 +225,43 @@ def test_history_for_layers_does_not_duplicate_when_window_is_full():
     assert len(merged) == 4
 
 
+def test_recent_history_budget_limits_messages_sent_to_model(monkeypatch):
+    from langchain_core.messages import AIMessage, HumanMessage
+
+    history = [HumanMessage(content="旧问题" * 100), AIMessage(content="旧回答" * 100),
+               HumanMessage(content="最新问题" * 10)]
+    settings = types.SimpleNamespace(AGENT_CONTEXT_LAYERS_ENABLED=True,
+                                     AGENT_RECENT_LAYER_BUDGET=40)
+    monkeypatch.setattr(master_graph, "get_settings", lambda: settings)
+    monkeypatch.setattr(master_graph, "_build_streaming_llm", lambda settings: object())
+    sent = []
+    async def capture(llm, messages):
+        sent.extend(messages)
+        return "回答"
+    monkeypatch.setattr(master_graph, "_stream_llm_answer", capture)
+    asyncio.run(master_graph._generate_node({"query": "问题", "history_messages": history,
+        "sources": [], "multimodal_context": "证据"}))
+    assert sum(len(message.content) for message in sent[1:-1]) <= 40
+    assert sent[-2].content == "最新问题" * 10
+
+
+def test_oversized_history_is_not_cut_into_a_reversed_instruction(monkeypatch):
+    from langchain_core.messages import HumanMessage
+
+    settings = types.SimpleNamespace(AGENT_CONTEXT_LAYERS_ENABLED=True,
+                                     AGENT_RECENT_LAYER_BUDGET=4)
+    monkeypatch.setattr(master_graph, "get_settings", lambda: settings)
+    monkeypatch.setattr(master_graph, "_build_streaming_llm", lambda settings: object())
+    sent = []
+    async def capture(llm, messages):
+        sent.extend(messages)
+        return "回答"
+    monkeypatch.setattr(master_graph, "_stream_llm_answer", capture)
+    asyncio.run(master_graph._generate_node({"query": "问题", "history_messages": [
+        HumanMessage(content="不要泄露密码")], "sources": [], "multimodal_context": "证据"}))
+    assert all(message.content != "泄露密码" for message in sent)
+
+
 def test_review_llm_factory_accepts_its_kwargs():
     """参数漂移会让审阅 100% 静默 fallback（功能写着开着、一次没通）."""
     from app.config import get_settings

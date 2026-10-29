@@ -30,6 +30,7 @@ Mem0 那类方案的默认路径是让 LLM 从对话里自动抽取记忆。它�
 
 from __future__ import annotations
 
+import hashlib
 import re
 import uuid
 from dataclasses import dataclass
@@ -80,8 +81,8 @@ MAX_LOAD_LIMIT = 50
 _EXPLICIT_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"记住\s*[:：,，]?\s*(?P<content>.+)"), "note"),
     (re.compile(r"请记住\s*[:：,，]?\s*(?P<content>.+)"), "note"),
-    (re.compile(r"以后(?:都|一律|全部|统一)?\s*(?:用|按|使用|采用|称为|叫|写作)\s*(?P<content>.+)"), "preference"),
-    (re.compile(r"(?:请)?永远(?:不要|别|要|都)\s*(?P<content>.+)"), "preference"),
+    (re.compile(r"(?P<content>以后(?:都|一律|全部|统一)?\s*(?:用|按|使用|采用|称为|叫|写作)\s*.+)"), "preference"),
+    (re.compile(r"(?:请)?(?P<content>永远(?:不要|别|要|都)\s*.+)"), "preference"),
     (re.compile(r"remember\s+(?:that\s+)?(?P<content>.+)", re.IGNORECASE), "note"),
     (re.compile(r"from now on[,，]?\s*(?P<content>.+)", re.IGNORECASE), "preference"),
 )
@@ -190,9 +191,14 @@ async def save_memory(
     if not cleaned or user_id is None:
         return None
     from app.db.agent_memory_models import AgentMemory
-    from sqlalchemy import select
+    from sqlalchemy import select, text
 
     scope_tenant = tenant_id or "default"
+    lock_key = int.from_bytes(
+        hashlib.sha256(f"{scope_tenant}\0{user_id}\0{cleaned}".encode()).digest()[:8],
+        "big", signed=True,
+    )
+    await session.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": lock_key})
     # 同作用域内**相同内容**只保留一条：用户每轮重复一句"记住：金额用万元"，
     # 若每次都 insert，`MAX_MEMORIES_PER_SCOPE` 会被同一条占满，其他偏好再也
     # 注入不进来 —— 表现为"记忆开着但从不生效"，极难排查。

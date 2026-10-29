@@ -21,6 +21,7 @@ from app.api.badcases import router as badcases_router
 from app.api.collections import router as collections_router
 from app.api.companies import router as companies_router
 from app.api.conversations import router as conversations_router
+from app.api.coordination import router as coordination_router
 from app.api.document_management import router as document_management_router
 from app.api.documents import router as documents_router
 from app.api.evaluation import router as evaluation_router
@@ -39,6 +40,7 @@ from app.middleware.gateway import gateway_middleware
 from app.db import models  # noqa: F401 — registers Phase 2 tables with Base.metadata
 from app.db import conversation_models  # noqa: F401 — registers Phase 4 tables
 from app.db import agent_memory_models  # noqa: F401 — registers Agent Runtime memory table
+from app.db import coordination_models  # noqa: F401 — registers coordinator tasks/events
 from app.db import feedback_models  # noqa: F401 — registers answer_feedback table
 from app.db import badcase_models  # noqa: F401 — registers bad_cases table (回流队列)
 from app.db import quality_models  # noqa: F401 — registers quality_events table (质量监控)
@@ -150,12 +152,24 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     except Exception as exc:      # noqa: BLE001 — never block startup on vision
         logger.warning("Vision startup probe failed: %s", exc)
 
-    yield
+    lease = None
+    try:
+        if _settings.COORDINATION_ENABLED:
+            from app.coordination.lease import acquire_coordinator_lease
+            from app.coordination.repository import SqlTaskRepository
 
-    # ── Shutdown ──────────────────────────────────────────────────────────────
-    logger.info("Shutting down — releasing resources …")
-    await dispose_engine()
-    await close_qdrant_client()
+            lease = await acquire_coordinator_lease(engine)
+            recovered = await SqlTaskRepository().recover_interrupted()
+            if recovered:
+                logger.warning("Coordination recovery: %d task(s) marked interrupted", recovered)
+        yield
+    finally:
+        logger.info("Shutting down — releasing resources …")
+        if lease is not None:
+            from app.coordination.lease import release_coordinator_lease
+            await release_coordinator_lease(lease)
+        await dispose_engine()
+        await close_qdrant_client()
     logger.info("Shutdown complete")
 
 
@@ -243,6 +257,8 @@ def create_app() -> FastAPI:
     app.include_router(collections_router)       # Phase 3 — Qdrant admin API (admin)
     app.include_router(query_router)             # Phase 4 — POST /query SSE (auth)
     app.include_router(conversations_router)     # Phase 4 — conversation history (auth)
+    if settings.COORDINATION_ENABLED:
+        app.include_router(coordination_router)  # 中心协调 — 文档/代码/联网任务
     app.include_router(agent_runtime_router)     # Agent Runtime — /agent/skills + 个人长期记忆
     app.include_router(feedback_router)          # 反馈闭环 — POST/GET /feedback (auth/admin)
     app.include_router(badcases_router)          # 持续监控 — /badcases 审阅队列 + 指标

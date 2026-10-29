@@ -1027,6 +1027,20 @@ async def _generate_node(state: MasterState) -> dict:
         focused_query = f"{skill_instruction}\n\n{focused_query}"
 
     history_messages = _trim_history(state["history_messages"])
+    if bool(getattr(settings, "AGENT_CONTEXT_LAYERS_ENABLED", False)):
+        remaining = max(0, int(getattr(settings, "AGENT_RECENT_LAYER_BUDGET", 2400)))
+        bounded = []
+        for message in reversed(history_messages):
+            if not remaining:
+                break
+            content = message.content
+            if not isinstance(content, str):
+                break
+            if len(content) > remaining:
+                break
+            bounded.append(message)
+            remaining -= len(content)
+        history_messages = list(reversed(bounded))
     if layer_block and agent_trace.context_layers:
         # 报"真正送进去的"历史层字符数（已过 _trim_history 的 400 字截断），
         # 而不是分层模块自己那套未截断的渲染值 —— trace 不能自说自话。

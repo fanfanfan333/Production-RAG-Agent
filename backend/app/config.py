@@ -786,6 +786,24 @@ class Settings(BaseSettings):
     MULTI_AGENT_ENABLED: bool = False
     MULTI_AGENT_TIMEOUT_SECONDS: float = 12.0
 
+    # ── Central coordination（文档 / 代码 / 联网子 Agent）──────────────────────
+    # 只影响新的 /agent/tasks 入口；POST /query 的普通问答路径保持不变。
+    COORDINATION_ENABLED: bool = True
+    COORDINATION_MAX_SUBTASKS: int = 4
+    COORDINATION_MAX_CONCURRENCY: int = 2
+    COORDINATION_DOCUMENT_TIMEOUT_SECONDS: float = 180.0
+    COORDINATION_RESEARCH_TIMEOUT_SECONDS: float = 30.0
+    COORDINATION_CODE_TIMEOUT_SECONDS: float = 300.0
+    COORDINATION_STATUS_RECONCILE_TIMEOUT_SECONDS: float = 12.0
+
+    # ForgeFlow is called with the caller's own token; this is only the address.
+    FORGEFLOW_BASE_URL: str = ""
+    # Search is unavailable unless a real provider endpoint is configured.
+    # There is intentionally no built-in fake result set.
+    WEB_SEARCH_ENDPOINT: str = ""
+    WEB_SEARCH_API_KEY: str = ""
+    WEB_RESEARCH_TIMEOUT_SECONDS: float = 20.0
+
     # ── API gateway / edge protection ─────────────────────────────────────────
     # In-process gateway policy. For multi-instance production, pair this with
     # Kong/APISIX/Envoy and a Redis-backed distributed limiter.
