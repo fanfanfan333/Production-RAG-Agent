@@ -129,7 +129,7 @@ RAG 智能助手是一套面向企业内部使用的检索增强生成平台，�
 
 项目围绕检索、证据与权限完善问答链路：
 
-- **意图路由** —— 识别问句属于知识检索、文档总结、闲聊还是跨文档关联，自动分流至对应支路
+- **意图路由** —— 六类意图（知识问答、文档总结、跨文档关联、文档清单、闲聊、Word 交付物生成）自动分流至对应支路，详见[六意图路由](#44-六意图路由)
 - **混合召回** —— PostgreSQL 全文关键词检索（可选内存 BM25）与向量语义检索独立召回，再统一校验权限、融合与精排
 - **证据评估** —— 由 LLM 判断检索内容能否真正回答问题，不足则自动改写重试
 - **证据门控** —— 检索后追加一道**确定性** Evidence Gate，证据形态不达标直接拒答，不与 LLM 判断耦合
@@ -209,7 +209,7 @@ RAG 智能助手是一套面向企业内部使用的检索增强生成平台，�
 | 上下文压缩     | Context Compression：按查询词覆盖率做句子级抽取式压缩，单源预算 + 总预算双重约束，控制父块回填后的上下文膨胀（确定性规则、零 LLM 调用）                           |
 | LLM 证据评估 | 不看分数，由 LLM 判断"这段证据是否真能回答问题"，仅保留相关证据                                                                         |
 | 重写—重试循环  | 指代消解 + 多查询扩展；证据不足时自动改写 query，最多重试 N 次后拒答                                                                    |
-| 五意图路由    | document_summary / knowledge_qa / general_chat / doc_relations / list_documents 自动分流                        |
+| 六意图路由    | document_summary / knowledge_qa / general_chat / doc_relations / list_documents / document_agent 自动分流（见 [4.4](#44-六意图路由)） |
 | 确定性前置路由  | 列表类问题走正则 + DB 直读，不经过 LLM，保证不漏不重                                                                             |
 | 闲聊兜底     | 闲聊直接调用 LLM，不检索、不伪装查库                                                                                        |
 | 跨文档关联与总结 | 总结支路按文档抽取主题—要点—总览；关联支路发现文档之间的关系与差异                                                                          |
@@ -811,7 +811,7 @@ LangGraph负责问答流程的状态、路由、重试和生成；知识图谱�
 | 检索引擎 | PostgreSQL 全文检索 / 自研内存 BM25 · Qdrant 1.12 · RRF 融合 · bge-reranker 三级降级精排                                                                       |
 | 生成   | Ollama 本地推理（默认 qwen3:8b）· LangChain-Ollama · 流式输出 · 思考流分离                                                                                |
 | 向量化  | BGE 本地模型（bge-large-zh-v1.5，1024 维）· CPU-only torch · FlagEmbedding                                                                       |
-| 文档解析 | Docling 2.137 · PyMuPDF · python-docx · python-pptx · openpyxl · pandas · markdown                                                                       |
+| 文档解析 | MinerU · Marker · Docling 2.137 结构解析（带原生解析兜底）· PyMuPDF · python-docx · python-pptx · openpyxl · pandas · markdown                                                                       |
 | OCR  | PaddleOCR 3.7 · PaddlePaddle 3.3 · Tesseract · OpenCV（headless）                                                                                             |
 | 数据存储 | PostgreSQL 16（元数据 · 对话 · 用户 · 审计 · 反馈）· Qdrant（向量 + payload）                                                                             |
 | 工程   | Docker 多阶段构建 · docker-compose · 非 root 容器 · 国内镜像加速                                                                                       |
