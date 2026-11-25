@@ -21,7 +21,17 @@
 
 </div>
 
+## 界面截图
+
+<img src="docs/images/login.png" alt="企业 RAG 知识库登录页（2026-11-25 实际运行截图）" width="100%"/>
+
+<img src="docs/images/chat.png" alt="问答页（本地 mock 账号登录后拍摄）" width="100%"/>
+
+*本地运行截图：登录页与问答页（问答页以本地 mock 账号登录拍摄）。*
+
 ## 核心优势
+
+这个项目主要解决六件事，每件都对应一段真实实现：
 
 | 业务问题 | 本项目的实现 | 用户得到什么 |
 | --- | --- | --- |
@@ -115,13 +125,15 @@
 
 ## 一、简介
 
-RAG 智能助手是一套面向企业内部使用的检索增强生成平台，将企业私有文档转化为可被自然语言检索的知识库。
+RAG 智能助手是一套在企业内网运行的检索增强生成平台，把私有文档变成能用自然语言查的知识库。
+
+企业文档问答的难点不在生成，在证据和权限。答案要能逐条对回原文，查不到就拒答，不能编；谁能看哪些文档，要在检索时就过滤掉，不能等答案生成完再藏。所以这套系统把力气花在生成之前：混合召回加图检索补齐证据，确定性门控判断证据够不够格，权限过滤前置到每一路召回。代价是链路更长、延迟更高，换来的是答案可核验、越权查不到。
 
 全链路运行于本地：生成由 Ollama 承担，向量化由 BGE 本地模型承担，精排由 bge-reranker 承担，元数据落在 PostgreSQL，向量落在 Qdrant。系统不调用任何云端大模型接口，不需要申请任何 API Key，文档原文、向量与对话数据均不离开内网。
 
 项目围绕检索、证据与权限完善问答链路：
 
-- **意图路由** —— 识别问句属于知识检索、文档总结、闲聊还是跨文档关联，自动分流至对应支路
+- **意图路由** —— 六类意图（知识问答、文档总结、跨文档关联、文档清单、闲聊、Word 交付物生成）自动分流至对应支路，详见[六意图路由](#44-六意图路由)
 - **混合召回** —— PostgreSQL 全文关键词检索（可选内存 BM25）与向量语义检索独立召回，再统一校验权限、融合与精排
 - **证据评估** —— 由 LLM 判断检索内容能否真正回答问题，不足则自动改写重试
 - **证据门控** —— 检索后追加一道**确定性** Evidence Gate，证据形态不达标直接拒答，不与 LLM 判断耦合
@@ -201,7 +213,7 @@ RAG 智能助手是一套面向企业内部使用的检索增强生成平台，�
 | 上下文压缩     | Context Compression：按查询词覆盖率做句子级抽取式压缩，单源预算 + 总预算双重约束，控制父块回填后的上下文膨胀（确定性规则、零 LLM 调用）                           |
 | LLM 证据评估 | 不看分数，由 LLM 判断"这段证据是否真能回答问题"，仅保留相关证据                                                                         |
 | 重写—重试循环  | 指代消解 + 多查询扩展；证据不足时自动改写 query，最多重试 N 次后拒答                                                                    |
-| 五意图路由    | document_summary / knowledge_qa / general_chat / doc_relations / list_documents 自动分流                        |
+| 六意图路由    | document_summary / knowledge_qa / general_chat / doc_relations / list_documents / document_agent 自动分流（见 [4.4](#44-六意图路由)） |
 | 确定性前置路由  | 列表类问题走正则 + DB 直读，不经过 LLM，保证不漏不重                                                                             |
 | 闲聊兜底     | 闲聊直接调用 LLM，不检索、不伪装查库                                                                                        |
 | 跨文档关联与总结 | 总结支路按文档抽取主题—要点—总览；关联支路发现文档之间的关系与差异                                                                          |
@@ -803,7 +815,7 @@ LangGraph负责问答流程的状态、路由、重试和生成；知识图谱�
 | 检索引擎 | PostgreSQL 全文检索 / 自研内存 BM25 · Qdrant 1.12 · RRF 融合 · bge-reranker 三级降级精排                                                                       |
 | 生成   | Ollama 本地推理（默认 qwen3:8b）· LangChain-Ollama · 流式输出 · 思考流分离                                                                                |
 | 向量化  | BGE 本地模型（bge-large-zh-v1.5，1024 维）· CPU-only torch · FlagEmbedding                                                                       |
-| 文档解析 | Docling 2.137 · PyMuPDF · python-docx · python-pptx · openpyxl · pandas · markdown                                                                       |
+| 文档解析 | MinerU · Marker · Docling 2.137 结构解析（带原生解析兜底）· PyMuPDF · python-docx · python-pptx · openpyxl · pandas · markdown                                                                       |
 | OCR  | PaddleOCR 3.7 · PaddlePaddle 3.3 · Tesseract · OpenCV（headless）                                                                                             |
 | 数据存储 | PostgreSQL 16（元数据 · 对话 · 用户 · 审计 · 反馈）· Qdrant（向量 + payload）                                                                             |
 | 工程   | Docker 多阶段构建 · docker-compose · 非 root 容器 · 国内镜像加速                                                                                       |
