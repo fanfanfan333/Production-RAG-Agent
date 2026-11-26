@@ -815,7 +815,7 @@ LangGraph负责问答流程的状态、路由、重试和生成；知识图谱�
 | 检索引擎 | PostgreSQL 全文检索 / 自研内存 BM25 · Qdrant 1.12 · RRF 融合 · bge-reranker 三级降级精排                                                                       |
 | 生成   | Ollama 本地推理（默认 qwen3:8b）· LangChain-Ollama · 流式输出 · 思考流分离                                                                                |
 | 向量化  | BGE 本地模型（bge-large-zh-v1.5，1024 维）· CPU-only torch · FlagEmbedding                                                                       |
-| 文档解析 | MinerU · Marker · Docling 2.137 结构解析（带原生解析兜底）· PyMuPDF · python-docx · python-pptx · openpyxl · pandas · markdown                                                                       |
+| 文档解析 | Docling 2.137 结构解析（带原生解析兜底）· PyMuPDF · python-docx · python-pptx · openpyxl · pandas · markdown                                                                       |
 | OCR  | PaddleOCR 3.7 · PaddlePaddle 3.3 · Tesseract · OpenCV（headless）                                                                                             |
 | 数据存储 | PostgreSQL 16（元数据 · 对话 · 用户 · 审计 · 反馈）· Qdrant（向量 + payload）                                                                             |
 | 工程   | Docker 多阶段构建 · docker-compose · 非 root 容器 · 国内镜像加速                                                                                       |
